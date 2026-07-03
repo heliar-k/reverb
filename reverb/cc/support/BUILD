@@ -279,3 +279,31 @@ cc_test(
         "@pypi//numpy:numpy_headers",
     ],
 )
+
+# --- length-delimited protobuf IO(替代 TFRecord,checkpoint 序列化基础,D3 决策) ---
+# 原生 cc_library/cc_test:不注入 TF 依赖。
+cc_library(
+    name = "length_delimited_io",
+    srcs = ["length_delimited_io.cc"],
+    hdrs = ["length_delimited_io.h"],
+    copts = ["-Wno-sign-compare"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_protobuf//:protobuf",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "length_delimited_io_test",
+    srcs = ["length_delimited_io_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    deps = [
+        ":length_delimited_io",
+        "//reverb/cc:schema_cc_proto",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
