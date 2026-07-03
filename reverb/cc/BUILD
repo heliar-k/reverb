@@ -423,10 +423,11 @@ reverb_cc_test(
     ] + reverb_tf_deps() + reverb_grpc_deps(),
 )
 
-reverb_cc_library(
+cc_library(
     name = "chunker",
     srcs = ["chunker.cc"],
     hdrs = ["chunker.h"],
+    copts = ["-Wno-sign-compare"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
         ":schema_cc_proto",
@@ -437,32 +438,46 @@ reverb_cc_library(
         "//reverb/cc/platform:status_macros",
         "//reverb/cc/support:key_generators",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/support:trajectory_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps(),
+    ],
 )
 
-reverb_cc_test(
+cc_test(
     name = "chunker_test",
     srcs = ["chunker_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :chunker -> :tensor_proxy(pybind11/numpy C-API),
+    # 需链接 libpython 解析 Py* 符号。host libpython 依赖 sysroot libc_nonshared。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunker",
         ":schema_cc_proto",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
         "//reverb/cc/support:signature",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/random:distributions",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
 )
 
 reverb_cc_library(

@@ -32,19 +32,29 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
 #include "reverb/cc/tensor_compression.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/tensor_util.h"
-#include "tensorflow/core/framework/types.h"
 
 namespace deepmind {
 namespace reverb {
 namespace {
 
 int GetLength(const ChunkData& chunk) {
-  return chunk.data().tensors(0).tensor_shape().dim(0).size();
+  return chunk.data().tensors(0).shape().dim(0);
+}
+
+// Renders a shape as "[d0,d1,...]" to mirror the format TF's TensorShape
+// DebugString historically produced (and which error messages/checkpoints rely
+// on for stable substrings).
+std::string ShapeString(const std::vector<int64_t>& shape) {
+  std::string s = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) absl::StrAppend(&s, ",");
+    absl::StrAppend(&s, shape[i]);
+  }
+  absl::StrAppend(&s, "]");
+  return s;
 }
 
 }  // namespace
@@ -82,7 +92,7 @@ uint64_t CellRef::episode_id() const { return episode_info_.episode_id; }
 
 int CellRef::episode_step() const { return episode_info_.step; }
 
-absl::Status CellRef::GetData(tensorflow::Tensor* out) const {
+absl::Status CellRef::GetData(TensorBuffer* out) const {
   auto chunker_sp = chunker_.lock();
   if (!chunker_sp) {
     return absl::InternalError(
@@ -113,20 +123,23 @@ Chunker::Chunker(internal::TensorSpec spec,
   Reset();
 }
 
-absl::Status Chunker::Append(const tensorflow::Tensor& tensor,
+absl::Status Chunker::Append(const TensorBuffer& tensor,
                              const CellRef::EpisodeInfo& episode_info,
                              std::weak_ptr<CellRef>* ref) {
   if (tensor.dtype() != spec_.dtype) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Tensor of wrong dtype provided for column ", spec_.name, ". Got ",
-        tensorflow::DataTypeString(tensor.dtype()), " but expected ",
-        tensorflow::DataTypeString(spec_.dtype), "."));
+        DataTypeName(tensor.dtype()), " but expected ",
+        DataTypeName(spec_.dtype), "."));
   }
-  if (!spec_.shape.IsCompatibleWith(tensor.shape())) {
+  // ponytail: shape 兼容判断。spec_ 允许 -1 通配;buffer 的 shape 全为具体值,
+  // 所以构造一个同 dtype 的 spec 与 spec_ 比较即可。
+  internal::TensorSpec buf_spec{spec_.name, tensor.dtype(), tensor.shape()};
+  if (!spec_.IsCompatibleWith(buf_spec)) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Tensor of incompatible shape provided for column ", spec_.name,
-        ". Got ", tensor.shape().DebugString(), " which is incompatible with ",
-        spec_.shape.DebugString(), "."));
+        ". Got ", ShapeString(tensor.shape()), " which is incompatible with ",
+        ShapeString(spec_.shape), "."));
   }
   if (options_->GetCompressionDisabled()){
     return AppendUncompressed(tensor, episode_info, ref);
@@ -152,15 +165,7 @@ absl::Status Chunker::Append(const tensorflow::Tensor& tensor,
 
   // Add a batch dim to the tensor before adding it to the buffer. This will
   // prepare it for the concat op when the chunk is finalized.
-  tensorflow::TensorShape shape = tensor.shape();
-  shape.InsertDim(0, 1);
-
-  // This should never fail due to dtype or shape differences, because the dtype
-  // of tensors[j] is UNKNOWN and `shape` has the same number of elements as
-  // `item`.
-  tensorflow::Tensor batched_tensor(tensor.dtype(), shape);
-  REVERB_CHECK(batched_tensor.CopyFrom(tensor, shape));
-  buffer_.push_back(std::move(batched_tensor));
+  buffer_.push_back(tensor.InsertBatchDim());
 
   // Create the chunk if max buffer size reached.
   if (buffer_.size() >= options_->GetMaxChunkLength()) {
@@ -178,7 +183,7 @@ absl::Status Chunker::Append(const tensorflow::Tensor& tensor,
 }
 
 absl::Status Chunker::AppendUncompressed(
-    const tensorflow::Tensor& tensor, const CellRef::EpisodeInfo& episode_info,
+    const TensorBuffer& tensor, const CellRef::EpisodeInfo& episode_info,
     std::weak_ptr<CellRef>* ref) {
   absl::MutexLock lock(mu_);
   // We validate that steps have to increase if they belong to the same episode.
@@ -199,16 +204,7 @@ absl::Status Chunker::AppendUncompressed(
   // Add a batch dim to the tensor before adding it to the buffer. Otherwise
   // when adding multiple tensors they will be just concated instead of
   // batched.
-  tensorflow::TensorShape shape = tensor.shape();
-  shape.InsertDim(0, 1);
-
-  // This should never fail due to dtype or shape differences, because the dtype
-  // of tensors[j] is UNKNOWN and `shape` has the same number of elements as
-  // `item`.
-  tensorflow::Tensor batched_tensor(tensor.dtype(), shape);
-  REVERB_CHECK(batched_tensor.CopyFrom(tensor, shape));
-
-  uncompressed_data_.push_back(std::move(batched_tensor));
+  uncompressed_data_.push_back(tensor.InsertBatchDim());
 
   // Delete references which have exceeded their max age.
   while (active_refs_.size() > options_->GetNumKeepAliveRefs()) {
@@ -254,8 +250,11 @@ absl::Status Chunker::FlushLocked() {
   auto chunk = std::make_unique<ChunkData>();
   chunk->set_chunk_key(next_chunk_key_);
 
-  tensorflow::Tensor batched;
-  REVERB_RETURN_IF_ERROR(tensorflow::tensor::Concat(buffer_, &batched));
+  absl::StatusOr<TensorBuffer> batched_or = TensorBuffer::Concat(buffer_);
+  if (!batched_or.ok()) {
+    return batched_or.status();
+  }
+  TensorBuffer batched = std::move(batched_or).value();
 
   // Save the size of the tensor before compression is applied.
   chunk->set_data_uncompressed_size(batched.TotalBytes());
@@ -361,7 +360,7 @@ absl::Status Chunker::ApplyConfig(std::shared_ptr<ChunkerOptions> options) {
 }
 
 absl::Status Chunker::CopyDataForCell(const CellRef* ref,
-                                      tensorflow::Tensor* out) const {
+                                      TensorBuffer* out) const {
   if (options_->GetCompressionDisabled()){
     return CopyUncompressedDataForCell(ref, out);
   }
@@ -369,13 +368,12 @@ absl::Status Chunker::CopyDataForCell(const CellRef* ref,
 
   // If the chunk has been finalized then we unpack it and slice out the data.
   if (ref->IsReady()) {
-    tensorflow::Tensor column;
+    TensorBuffer column;
     REVERB_RETURN_IF_ERROR(
         internal::UnpackChunkColumn(*ref->GetChunk()->get(), 0, &column));
+    // SubSlice returns an independent buffer (own bytes copy), so no
+    // DeepCopy/IsAligned handling is needed.
     *out = column.SubSlice(ref->offset());
-    if (!out->IsAligned()) {
-      *out = tensorflow::tensor::DeepCopy(*out);
-    }
     return absl::OkStatus();
   }
 
@@ -396,18 +394,14 @@ absl::Status Chunker::CopyDataForCell(const CellRef* ref,
 
   // A batch dimension is added to the data before it is added to the buffer so
   // we strip that off before copying the content to the output tensor.
-  tensorflow::TensorShape shape = buffer_[buffer_index].shape();
-  shape.RemoveDim(0);
-  if (!out->CopyFrom(buffer_[buffer_index], shape)) {
-    return absl::InternalError("Unable to copy tensor from buffer.");
-  }
+  *out = buffer_[buffer_index].RemoveBatchDim();
 
   return absl::OkStatus();
 }
 
 
 absl::Status Chunker::CopyUncompressedDataForCell(const CellRef* ref,
-                                           tensorflow::Tensor* out) const{
+                                           TensorBuffer* out) const{
   // When compression is disabled, the chunks are never constructed and we
   // always fetch the data from the queue of uncompressed data.
   absl::MutexLock lock(mu_);
@@ -426,10 +420,8 @@ absl::Status Chunker::CopyUncompressedDataForCell(const CellRef* ref,
         "Data could not be found in buffer nor in finalized chunk.");
   }
 
-  tensorflow::TensorShape shape = uncompressed_data_[buffer_index].shape();
-  if (!out->CopyFrom(uncompressed_data_[buffer_index], shape)) {
-    return absl::InternalError("Unable to copy tensor from buffer.");
-  }
+  // Buffer stores batched tensors; return as-is (with batch dim).
+  *out = uncompressed_data_[buffer_index];
 
   return absl::OkStatus();
 }

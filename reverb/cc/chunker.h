@@ -30,7 +30,7 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
-#include "tensorflow/core/framework/tensor.h"
+#include "reverb/cc/support/tensor_proxy.h"
 
 namespace deepmind {
 namespace reverb {
@@ -113,7 +113,7 @@ class CellRef {
   // it is unpacked and the referenced row copied into `out`. If the chunk is
   // not yet finalized then the data is copied from the buffer of the parent
   // `Chunker`.
-  absl::Status GetData(tensorflow::Tensor* out) const;
+  absl::Status GetData(TensorBuffer* out) const;
 
   // Gets the internal::TensorSpec for the referenced data. This provides a
   // description of the referenced data's dtype and shape information. This
@@ -162,7 +162,7 @@ class Chunker : public std::enable_shared_from_this<Chunker> {
   // calls, appends it to the active chunk and returns a reference to the new
   // row. If the active chunk now has `max_chunk_length` rows then it is
   // finalized and its `CellRef`s notified (including `ref`).
-  absl::Status Append(const tensorflow::Tensor& tensor,
+  absl::Status Append(const TensorBuffer& tensor,
                       const CellRef::EpisodeInfo& episode_info,
                       std::weak_ptr<CellRef>* ref) ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -204,19 +204,18 @@ class Chunker : public std::enable_shared_from_this<Chunker> {
   // Get the data for referenced by `ref`. If the data has been finalized into
   // a ChunkData then the chunk is unpacked and the row extracted. If the
   // chunk has not been finalized the data is copied from `buffer_`.
-  absl::Status CopyDataForCell(const CellRef* ref,
-                               tensorflow::Tensor* out) const;
+  absl::Status CopyDataForCell(const CellRef* ref, TensorBuffer* out) const;
 
  private:
   // Appends a tensor to the queue of uncompressed items.
-  absl::Status AppendUncompressed(const tensorflow::Tensor& tensor,
+  absl::Status AppendUncompressed(const TensorBuffer& tensor,
                                   const CellRef::EpisodeInfo& episode_info,
                                   std::weak_ptr<CellRef>* ref)
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Get the data referenced by `ref` from the queue of uncompressed items.
   absl::Status CopyUncompressedDataForCell(const CellRef* ref,
-                                           tensorflow::Tensor* out) const
+                                           TensorBuffer* out) const
       ABSL_LOCKS_EXCLUDED(mu_);
 
   absl::Status FlushLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -231,13 +230,13 @@ class Chunker : public std::enable_shared_from_this<Chunker> {
   mutable absl::Mutex mu_;
 
   // Data waiting for the next chunk to be constructed.
-  std::vector<tensorflow::Tensor> buffer_ ABSL_GUARDED_BY(mu_);
+  std::vector<TensorBuffer> buffer_ ABSL_GUARDED_BY(mu_);
 
   // If compression is disabled, we accumulate the data in a queue. Since chunks
   // are never constructed, data is always fetched from the queue in `GetData`.
   // To avoid growing the queue indefinitely, on `AppendInternal` we remove the
   // items from the queue that are no longer refereced by `active_refs_`.
-  std::deque<tensorflow::Tensor> uncompressed_data_ ABSL_GUARDED_BY(mu_);
+  std::deque<TensorBuffer> uncompressed_data_ ABSL_GUARDED_BY(mu_);
 
   // Offset within the chunk of the next appended item.
   int offset_ ABSL_GUARDED_BY(mu_);
