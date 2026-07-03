@@ -147,42 +147,30 @@ bool IsTimestepTrajectory(const FlatTrajectory& trajectory) {
 
 absl::Status UnpackChunkColumn(const ChunkData& chunk_data, int column,
                                tensorflow::Tensor* out) {
+  // ponytail: UnpackChunkColumn 需要 DecompressTensorFromProto(tensor_compression)
+  // 的 TF 实现,但 schema.proto 的 TensorProto 已去 TF(Task 1),dtype 枚举值与
+  // tensorflow::DataType 不一致,无法直接转换。待 Task 5 用 TensorBuffer 重写
+  // tensor_compression 后恢复实现。当前返回 UnimplementedError,sample/chunker
+  // 数据解包路径会报错,但 checkpoint save/load 不走此路径。
   if (column >= chunk_data.data().tensors_size() || column < 0) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Cannot unpack column ", column, " in chunk ", chunk_data.chunk_key(),
         " which has ", chunk_data.data().tensors_size(), " columns."));
   }
-
-  absl::StatusOr<tensorflow::Tensor> tensor =
-      DecompressTensorFromProto(chunk_data.data().tensors(column));
-  if (!tensor.ok()) {
-    return tensor.status();
-  }
-  *out = *std::move(tensor);
-
-  if (chunk_data.delta_encoded()) {
-    *out = DeltaEncode(*out, /*encode=*/false);
-  }
-
-  return absl::OkStatus();
+  return absl::UnimplementedError(
+      "UnpackChunkColumn not implemented: tensor_compression pending TF removal "
+      "(Task 5).");
 }
 
 absl::Status UnpackChunkColumnAndSlice(const ChunkData& chunk_data, int column,
                                        int offset, int length,
                                        tensorflow::Tensor* out) {
   REVERB_RETURN_IF_ERROR(UnpackChunkColumn(chunk_data, column, out));
-
-  if (offset < 0 || offset + length > out->shape().dim_size(0)) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Cannot slice (", offset, ", ", offset + length,
-        ") out of tensor with shape ", out->shape().DebugString(), "."));
+  // ponytail: 以下依赖 tensorflow::Tensor 的 Slice/DeepCopy,待 Task 5 重写。
+  if (offset < 0 || length <= 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Invalid slice (", offset, ", ", length, ")."));
   }
-
-  *out = out->Slice(offset, offset + length);
-  if (!out->IsAligned()) {
-    *out = tensorflow::tensor::DeepCopy(*out);
-  }
-
   return absl::OkStatus();
 }
 

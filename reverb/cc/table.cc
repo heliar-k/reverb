@@ -154,7 +154,7 @@ Table::Table(std::string name, std::shared_ptr<ItemSelector> sampler,
              std::shared_ptr<ItemSelector> remover, int64_t max_size,
              int32_t max_times_sampled,
              std::shared_ptr<RateLimiter> rate_limiter, Extensions extensions,
-             std::optional<tensorflow::StructuredValue> signature)
+             std::optional<::reverb::tensor::SignatureProto> signature)
     : sampler_(std::move(sampler)),
       remover_(std::move(remover)),
       num_deleted_episodes_(0),
@@ -186,7 +186,7 @@ void Table::InitializeFromCheckpoint(
     std::unique_ptr<ItemSelector> sampler,
     std::unique_ptr<ItemSelector> remover, int64_t max_size,
     int32_t max_times_sampled, std::shared_ptr<RateLimiter> rate_limiter,
-    std::optional<tensorflow::StructuredValue> signature,
+    std::optional<::reverb::tensor::SignatureProto> signature,
     int64_t num_deleted_episodes, int64_t num_unique_samples) {
   rate_limiter_->UnregisterTable(&mu_, this);
   {
@@ -1039,7 +1039,7 @@ void Table::UnsafeAddExtension(std::shared_ptr<TableExtension> extension) {
   }
 }
 
-const std::optional<tensorflow::StructuredValue>& Table::signature() const {
+const std::optional<::reverb::tensor::SignatureProto>& Table::signature() const {
   return signature_;
 }
 

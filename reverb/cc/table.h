@@ -43,7 +43,7 @@
 #include "reverb/cc/support/state_statistics.h"
 #include "reverb/cc/support/task_executor.h"
 #include "reverb/cc/table_extensions/interface.h"
-#include "tensorflow/core/protobuf/struct.pb.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
 namespace reverb {
@@ -236,7 +236,7 @@ class Table {
         std::shared_ptr<ItemSelector> remover, int64_t max_size,
         int32_t max_times_sampled, std::shared_ptr<RateLimiter> rate_limiter,
         std::vector<std::shared_ptr<TableExtension>> extensions = {},
-        absl::optional<tensorflow::StructuredValue> signature = absl::nullopt);
+        absl::optional<::reverb::tensor::SignatureProto> signature = absl::nullopt);
 
   ~Table();
 
@@ -248,7 +248,7 @@ class Table {
       std::unique_ptr<ItemSelector> sampler,
       std::unique_ptr<ItemSelector> remover, int64_t max_size,
       int32_t max_times_sampled, std::shared_ptr<RateLimiter> rate_limiter,
-      std::optional<tensorflow::StructuredValue> signature,
+      std::optional<::reverb::tensor::SignatureProto> signature,
       int64_t num_deleted_episodes, int64_t num_unique_samples)
       ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -407,7 +407,7 @@ class Table {
   TableInfo info() const;
 
   // Signature (if any) of the table.
-  const absl::optional<tensorflow::StructuredValue>& signature() const;
+  const absl::optional<::reverb::tensor::SignatureProto>& signature() const;
 
   // Cancels pending calls and marks object as closed. Object must be
   // abandoned after `Close` called.
@@ -581,7 +581,7 @@ class Table {
   std::shared_ptr<RateLimiter> rate_limiter_;
 
   // Optional signature for data in the table.
-  absl::optional<tensorflow::StructuredValue> signature_;
+  absl::optional<::reverb::tensor::SignatureProto> signature_;
 
   // Worker thread which processes asynchronous insert and sample requests.
   std::unique_ptr<internal::Thread> table_worker_;
