@@ -217,36 +217,54 @@ reverb_cc_test(
     ],
 )
 
-reverb_cc_library(
+cc_library(
     name = "trajectory_util",
     srcs = ["trajectory_util.cc"],
     hdrs = ["trajectory_util.h"],
+    copts = ["-Wno-sign-compare"],
+    visibility = ["//reverb:__subpackages__"],
     deps = [
+        ":tensor_proxy",
         "//reverb/cc:chunk_store",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
         "//reverb/cc/platform:hash_set",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps(),
+    ],
 )
 
-reverb_cc_test(
+cc_test(
     name = "trajectory_util_test",
     srcs = ["trajectory_util_test.cc"],
+    size = "small",
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :trajectory_util -> :tensor_compression -> :tensor_proxy,
+    # 需链接 libpython 解析 Py* 符号。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":trajectory_util",
+        ":tensor_proxy",
         "//reverb/cc:chunk_store",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
+        "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
-    ] + reverb_tf_deps(),
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
 )
 
 reverb_cc_library(

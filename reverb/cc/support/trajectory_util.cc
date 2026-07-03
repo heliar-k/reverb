@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,13 +30,57 @@
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/tensor_compression.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_util.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
 namespace reverb {
 namespace internal {
+
+namespace {
+
+// Returns a copy of `tensor` sliced along the first dimension to the range
+// [offset, offset+length). Shape[0] becomes `length`; remaining dims are
+// unchanged. For string tensors the per-element length-delimited encoding is
+// walked; numeric tensors slice the raw byte region directly.
+TensorBuffer SliceDim0(const TensorBuffer& tensor, int64_t offset,
+                       int64_t length) {
+  const std::vector<int64_t>& shape = tensor.shape();
+  int64_t time = shape.empty() ? 1 : shape[0];
+
+  TensorSpec spec{tensor.dtype(), shape};
+  if (!spec.shape.empty()) spec.shape[0] = length;
+
+  std::string bytes;
+  if (tensor.dtype() == DataType::String) {
+    // Walk encoded elements [len][bytes], copy those in [offset, offset+length).
+    int64_t idx = 0;
+    size_t pos = 0;
+    absl::string_view src = tensor.bytes();
+    while (pos < src.size() && idx < offset + length) {
+      uint32_t len = static_cast<uint8_t>(src[pos]) |
+                     (static_cast<uint8_t>(src[pos + 1]) << 8) |
+                     (static_cast<uint8_t>(src[pos + 2]) << 16) |
+                     (static_cast<uint8_t>(src[pos + 3]) << 24);
+      size_t entry = 4 + len;
+      if (idx >= offset) {
+        bytes.append(src.data() + pos, entry);
+      }
+      pos += entry;
+      ++idx;
+    }
+  } else {
+    int64_t total = tensor.TotalBytes();
+    int64_t row_size = (time > 0) ? total / time : 0;
+    size_t start = static_cast<size_t>(offset * row_size);
+    size_t nbytes = static_cast<size_t>(length * row_size);
+    bytes.assign(tensor.bytes().data() + start, nbytes);
+  }
+  return TensorBuffer(std::move(spec), std::move(bytes));
+}
+
+}  // namespace
 
 std::vector<uint64_t> GetChunkKeys(const FlatTrajectory& trajectory) {
   std::vector<uint64_t> keys;
@@ -146,37 +191,47 @@ bool IsTimestepTrajectory(const FlatTrajectory& trajectory) {
 }
 
 absl::Status UnpackChunkColumn(const ChunkData& chunk_data, int column,
-                               tensorflow::Tensor* out) {
-  // ponytail: UnpackChunkColumn 需要 DecompressTensorFromProto(tensor_compression)
-  // 的 TF 实现,但 schema.proto 的 TensorProto 已去 TF(Task 1),dtype 枚举值与
-  // tensorflow::DataType 不一致,无法直接转换。待 Task 5 用 TensorBuffer 重写
-  // tensor_compression 后恢复实现。当前返回 UnimplementedError,sample/chunker
-  // 数据解包路径会报错,但 checkpoint save/load 不走此路径。
+                               TensorBuffer* out) {
   if (column >= chunk_data.data().tensors_size() || column < 0) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Cannot unpack column ", column, " in chunk ", chunk_data.chunk_key(),
         " which has ", chunk_data.data().tensors_size(), " columns."));
   }
-  return absl::UnimplementedError(
-      "UnpackChunkColumn not implemented: tensor_compression pending TF removal "
-      "(Task 5).");
+
+  absl::StatusOr<TensorBuffer> tensor =
+      DecompressTensorFromProto(chunk_data.data().tensors(column));
+  if (!tensor.ok()) {
+    return tensor.status();
+  }
+  *out = *std::move(tensor);
+
+  if (chunk_data.delta_encoded()) {
+    *out = DeltaEncode(*out, /*encode=*/false);
+  }
+
+  return absl::OkStatus();
 }
 
 absl::Status UnpackChunkColumnAndSlice(const ChunkData& chunk_data, int column,
                                        int offset, int length,
-                                       tensorflow::Tensor* out) {
+                                       TensorBuffer* out) {
   REVERB_RETURN_IF_ERROR(UnpackChunkColumn(chunk_data, column, out));
-  // ponytail: 以下依赖 tensorflow::Tensor 的 Slice/DeepCopy,待 Task 5 重写。
-  if (offset < 0 || length <= 0) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("Invalid slice (", offset, ", ", length, ")."));
+
+  int64_t dim0 = out->shape().empty() ? 1 : out->shape()[0];
+  if (offset < 0 || offset + length > dim0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Cannot slice (", offset, ", ", offset + length,
+        ") out of tensor with ", dim0, " timesteps."));
+  }
+  if (length < dim0) {
+    *out = SliceDim0(*out, offset, length);
   }
   return absl::OkStatus();
 }
 
 absl::Status UnpackChunkColumnAndSlice(const ChunkData& chunk_data,
                                        const FlatTrajectory::ChunkSlice& slice,
-                                       tensorflow::Tensor* out) {
+                                       TensorBuffer* out) {
   return UnpackChunkColumnAndSlice(chunk_data, slice.index(), slice.offset(),
                                    slice.length(), out);
 }

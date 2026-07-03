@@ -14,6 +14,9 @@
 
 #include "reverb/cc/tensor_compression.h"
 
+#include <cstdint>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -21,15 +24,8 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "reverb/cc/platform/status_matchers.h"
-#include "reverb/cc/testing/tensor_testutil.h"
-#include "tensorflow/core/framework/register_types.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor.pb.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/types.h"
-#include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/framework/variant.h"
-#include "tensorflow/core/platform/tstring.h"
+#include "reverb/cc/support/tensor_proxy.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
 namespace reverb {
@@ -38,99 +34,191 @@ namespace {
 using ::testing::HasSubstr;
 using ::absl_testing::StatusIs;
 
+// Builds a numeric TensorBuffer from a host vector laid out row-major in
+// little-endian. T must be a numeric type with a matching DataType.
 template <typename T>
-void EncodeMatchesDecodeT() {
-  tensorflow::Tensor tensor(tensorflow::DataTypeToEnum<T>::v(),
-                            tensorflow::TensorShape({16, 37, 6}));
-  tensor.flat<T>().setRandom();
-  tensorflow::Tensor encoded = DeltaEncode(tensor, true);
-  tensorflow::Tensor decoded = DeltaEncode(encoded, false);
-  test::ExpectTensorEqual<T>(tensor, decoded);
+TensorBuffer MakeNumeric(DataType dt, const std::vector<int64_t>& shape,
+                         const std::vector<T>& values) {
+  std::string bytes(values.size() * sizeof(T), '\0');
+  std::memcpy(bytes.data(), values.data(), bytes.size());
+  return TensorBuffer(TensorSpec{dt, shape}, std::move(bytes));
 }
 
-TEST(TensorCompressionTest, EncodeMatchesDecode) {
-#define ENCODE_MATCHES_DECODE(T) EncodeMatchesDecodeT<T>();
-  TF_CALL_INTEGRAL_TYPES(ENCODE_MATCHES_DECODE)
-#undef ENCODE_MATCHES_DECODE
-  EncodeMatchesDecodeT<float>();
-  EncodeMatchesDecodeT<double>();
-  EncodeMatchesDecodeT<bool>();
+template <typename T>
+std::vector<T> ReadNumeric(const TensorBuffer& t) {
+  std::vector<T> out(t.NumElements());
+  std::memcpy(out.data(), t.bytes().data(), out.size() * sizeof(T));
+  return out;
+}
+
+// Encodes a list of strings into the [len][bytes] layout TensorBuffer uses.
+TensorBuffer MakeString(const std::vector<int64_t>& shape,
+                        const std::vector<std::string>& values) {
+  std::string bytes;
+  for (const std::string& s : values) {
+    uint32_t len = static_cast<uint32_t>(s.size());
+    char header[4] = {
+        static_cast<char>(len & 0xff),
+        static_cast<char>((len >> 8) & 0xff),
+        static_cast<char>((len >> 16) & 0xff),
+        static_cast<char>((len >> 24) & 0xff),
+    };
+    bytes.append(header, 4);
+    bytes.append(s);
+  }
+  return TensorBuffer(TensorSpec{DataType::String, shape}, std::move(bytes));
+}
+
+std::vector<std::string> ReadStrings(const TensorBuffer& t) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  absl::string_view src = t.bytes();
+  while (pos < src.size()) {
+    uint32_t len = static_cast<uint8_t>(src[pos]) |
+                   (static_cast<uint8_t>(src[pos + 1]) << 8) |
+                   (static_cast<uint8_t>(src[pos + 2]) << 16) |
+                   (static_cast<uint8_t>(src[pos + 3]) << 24);
+    pos += 4;
+    out.emplace_back(src.data() + pos, len);
+    pos += len;
+  }
+  return out;
+}
+
+template <typename T>
+void ExpectTensorBufferEq(const TensorBuffer& x, const TensorBuffer& y) {
+  ASSERT_EQ(x.dtype(), y.dtype());
+  ASSERT_EQ(x.shape(), y.shape());
+  EXPECT_EQ(x.bytes(), y.bytes()) << "byte content differs";
+}
+
+// Fills `count` values with a deterministic pattern.
+template <typename T>
+std::vector<T> Pattern(int count) {
+  std::vector<T> v(count);
+  for (int i = 0; i < count; i++) v[i] = static_cast<T>(i * 7 + 3);
+  return v;
+}
+
+TEST(TensorCompressionTest, EncodeMatchesDecodeInt32) {
+  auto values = Pattern<int32_t>(16 * 37 * 6);
+  TensorBuffer tensor =
+      MakeNumeric<int32_t>(DataType::Int32, {16, 37, 6}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  TensorBuffer decoded = DeltaEncode(encoded, false);
+  ExpectTensorBufferEq<int32_t>(tensor, decoded);
+}
+
+TEST(TensorCompressionTest, EncodeMatchesDecodeInt8) {
+  auto values = Pattern<int8_t>(4 * 5 * 3);
+  TensorBuffer tensor =
+      MakeNumeric<int8_t>(DataType::Int8, {4, 5, 3}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  TensorBuffer decoded = DeltaEncode(encoded, false);
+  ExpectTensorBufferEq<int8_t>(tensor, decoded);
+}
+
+TEST(TensorCompressionTest, EncodeMatchesDecodeUint64) {
+  auto values = Pattern<uint64_t>(2 * 8 * 4);
+  TensorBuffer tensor =
+      MakeNumeric<uint64_t>(DataType::Uint64, {2, 8, 4}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  TensorBuffer decoded = DeltaEncode(encoded, false);
+  ExpectTensorBufferEq<uint64_t>(tensor, decoded);
+}
+
+TEST(TensorCompressionTest, EncodeMatchesDecodeUint8) {
+  auto values = Pattern<uint8_t>(3 * 4 * 2);
+  TensorBuffer tensor =
+      MakeNumeric<uint8_t>(DataType::Uint8, {3, 4, 2}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  TensorBuffer decoded = DeltaEncode(encoded, false);
+  ExpectTensorBufferEq<uint8_t>(tensor, decoded);
+}
+
+TEST(TensorCompressionTest, EncodeLeavesFloatUnchanged) {
+  // Float is not an integral type: DeltaEncode returns it unchanged.
+  auto values = Pattern<float>(4 * 3);
+  TensorBuffer tensor =
+      MakeNumeric<float>(DataType::Float32, {4, 3}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  EXPECT_EQ(encoded.bytes(), tensor.bytes());
+}
+
+TEST(TensorCompressionTest, EncodeLeavesRank1Unchanged) {
+  auto values = Pattern<int32_t>(8);
+  TensorBuffer tensor = MakeNumeric<int32_t>(DataType::Int32, {8}, values);
+  TensorBuffer encoded = DeltaEncode(tensor, true);
+  EXPECT_EQ(encoded.bytes(), tensor.bytes());
 }
 
 TEST(TensorCompressionTest, EncodeListMatchesDecode) {
-  tensorflow::Tensor tensor(tensorflow::DT_INT32,
-                            tensorflow::TensorShape({16, 37, 6}));
-  tensor.flat<int>().setRandom();
-  std::vector<tensorflow::Tensor> tensors{tensor, tensor};
-  std::vector<tensorflow::Tensor> encoded = DeltaEncodeList(tensors, true);
-  std::vector<tensorflow::Tensor> decoded = DeltaEncodeList(encoded, false);
+  auto values = Pattern<int32_t>(16 * 37 * 6);
+  TensorBuffer tensor =
+      MakeNumeric<int32_t>(DataType::Int32, {16, 37, 6}, values);
+  std::vector<TensorBuffer> tensors{tensor, tensor};
+  std::vector<TensorBuffer> encoded = DeltaEncodeList(tensors, true);
+  std::vector<TensorBuffer> decoded = DeltaEncodeList(encoded, false);
   EXPECT_EQ(tensors.size(), decoded.size());
   for (int i = 0; i < tensors.size(); i++) {
-    test::ExpectTensorEqual<int>(tensors[i], decoded[i]);
+    ExpectTensorBufferEq<int32_t>(tensors[i], decoded[i]);
   }
 }
 
 TEST(TensorCompressionTest, StringTensor) {
-  tensorflow::Tensor tensor(tensorflow::DT_STRING,
-                            tensorflow::TensorShape({2}));
-  tensor.flat<tensorflow::tstring>()(0) = "hello";
-  tensor.flat<tensorflow::tstring>()(1) = "world";
+  TensorBuffer tensor = MakeString({2}, {"hello", "world"});
 
-  tensorflow::TensorProto proto;
+  ::reverb::tensor::TensorProto proto;
   REVERB_ASSERT_OK(CompressTensorAsProto(tensor, &proto));
 
-  REVERB_ASSERT_OK_AND_ASSIGN(tensorflow::Tensor result,
-                       DecompressTensorFromProto(proto));
-  test::ExpectTensorEqual<tensorflow::tstring>(tensor, result);
+  absl::StatusOr<TensorBuffer> r = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r);
+  TensorBuffer result = std::move(r).value();
+  ExpectTensorBufferEq<int>(tensor, result);
+  EXPECT_THAT(ReadStrings(result), ::testing::ElementsAre("hello", "world"));
 }
 
 TEST(TensorCompressionTest, NonStringTensor) {
-  tensorflow::Tensor tensor(tensorflow::DT_INT32,
-                            tensorflow::TensorShape({2, 2}));
-  tensor.flat<int>().setRandom();
+  auto values = Pattern<int32_t>(4);
+  TensorBuffer tensor =
+      MakeNumeric<int32_t>(DataType::Int32, {2, 2}, values);
 
-  tensorflow::TensorProto proto;
+  ::reverb::tensor::TensorProto proto;
   REVERB_ASSERT_OK(CompressTensorAsProto(tensor, &proto));
 
-  REVERB_ASSERT_OK_AND_ASSIGN(tensorflow::Tensor result,
-                       DecompressTensorFromProto(proto));
-  test::ExpectTensorEqual<int>(tensor, result);
+  absl::StatusOr<TensorBuffer> r = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r);
+  TensorBuffer result = std::move(r).value();
+  ExpectTensorBufferEq<int32_t>(tensor, result);
 }
 
 TEST(TensorCompressionTest, NonStringTensorWithDeltaEncoding) {
-  tensorflow::Tensor tensor(tensorflow::DT_INT32,
-                            tensorflow::TensorShape({2, 2}));
-  tensor.flat<int>().setRandom();
+  auto values = Pattern<int32_t>(4);
+  TensorBuffer tensor =
+      MakeNumeric<int32_t>(DataType::Int32, {2, 2}, values);
 
-  tensorflow::TensorProto proto;
+  ::reverb::tensor::TensorProto proto;
   REVERB_ASSERT_OK(CompressTensorAsProto(DeltaEncode(tensor, true), &proto));
-  REVERB_ASSERT_OK_AND_ASSIGN(tensorflow::Tensor result,
-                       DecompressTensorFromProto(proto));
-  test::ExpectTensorEqual<int>(tensor, DeltaEncode(result, false));
+  absl::StatusOr<TensorBuffer> r2 = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r2);
+  TensorBuffer result = std::move(r2).value();
+  // result == DeltaEncode(tensor, true); decoding it must recover `tensor`.
+  ExpectTensorBufferEq<int32_t>(tensor, DeltaEncode(result, false));
 }
 
-TEST(TensorCompressionTest, CompressingVariantNotSupported) {
-  tensorflow::Tensor tensor(tensorflow::DT_VARIANT,
-                            tensorflow::TensorShape({}));
+TEST(TensorCompressionTest, NonStringTensorWithDeltaRoundTrip) {
+  // Full encode -> compress -> decompress -> decode == original, across a
+  // larger shape to exercise the per-row delta loop.
+  auto values = Pattern<int32_t>(8 * 4);
+  TensorBuffer tensor =
+      MakeNumeric<int32_t>(DataType::Int32, {8, 4}, values);
 
-  tensorflow::Tensor internal(tensorflow::DT_FLOAT,
-                              tensorflow::TensorShape({2, 2}));
-  internal.flat<float>().setRandom();
-  tensor.flat<tensorflow::Variant>()(0) = internal;
-
-  tensorflow::TensorProto proto;
-  EXPECT_THAT(CompressTensorAsProto(DeltaEncode(tensor, true), &proto),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("variant is not supported")));
-}
-
-TEST(TensorCompressionTest, DecompressingVariantNotSupported) {
-  tensorflow::TensorProto proto;
-  proto.set_dtype(tensorflow::DT_VARIANT);
-
-  EXPECT_THAT(DecompressTensorFromProto(proto),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("variant is not supported")));
+  ::reverb::tensor::TensorProto proto;
+  REVERB_ASSERT_OK(CompressTensorAsProto(DeltaEncode(tensor, true), &proto));
+  absl::StatusOr<TensorBuffer> r = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r);
+  TensorBuffer result = std::move(r).value();
+  ExpectTensorBufferEq<int32_t>(tensor, DeltaEncode(result, false));
 }
 
 }  // namespace

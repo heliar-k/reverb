@@ -23,7 +23,7 @@
 #include "absl/types/span.h"
 #include "reverb/cc/chunk_store.h"
 #include "reverb/cc/schema.pb.h"
-#include "tensorflow/core/framework/tensor.h"
+#include "reverb/cc/support/tensor_proxy.h"
 
 namespace deepmind {
 namespace reverb {
@@ -65,19 +65,19 @@ int ColumnLength(const FlatTrajectory& trajectory, int column);
 
 // Decompresses the tensor at index `column` in `chunk_data` into `out`.
 absl::Status UnpackChunkColumn(const ChunkData& chunk_data, int column,
-                               tensorflow::Tensor* out);
+                               TensorBuffer* out);
 
 // Unpacks content of column (see `UnpackChunkColumn`) and returns an aligned
 // tensor of the desired slice,
 absl::Status UnpackChunkColumnAndSlice(const ChunkData& chunk_data, int column,
                                        int offset, int length,
-                                       tensorflow::Tensor* out);
+                                       TensorBuffer* out);
 
 // Unpacks content of column (see `UnpackChunkColumn`) and returns an aligned
 // tensor of the desired slice,
 absl::Status UnpackChunkColumnAndSlice(const ChunkData& chunk_data,
                                        const FlatTrajectory::ChunkSlice& slice,
-                                       tensorflow::Tensor* out);
+                                       TensorBuffer* out);
 
 }  // namespace internal
 }  // namespace reverb

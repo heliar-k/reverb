@@ -68,16 +68,28 @@ reverb_cc_test(
     ] + reverb_tf_deps(),
 )
 
-reverb_cc_test(
+cc_test(
     name = "tensor_compression_test",
     srcs = ["tensor_compression_test.cc"],
+    size = "small",
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :tensor_compression 依赖 :tensor_proxy(pybind11/numpy C-API),
+    # 需链接 libpython 解析 Py* 符号(同 :tensor_proxy_test/:signature_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":tensor_compression",
         "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/testing:tensor_testutil",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
-    ] + reverb_tf_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 reverb_cc_test(
@@ -219,19 +231,22 @@ reverb_cc_library(
     ] + reverb_tf_deps(),
 )
 
-reverb_cc_library(
+cc_library(
     name = "tensor_compression",
     srcs = ["tensor_compression.cc"],
     hdrs = ["tensor_compression.h"],
+    copts = ["-Wno-sign-compare"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:snappy",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@local_xla//xla/tsl/platform:status",
-    ] + reverb_tf_deps(),
+    ],
 )
 
 reverb_cc_library(
