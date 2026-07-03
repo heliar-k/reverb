@@ -195,9 +195,6 @@ def patch_so(srcs_dir: str) -> None:
   """
   to_patch = {
       "reverb/libpybind.so": "$ORIGIN/../tensorflow",
-      "reverb/cc/ops/libgen_reverb_ops_gen_op.so": (
-          "$ORIGIN/../../../tensorflow"
-      ),
   }
   for file, path in to_patch.items():
     rpath = (

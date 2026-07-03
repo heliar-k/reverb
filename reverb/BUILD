@@ -26,14 +26,10 @@ reverb_pytype_strict_library(
         ":client",
         ":errors",
         ":item_selectors",
-        ":pattern_dataset",
         ":rate_limiters",
         ":replay_sample",
         ":server",
         ":structured_writer",
-        ":tf_client",
-        ":timestep_dataset",
-        ":trajectory_dataset",
         ":trajectory_writer",
         "//reverb/platform/default:checkpointers",
         "//reverb/platform/default:ensure_tf_install",
@@ -185,40 +181,6 @@ reverb_pybind_extension(
 )
 
 reverb_pytype_library(
-    name = "tf_client",
-    srcs = ["tf_client.py"],
-    strict_deps = True,
-    deps = [
-        ":replay_sample",
-        "//reverb/cc/ops:gen_reverb_ops",
-    ],
-)
-
-reverb_pytype_library(
-    name = "trajectory_dataset",
-    srcs = ["trajectory_dataset.py"],
-    strict_deps = True,
-    visibility = [":__subpackages__"],
-    deps = [
-        ":client",
-        ":replay_sample",
-        "//reverb/cc/ops:gen_reverb_ops",
-    ],
-)
-
-reverb_pytype_library(
-    name = "timestep_dataset",
-    srcs = ["timestep_dataset.py"],
-    strict_deps = True,
-    visibility = ["//visibility:private"],
-    deps = [
-        ":client",
-        ":replay_sample",
-        "//reverb/cc/ops:gen_reverb_ops",
-    ],
-)
-
-reverb_pytype_library(
     name = "reverb_types",
     srcs = ["reverb_types.py"],
     strict_deps = True,
@@ -281,66 +243,6 @@ reverb_py_test(
 )
 
 reverb_py_test(
-    name = "tf_client_test",
-    timeout = "short",
-    srcs = ["tf_client_test.py"],
-    deps = [
-        ":client",
-        ":item_selectors",
-        ":rate_limiters",
-        ":replay_sample",
-        ":server",
-        ":tf_client",
-    ],
-)
-
-reverb_py_test(
-    name = "timestep_dataset_test",
-    srcs = ["timestep_dataset_test.py"],
-    deps = [
-        ":client",
-        ":errors",
-        ":item_selectors",
-        ":rate_limiters",
-        ":replay_sample",
-        ":server",
-        ":timestep_dataset",
-    ],
-)
-
-reverb_py_test(
-    name = "timestep_dataset_eager_test",
-    srcs = ["timestep_dataset_eager_test.py"],
-    deps = [
-        ":server",
-        ":timestep_dataset",
-    ],
-)
-
-reverb_py_test(
-    name = "trajectory_dataset_test",
-    srcs = ["trajectory_dataset_test.py"],
-    deps = [
-        ":client",
-        ":errors",
-        ":item_selectors",
-        ":rate_limiters",
-        ":replay_sample",
-        ":server",
-        ":trajectory_dataset",
-    ],
-)
-
-reverb_py_test(
-    name = "trajectory_dataset_eager_test",
-    srcs = ["trajectory_dataset_eager_test.py"],
-    deps = [
-        ":server",
-        ":trajectory_dataset",
-    ],
-)
-
-reverb_py_test(
     name = "rate_limiters_test",
     srcs = ["rate_limiters_test.py"],
     deps = [
@@ -384,28 +286,5 @@ reverb_py_test(
     deps = [
         ":pybind",
         ":replay_sample",
-    ],
-)
-
-reverb_pytype_library(
-    name = "pattern_dataset",
-    srcs = ["pattern_dataset.py"],
-    strict_deps = False,
-    tags = ["pytype_unchecked_annotations"],
-    deps = [
-        ":replay_sample",
-        ":structured_writer",
-        "//reverb/cc:patterns_py_pb2",
-        "//reverb/cc/ops:gen_reverb_ops",
-    ],
-)
-
-reverb_py_test(
-    name = "pattern_dataset_test",
-    srcs = ["pattern_dataset_test.py"],
-    deps = [
-        ":pattern_dataset",
-        ":replay_sample",
-        ":structured_writer",
     ],
 )

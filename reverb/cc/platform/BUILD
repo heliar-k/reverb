@@ -16,51 +16,6 @@ package(
 licenses(["notice"])
 
 reverb_cc_library(
-    name = "tfrecord_checkpointer",
-    srcs = ["tfrecord_checkpointer.cc"],
-    hdrs = ["tfrecord_checkpointer.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = [
-        ":checkpointing_utils",
-        ":hash_map",
-        ":hash_set",
-        ":logging",
-        ":status_macros",
-        "//reverb/cc:chunk_store",
-        "//reverb/cc:schema_cc_proto",
-        "//reverb/cc:table",
-        "//reverb/cc/checkpointing:checkpoint_cc_proto",
-        "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/support:trajectory_util",
-        "//reverb/cc/table_extensions:interface",
-        "@com_google_absl//absl/memory",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/time",
-        "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps(),
-)
-
-reverb_cc_test(
-    name = "tfrecord_checkpointer_test",
-    srcs = ["tfrecord_checkpointer_test.cc"],
-    deps = [
-        ":status_matchers",
-        ":tfrecord_checkpointer",
-        "//reverb/cc:chunk_store",
-        "//reverb/cc:table",
-        "//reverb/cc/selectors:fifo",
-        "//reverb/cc/selectors:heap",
-        "//reverb/cc/selectors:prioritized",
-        "//reverb/cc/selectors:uniform",
-        "//reverb/cc/table_extensions:base",
-        "//reverb/cc/testing:proto_test_util",
-    ] + reverb_tf_deps(),
-)
-
-reverb_cc_library(
     name = "checkpointing_hdr",
     hdrs = ["checkpointing.h"],
     deps = [

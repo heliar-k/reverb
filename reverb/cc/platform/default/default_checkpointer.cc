@@ -13,9 +13,10 @@
 // limitations under the License.
 
 #include <memory>
+#include <utility>
 
 #include "reverb/cc/platform/checkpointing.h"
-#include "reverb/cc/platform/tfrecord_checkpointer.h"
+#include "reverb/cc/platform/default/simple_checkpointer.h"
 
 namespace deepmind {
 namespace reverb {
@@ -23,9 +24,11 @@ namespace reverb {
 std::unique_ptr<Checkpointer> CreateDefaultCheckpointer(
     std::string root_dir, std::string group,
     absl::optional<std::string> fallback_checkpoint_path) {
-  return std::make_unique<TFRecordCheckpointer>(
-      std::move(root_dir), std::move(group),
-      std::move(fallback_checkpoint_path));
+  // ponytail: group 历史无效(TFRecordCheckpointer.Save 对非空 group 报错),
+  // SimpleCheckpointer 无 group 概念,直接忽略以保持构造期行为一致。
+  (void)group;
+  return std::make_unique<SimpleCheckpointer>(
+      std::move(root_dir), std::move(fallback_checkpoint_path));
 }
 
 }  // namespace reverb

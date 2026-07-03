@@ -29,7 +29,7 @@ reverb_cc_library(
     deps = [
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing_hdr",
-        "//reverb/cc/platform:tfrecord_checkpointer",
+        ":simple_checkpointer",
         "@com_google_absl//absl/strings",
     ],
     alwayslink = 1,
@@ -64,7 +64,6 @@ reverb_cc_library(
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:server_hdr",
         "//reverb/cc/platform:status_macros",
-        "//reverb/cc/platform:tfrecord_checkpointer",
         "//reverb/cc/support:periodic_closure",
         "@com_google_absl//absl/strings",
     ] + reverb_grpc_deps(),

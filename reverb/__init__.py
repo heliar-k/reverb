@@ -35,8 +35,6 @@ from reverb.client import Writer
 from reverb.errors import DeadlineExceededError
 from reverb.errors import ReverbError
 
-from reverb.pattern_dataset import PatternDataset
-
 from reverb.platform.default import checkpointers
 
 from reverb.replay_sample import ReplaySample
@@ -44,12 +42,6 @@ from reverb.replay_sample import SampleInfo
 
 from reverb.server import Server
 from reverb.server import Table
-
-from reverb.tf_client import TFClient
-
-from reverb.timestep_dataset import TimestepDataset
-
-from reverb.trajectory_dataset import TrajectoryDataset
 
 from reverb.trajectory_writer import TrajectoryColumn
 from reverb.trajectory_writer import TrajectoryWriter
