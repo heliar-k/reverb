@@ -48,9 +48,8 @@
 #include "reverb/cc/support/grpc_util.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/types.h"
 
 namespace deepmind {
 namespace reverb {
@@ -126,6 +125,18 @@ bool AllReady(absl::Span<const std::shared_ptr<CellRef>> refs) {
   return absl::c_all_of(refs, [](const auto& ref) { return ref->IsReady(); });
 }
 
+// Formats a shape vector as "[d0,d1,...]" with -1 shown as "?", matching the
+// diagnostic strings used elsewhere in the codebase.
+std::string ShapeString(const std::vector<int64_t>& shape) {
+  std::string s = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) absl::StrAppend(&s, ",");
+    absl::StrAppend(&s, shape[i] == -1 ? "?" : std::to_string(shape[i]));
+  }
+  absl::StrAppend(&s, "]");
+  return s;
+}
+
 // Returns true if `set` contains all chunk keys references by `refs`.
 bool ContainsAll(const internal::flat_hash_set<uint64_t>& set,
                  absl::Span<const std::shared_ptr<CellRef>> refs) {
@@ -143,6 +154,7 @@ std::vector<internal::TensorSpec> FlatSignatureFromTrajectory(
       }
     }
     REVERB_CHECK(false) << "Invalid trajectory";
+    return internal::TensorSpec{};  // unreachable
   };
 
   std::vector<internal::TensorSpec> specs;
@@ -151,7 +163,8 @@ std::vector<internal::TensorSpec> FlatSignatureFromTrajectory(
     internal::TensorSpec spec = get_spec(col.chunk_slices(0).chunk_key());
     spec.name = std::to_string(col_idx);
     if (!col.squeeze()) {
-      spec.shape.InsertDim(0, internal::ColumnLength(trajectory, col_idx));
+      spec.shape.insert(spec.shape.begin(),
+                        internal::ColumnLength(trajectory, col_idx));
     }
     specs.push_back(std::move(spec));
   }
@@ -262,16 +275,16 @@ absl::Status TrajectoryWriter::ItemAndRefs::Validate(
     const internal::TensorSpec& want = table_signature[i];
     const internal::TensorSpec& got = trajectory_signature[i];
 
-    if (want.dtype != got.dtype || !want.shape.IsCompatibleWith(got.shape)) {
+    if (want.dtype != got.dtype || !want.IsCompatibleWith(got)) {
       return absl::InvalidArgumentError(absl::StrFormat(
           "Unable to create item in table '%s' since the provided trajectory "
           "is inconsistent with the table signature. The table expects column "
           "%d to be a %s %s tensor but got a %s %s tensor."
           "\n\nThe table signature is:\n\t%s"
           "\n\nThe provided trajectory signature is:\n\t%s.\n",
-          table, i, tensorflow::DataTypeString(want.dtype),
-          want.shape.DebugString(), tensorflow::DataTypeString(got.dtype),
-          got.shape.DebugString(),
+          table, i, DataTypeName(want.dtype),
+          ShapeString(want.shape), DataTypeName(got.dtype),
+          ShapeString(got.shape),
           internal::DtypesShapesString(table_signature),
           internal::DtypesShapesString(trajectory_signature)));
     }
@@ -334,6 +347,23 @@ TrajectoryWriter::TrajectoryWriter(
   REVERB_CHECK_OK(options.Validate());
 }
 
+TrajectoryWriter::TrajectoryWriter(std::shared_ptr<Table> table,
+                                   const Options& options)
+    : is_local_(true),
+      table_(std::move(table)),
+      options_(options),
+      key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
+      episode_id_(key_generator_->Generate()),
+      episode_step_(0),
+      closed_(false),
+      stream_worker_(
+          internal::StartThread("TrajectoryWriter_LocalWorker",
+                                [this] { (void)RunLocalWorker(); })),
+      stream_ok_(true) {
+  REVERB_CHECK_OK(options.Validate());
+  REVERB_CHECK(table_ != nullptr);
+}
+
 TrajectoryWriter::~TrajectoryWriter() {
   {
     absl::MutexLock lock(mu_);
@@ -350,20 +380,20 @@ TrajectoryWriter::~TrajectoryWriter() {
 }
 
 absl::Status TrajectoryWriter::Append(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   return AppendInternal(std::move(data), /*increment_episode_step=*/true, refs);
 }
 
 absl::Status TrajectoryWriter::AppendPartial(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   return AppendInternal(std::move(data), /*increment_episode_step=*/false,
                         refs);
 }
 
 absl::Status TrajectoryWriter::AppendInternal(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     bool increment_episode_step,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   CellRef::EpisodeInfo episode_info;
@@ -377,7 +407,7 @@ absl::Status TrajectoryWriter::AppendInternal(
   // create a chunker using the spec of the item.
   for (int i = 0; i < data.size(); i++) {
     if (data[i].has_value() && !chunkers_.contains(i)) {
-      const tensorflow::Tensor& tensor = data[i].value();
+      const TensorBuffer& tensor = data[i].value();
       // If the new column has been configured with `ConfigureChunker` then we
       // use the overrided options. If not then we use the default in
       // `options_.chunker_options`.
@@ -595,6 +625,154 @@ internal::flat_hash_set<uint64_t> TrajectoryWriter::GetKeepKeys(
   }
 
   return keys;
+}
+
+absl::Status TrajectoryWriter::RunLocalWorker() {
+  while (true) {
+    ItemAndRefs* item_and_refs = nullptr;
+    {
+      absl::MutexLock l(&mu_);
+      while (write_queue_.empty() && !closed_ && stream_ok_) {
+        data_cv_.Wait(&mu_);
+      }
+      if (!stream_ok_) {
+        return stream_status_;
+      }
+      if (closed_ && write_queue_.empty()) {
+        return absl::OkStatus();
+      }
+      item_and_refs = write_queue_.front().get();
+    }
+
+    // Wait until all chunks referenced by the item have been finalized.
+    // This mirrors the ContainsAll/AllReady dance in `RunStreamWorker`: if a
+    // referenced chunk is incomplete, flush its chunker and wait for
+    // `data_cv_` to be signalled when the chunk becomes ready.
+    if (!AllReady(item_and_refs->refs)) {
+      for (const std::shared_ptr<CellRef>& ref : item_and_refs->refs) {
+        if (!ref->IsReady()) {
+          auto chunker_sp = ref->chunker().lock();
+          if (chunker_sp) {
+            absl::Status s = chunker_sp->Flush();
+            if (!s.ok()) {
+              absl::MutexLock l(&mu_);
+              stream_ok_ = false;
+              stream_status_ = s;
+              unrecoverable_status_ = s;
+              data_cv_.Signal();
+              return s;
+            }
+          }
+        }
+      }
+      absl::MutexLock l(&mu_);
+      // Re-check now that we hold the lock; the chunk may already be ready.
+      if (!AllReady(item_and_refs->refs)) {
+        data_cv_.Wait(&mu_);
+      }
+      continue;
+    }
+
+    // Notify chunkers so they can adapt (mirrors the gRPC path). This MUST run
+    // before the item is handed to the table / moved to `in_flight_items_`, as
+    // the insert-completion callback (fired asynchronously by the table
+    // worker) erases the item and would otherwise free it under us.
+    internal::flat_hash_map<Chunker*, std::vector<std::shared_ptr<CellRef>>>
+        refs_per_chunker;
+    for (auto& ref : item_and_refs->refs) {
+      auto chunker_sp = ref->chunker().lock();
+      if (!chunker_sp) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Chunker::OnItemFinalized: Unable to lock the weak_ptr for the "
+            "chunker associated with chunk_key: ",
+            ref->chunk_key()));
+      }
+      refs_per_chunker[chunker_sp.get()].push_back(ref);
+    }
+    for (auto& [chunker, refs] : refs_per_chunker) {
+      absl::Status status =
+          chunker->OnItemFinalized(item_and_refs->item, refs);
+      if (!status.ok()) {
+        absl::MutexLock l(&mu_);
+        stream_ok_ = false;
+        stream_status_ = status;
+        unrecoverable_status_ = status;
+        data_cv_.Signal();
+        return status;
+      }
+    }
+
+    // Assemble the list of referenced chunks, deduplicating by chunk key.
+    std::vector<std::shared_ptr<ChunkStore::Chunk>> chunks;
+    internal::flat_hash_set<uint64_t> sent_keys;
+    for (const std::shared_ptr<CellRef>& ref : item_and_refs->refs) {
+      uint64_t ck = ref->chunk_key();
+      if (sent_keys.insert(ck).second) {
+        auto chunk_container = ref->GetChunk();
+        // `ChunkStore::Chunk` owns a copy of the `ChunkData` proto.
+        chunks.push_back(
+            std::make_shared<ChunkStore::Chunk>(*chunk_container->get()));
+      }
+    }
+
+    TableItem table_item(item_and_refs->item, std::move(chunks));
+    uint64_t key = item_and_refs->item.key();
+
+    // Backpressure: `InsertOrAssignAsync` reports via `can_insert_more`
+    // whether another insert can be queued right away. When it can't, we wait
+    // for an outstanding insert to complete (signalled by the callback, which
+    // also clears `local_can_insert_more_`).
+    //
+    // The callback is stored on the `ItemAndRefs` so the `weak_ptr` handed to
+    // the table stays alive until the insert actually completes; otherwise the
+    // table would drop a dead callback and never confirm the item.
+    bool can_insert_more = false;
+    item_and_refs->insert_callback =
+        std::make_shared<Table::InsertCallback>(
+            [this](uint64_t completed_key) {
+              absl::MutexLock l(&mu_);
+              in_flight_items_.erase(completed_key);
+              local_can_insert_more_ = true;
+              data_cv_.Signal();
+            });
+
+    absl::Status s = table_->InsertOrAssignAsync(
+        std::move(table_item), &can_insert_more, item_and_refs->insert_callback);
+    if (!s.ok()) {
+      absl::MutexLock l(&mu_);
+      stream_ok_ = false;
+      stream_status_ = s;
+      unrecoverable_status_ = s;
+      data_cv_.Signal();
+      return s;
+    }
+
+    // Move the item from `write_queue_` to `in_flight_items_` so `FlushLocked`
+    // keeps waiting for confirmation until the callback erases it.
+    {
+      absl::MutexLock l(&mu_);
+      in_flight_items_[key] = std::move(write_queue_.front());
+      write_queue_.pop_front();
+
+      if (in_flight_items_.size() + write_queue_.size() >=
+          kPendingItemsWarningThreshold) {
+        REVERB_LOG_EVERY_N(REVERB_WARNING, 10) << absl::StrFormat(
+            "The number of pending items is alarmingly high, did you forget "
+            "to call Flush? %d items are waiting to be inserted and %d items "
+            "have been queued but haven't been confirmed yet.",
+            write_queue_.size(), in_flight_items_.size());
+      }
+
+      // Apply backpressure: if the table's insert queue is full, wait for an
+      // outstanding insert to complete before pulling another item.
+      if (!can_insert_more) {
+        local_can_insert_more_ = false;
+        while (!local_can_insert_more_ && !closed_ && stream_ok_) {
+          data_cv_.Wait(&mu_);
+        }
+      }
+    }
+  }
 }
 
 absl::Status TrajectoryWriter::RunStreamWorker() {
@@ -836,14 +1014,14 @@ absl::Status TrajectoryColumn::Validate() const {
     if (spec.dtype != col_spec.dtype) {
       return absl::InvalidArgumentError(absl::StrCat(
           "Column references tensors with different dtypes: ",
-          tensorflow::DataTypeString(col_spec.dtype), " (index 0) != ",
-          tensorflow::DataTypeString(spec.dtype), " (index ", i, ")."));
+          DataTypeName(col_spec.dtype), " (index 0) != ",
+          DataTypeName(spec.dtype), " (index ", i, ")."));
     }
-    if (!spec.shape.IsCompatibleWith(col_spec.shape)) {
+    if (!spec.IsCompatibleWith(col_spec)) {
       return absl::InvalidArgumentError(absl::StrCat(
           "Column references tensors with incompatible shapes: ",
-          col_spec.shape.DebugString(), " (index 0) not compatible with ",
-          spec.shape.DebugString(), " (index ", i, ")."));
+          ShapeString(col_spec.shape), " (index 0) not compatible with ",
+          ShapeString(spec.shape), " (index ", i, ")."));
     }
   }
 

@@ -349,25 +349,27 @@ reverb_cc_library(
     ] + reverb_tf_deps() + reverb_grpc_deps(),
 )
 
-reverb_cc_library(
+cc_library(
     name = "trajectory_writer",
     srcs = ["trajectory_writer.cc"],
     hdrs = ["trajectory_writer.h"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
         ":chunker",
+        ":chunk_store",
         ":reverb_service_cc_grpc_proto",
         ":reverb_service_cc_proto",
         ":schema_cc_proto",
+        ":table",
         "//reverb/cc/platform:hash_map",
         "//reverb/cc/platform:hash_set",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
         "//reverb/cc/platform:thread",
-        "//reverb/cc/support:cleanup",
         "//reverb/cc/support:grpc_util",
         "//reverb/cc/support:key_generators",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/support:trajectory_util",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
@@ -378,7 +380,7 @@ reverb_cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+    ] + reverb_grpc_deps(),
 )
 
 reverb_cc_library(
@@ -408,33 +410,33 @@ reverb_cc_library(
     ] + reverb_tf_deps() + reverb_grpc_deps(),
 )
 
-reverb_cc_test(
+cc_test(
     name = "trajectory_writer_test",
     srcs = ["trajectory_writer_test.cc"],
+    # ponytail: :trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy
+    # C-API), 需链接 libpython 解析 Py* 符号。host libpython 依赖 sysroot libc_nonshared。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunker",
-        ":reverb_service_cc_grpc_proto",
-        ":reverb_service_cc_proto",
+        ":schema_cc_proto",
+        ":table",
         ":trajectory_writer",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/platform:thread",
-        "//reverb/cc/support:grpc_util",
-        "//reverb/cc/support:queue",
+        "//reverb/cc/selectors:fifo",
         "//reverb/cc/support:signature",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/memory",
-        "@com_google_absl//absl/random",
-        "@com_google_absl//absl/random:distributions",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 reverb_cc_test(

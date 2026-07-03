@@ -39,7 +39,8 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
-#include "tensorflow/core/framework/tensor.h"
+#include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/table.h"
 
 namespace deepmind {
 namespace reverb {
@@ -166,7 +167,7 @@ class ColumnWriter {
   // TODO(b/178085792): Figure out how episode information should be handled.
   // TODO(b/178085755): Decide how to manage partially invalid data.
   virtual absl::Status Append(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs) = 0;
 
   // Same as `Append` but does not increment the episode step counter after
@@ -182,7 +183,7 @@ class ColumnWriter {
   //
   // TODO(b/178085755): Decide how to manage partially invalid data.
   virtual absl::Status AppendPartial(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs) = 0;
 
   // Defines an item representing the data of `trajectory` and enques it for
@@ -267,6 +268,11 @@ class TrajectoryWriter : public ColumnWriter,
     // underlying data is not prematurely cleaned up even if it exceeds the max
     // age of the parent `Chunker`.
     std::vector<std::shared_ptr<CellRef>> refs;
+
+    // Local-mode only: the insert-completion callback for this item. Kept
+    // alive here so the `weak_ptr` handed to `Table::InsertOrAssignAsync` is
+    // not destroyed before the table worker invokes it.
+    std::shared_ptr<Table::InsertCallback> insert_callback;
   };
 
   // TODO(b/178084425): Allow chunking options to be specified for each column.
@@ -275,18 +281,24 @@ class TrajectoryWriter : public ColumnWriter,
       std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub,
       const Options& options);
 
+  // Local mode: writes items directly into `table` via
+  // `Table::InsertOrAssignAsync`, bypassing gRPC entirely. All chunker,
+  // column, and history logic is shared with the gRPC path.
+  explicit TrajectoryWriter(std::shared_ptr<Table> table,
+                            const Options& options);
+
   // Flushes pending items and then closes stream. If `Close` has already been
   // called then no action is taken.
   ~TrajectoryWriter() override;
 
   // See `ColumnWriter::Append` above.
-  absl::Status Append(std::vector<absl::optional<tensorflow::Tensor>> data,
+  absl::Status Append(std::vector<absl::optional<TensorBuffer>> data,
                       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs)
       override ABSL_LOCKS_EXCLUDED(mu_);
 
   // See `ColumnWriter::AppendPartial` above.
   absl::Status AppendPartial(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs) override
       ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -339,7 +351,7 @@ class TrajectoryWriter : public ColumnWriter,
 
   // See `Append` and `AppendPartial`.
   absl::Status AppendInternal(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       bool increment_episode_step,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs)
       ABSL_LOCKS_EXCLUDED(mu_);
@@ -359,6 +371,12 @@ class TrajectoryWriter : public ColumnWriter,
   // method again. This is managed by the anonymous function executed
   // by `worker_thread_`.
   absl::Status RunStreamWorker();
+
+  // Local-mode worker loop. Drains `write_queue_`, assembles `TableItem`s
+  // from the referenced chunks, and inserts them into `table_` via
+  // `InsertOrAssignAsync`. The insert completion callback erases the item
+  // from `in_flight_items_`, mirroring `OnReadDone` on the gRPC path.
+  absl::Status RunLocalWorker();
 
   // Sets `context_` and opens a gRPC InsertStream to the server iff the writer
   // has not yet been closed.
@@ -394,6 +412,18 @@ class TrajectoryWriter : public ColumnWriter,
 
   // Stub used to create InsertStream gRPC streams.
   std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub_;
+
+  // True when the writer is in local mode (writes directly into `table_`
+  // instead of going over gRPC).
+  bool is_local_ = false;
+
+  // Target table in local mode. Unused on the gRPC path.
+  std::shared_ptr<Table> table_;
+
+  // Local-mode backpressure: cleared to false by `InsertOrAssignAsync` when the
+  // table's insert queue is full, set back to true by the insert-completion
+  // callback. `RunLocalWorker` waits on `data_cv_` while it is false.
+  bool local_can_insert_more_ ABSL_GUARDED_BY(mu_) = true;
 
   // Configuration options.
   Options options_;
