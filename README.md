@@ -149,6 +149,44 @@ Continue with the
 [Reverb Tutorial](https://github.com/deepmind/reverb/tree/master/examples/demo.ipynb)
 for an interactive tutorial.
 
+## 内嵌模式(纯 numpy,无 TensorFlow)
+
+Reverb 支持纯 numpy 的进程内模式,无需 TensorFlow,零网络开销,适合单机训练内嵌使用。
+
+```python
+import reverb
+import numpy as np
+
+server = reverb.Server(
+    tables=[reverb.Table(
+        name='my_table',
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        max_size=1000,
+        rate_limiter=reverb.rate_limiters.MinSize(100),
+    )],
+    in_process=True,  # 零网络,进程内直连
+)
+
+client = server.in_process_client
+
+# 写入数据(纯 numpy)
+with client.trajectory_writer(table='my_table', num_keep_alive_refs=10) as w:
+    w.append({'obs': np.zeros(4, dtype=np.float32)})
+    w.create_item(table='my_table', priority=1.0,
+                  trajectory={'obs': w.history['obs'][:]})
+    w.flush()
+
+# 采样
+for sample in client.sample('my_table', num_samples=4):
+    print(sample.data[0])  # numpy array
+```
+
+**注意:**
+- 内嵌模式使用 numpy 作为数据载体,不依赖 TensorFlow。
+- 仅支持 `TrajectoryWriter`(本地路径),gRPC `Client`/`Writer` 暂不可用(待清理 TF 依赖)。
+- 旧版本(基于 TF)的 checkpoint 不兼容,需重新生成。
+
 ## Detailed overview
 
 Experience replay has become an important tool for training off-policy
