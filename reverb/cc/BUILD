@@ -45,9 +45,19 @@ reverb_cc_test(
     ],
 )
 
-reverb_cc_test(
+# ponytail: 原生 cc_test,去 reverb_tf_deps() + :proto_test_util(后者仍依赖 TF)。
+# 测试数据构造内联(MakeChunkData/MakePrioritizedItem/EqualsProto),见 table_test.cc。
+cc_test(
     name = "table_test",
     srcs = ["table_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :table -> :trajectory_util -> :tensor_compression -> :tensor_proxy
+    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :chunker_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunk_store",
         ":schema_cc_proto",
@@ -59,13 +69,16 @@ reverb_cc_test(
         "//reverb/cc/selectors:uniform",
         "//reverb/cc/support:task_executor",
         "//reverb/cc/table_extensions:interface",
-        "//reverb/cc/testing:proto_test_util",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-    ] + reverb_tf_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
 )
 
 cc_test(
@@ -192,7 +205,8 @@ reverb_cc_library(
     ],
 )
 
-reverb_cc_library(
+# ponytail: 原生 cc_library,去 reverb_tf_deps() 注入(Task 8)。table.h/cc 已无 TF include。
+cc_library(
     name = "table",
     srcs = [
         "rate_limiter.cc",
@@ -202,6 +216,7 @@ reverb_cc_library(
         "rate_limiter.h",
         "table.h",
     ],
+    copts = ["-Wno-sign-compare"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
         ":chunk_store",
@@ -228,7 +243,7 @@ reverb_cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps(),
+    ],
 )
 
 cc_library(

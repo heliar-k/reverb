@@ -14,6 +14,7 @@
 
 #include "reverb/cc/table.h"
 
+#include <cstdint>
 #include <atomic>
 #include <cfloat>
 #include <memory>
@@ -30,21 +31,20 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "google/protobuf/text_format.h"
+#include "google/protobuf/util/message_differencer.h"
 #include "reverb/cc/checkpointing/checkpoint.pb.h"
 #include "reverb/cc/chunk_store.h"
 #include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/platform/thread.h"
+#include "reverb/cc/platform/logging.h"
 #include "reverb/cc/rate_limiter.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/selectors/fifo.h"
 #include "reverb/cc/selectors/uniform.h"
 #include "reverb/cc/support/task_executor.h"
 #include "reverb/cc/table_extensions/interface.h"
-#include "reverb/cc/testing/proto_test_util.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/tensor_shape.pb.h"
-#include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/protobuf/struct.pb.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
 namespace reverb {
@@ -53,13 +53,68 @@ namespace {
 const absl::Duration kTimeout = absl::Milliseconds(250);
 const absl::Duration kLongTimeout = absl::Seconds(1);
 
-using ::deepmind::reverb::testing::Partially;
 using ::testing::ElementsAre;
 using ::testing::IsEmpty;
 using ::testing::SizeIs;
 
 MATCHER_P(HasItemKey, key, "") { return arg.key() == key; }
 MATCHER_P(HasSampledItemKey, key, "") { return arg.ref->key() == key; }
+
+// ponytail: 内联 proto matcher(替代 testing/proto_test_util,该 lib 仍依赖 TF)。
+// 支持部分匹配:expected 里没列出的字段不比较。
+class InlineProtoMatcher {
+ public:
+  explicit InlineProtoMatcher(std::string expected, bool partial)
+      : expected_str_(std::move(expected)), partial_(partial) {}
+  template <typename Message>
+  bool MatchAndExplain(const Message& actual,
+                       ::testing::MatchResultListener* listener) const {
+    Message expected;
+    if (!google::protobuf::TextFormat::ParseFromString(expected_str_, &expected)) {
+      *listener << "failed to parse expected proto";
+      return false;
+    }
+    google::protobuf::util::MessageDifferencer differencer;
+    differencer.set_scope(partial_
+                              ? google::protobuf::util::MessageDifferencer::PARTIAL
+                              : google::protobuf::util::MessageDifferencer::FULL);
+    std::string differences;
+    differencer.ReportDifferencesToString(&differences);
+    if (!differencer.Compare(expected, actual)) {
+      *listener << "protos differ:\n" << differences;
+      return false;
+    }
+    return true;
+  }
+  void DescribeTo(std::ostream* os) const { *os << expected_str_; }
+  void DescribeNegationTo(std::ostream* os) const {
+    *os << "not equal to: " << expected_str_;
+  }
+  void SetComparePartially() { partial_ = true; }
+
+ private:
+  std::string expected_str_;
+  bool partial_;
+};
+
+inline ::testing::PolymorphicMatcher<InlineProtoMatcher> EqualsProto(
+    const std::string& text) {
+  return ::testing::MakePolymorphicMatcher(InlineProtoMatcher(text, false));
+}
+
+inline ::testing::PolymorphicMatcher<InlineProtoMatcher> EqualsProto(
+    const google::protobuf::Message& expected) {
+  std::string text;
+  google::protobuf::TextFormat::PrintToString(expected, &text);
+  return EqualsProto(text);
+}
+
+template <typename Inner>
+Inner Partially(Inner inner) {
+  // inner 是 PolymorphicMatcher<InlineProtoMatcher>;切到部分匹配。
+  inner.mutable_impl().SetComparePartially();
+  return inner;
+}
 
 template <typename... Ts>
 std::unique_ptr<Table> MakeTable(Ts... args) {
@@ -68,22 +123,76 @@ std::unique_ptr<Table> MakeTable(Ts... args) {
   return table;
 }
 
+// ponytail: 内联 MakeChunkData/MakeSequenceRange/MakeKeyWithPriority/
+// MakePrioritizedItem(替代 testing/proto_test_util,该 lib 仍依赖 TF)。
+// ChunkData 只需可被 Table/ChunkStore 接受,不解码 tensor 字节,故手搓最小内容。
+ChunkData MakeChunkData(uint64_t key, SequenceRange range) {
+  ChunkData chunk;
+  chunk.set_chunk_key(key);
+  *chunk.mutable_sequence_range() = std::move(range);
+  int64_t rows = chunk.sequence_range().end() -
+                 chunk.sequence_range().start() + 1;
+  auto* tensor = chunk.mutable_data()->add_tensors();
+  tensor->set_dtype(::reverb::tensor::DT_INT32);
+  tensor->mutable_shape()->add_dim(rows);
+  tensor->mutable_shape()->add_dim(10);
+  tensor->set_tensor_content(std::string(rows * 10 * sizeof(int32_t), '\1'));
+  chunk.set_data_tensors_len(1);
+  return chunk;
+}
+
+SequenceRange MakeSequenceRange(uint64_t episode_id, int32_t start,
+                                int32_t end) {
+  REVERB_CHECK_LE(start, end);
+  SequenceRange range;
+  range.set_episode_id(episode_id);
+  range.set_start(start);
+  range.set_end(end);
+  return range;
+}
+
+KeyWithPriority MakeKeyWithPriority(uint64_t key, double priority) {
+  KeyWithPriority update;
+  update.set_key(key);
+  update.set_priority(priority);
+  return update;
+}
+
+PrioritizedItem MakePrioritizedItem(uint64_t key, double priority,
+                                    const std::vector<ChunkData>& chunks) {
+  REVERB_CHECK(!chunks.empty());
+  PrioritizedItem item;
+  item.set_key(key);
+  item.set_priority(priority);
+  for (int i = 0; i < chunks.front().data().tensors_size(); ++i) {
+    auto* col = item.mutable_flat_trajectory()->add_columns();
+    for (const auto& chunk : chunks) {
+      auto* slice = col->add_chunk_slices();
+      slice->set_chunk_key(chunk.chunk_key());
+      slice->set_offset(0);
+      slice->set_length(chunk.data().tensors(i).shape().dim(0));
+      slice->set_index(i);
+    }
+  }
+  return item;
+}
+
 TableItem MakeItem(uint64_t key, double priority,
                    const std::vector<SequenceRange>& sequences) {
   std::vector<std::shared_ptr<ChunkStore::Chunk>> chunks(sequences.size());
   std::vector<ChunkData> data(sequences.size());
 
   for (int i = 0; i < sequences.size(); i++) {
-    data[i] = testing::MakeChunkData(key * 100 + i, sequences[i]);
+    data[i] = MakeChunkData(key * 100 + i, sequences[i]);
     chunks[i] = std::make_shared<ChunkStore::Chunk>(data[i]);
   }
 
-  return TableItem(testing::MakePrioritizedItem(key, priority, data),
+  return TableItem(MakePrioritizedItem(key, priority, data),
                    std::move(chunks));
 }
 
 TableItem MakeItem(uint64_t key, double priority) {
-  return MakeItem(key, priority, {testing::MakeSequenceRange(key * 100, 0, 1)});
+  return MakeItem(key, priority, {MakeSequenceRange(key * 100, 0, 1)});
 }
 
 std::shared_ptr<RateLimiter> MakeLimiter(int64_t min_size) {
@@ -121,7 +230,7 @@ TEST(TableTest, CopyAfterInsert) {
   ASSERT_THAT(items, SizeIs(1));
   EXPECT_THAT(
       items[0].AsPrioritizedItem(),
-      Partially(testing::EqualsProto("key: 3 times_sampled: 0 priority: 123")));
+      Partially(EqualsProto("key: 3 times_sampled: 0 priority: 123")));
 }
 
 TEST(TableTest, CopySubset) {
@@ -148,8 +257,8 @@ TEST(TableTest, UpdatesAreAppliedPartially) {
   REVERB_EXPECT_OK(table->InsertOrAssign(MakeItem(3, 123)));
   REVERB_EXPECT_OK(table->MutateItems(
       {
-          testing::MakeKeyWithPriority(5, 55),
-          testing::MakeKeyWithPriority(3, 456),
+          MakeKeyWithPriority(5, 55),
+          MakeKeyWithPriority(3, 456),
       },
       {}));
 
@@ -201,7 +310,7 @@ TEST(TableTest, SampleMatchesInsert) {
   PrioritizedItem sample_item = sample.ref->AsPrioritizedItem();
   sample_item.clear_inserted_at();
 
-  EXPECT_THAT(insert_item, testing::EqualsProto(sample_item));
+  EXPECT_THAT(insert_item, EqualsProto(sample_item));
   EXPECT_EQ(sample.ref->chunks(), item.chunks());
   EXPECT_EQ(sample.probability, 1);
 }
@@ -514,7 +623,7 @@ TEST(TableTest, ResetWhileConcurrentCalls) {
       }
       REVERB_EXPECT_OK(table->InsertOrAssign(MakeItem(i, 123)));
       auto result =
-          table->MutateItems({testing::MakeKeyWithPriority(i, 456)}, {i});
+          table->MutateItems({MakeKeyWithPriority(i, 456)}, {i});
       if (!result.ok()) {
         EXPECT_EQ(result.code(), absl::StatusCode::kInvalidArgument);
       }
@@ -532,18 +641,18 @@ TEST(TableTest, CheckpointOrderItems) {
 
   auto checkpoint = table->Checkpoint();
   EXPECT_THAT(checkpoint.items,
-              ElementsAre(Partially(testing::EqualsProto("key: 1")),
-                          Partially(testing::EqualsProto("key: 3")),
-                          Partially(testing::EqualsProto("key: 2"))));
+              ElementsAre(Partially(EqualsProto("key: 1")),
+                          Partially(EqualsProto("key: 3")),
+                          Partially(EqualsProto("key: 2"))));
 }
 
 TEST(TableTest, CheckpointSanityCheck) {
-  tensorflow::StructuredValue signature;
+  ::reverb::tensor::SignatureProto signature;
   auto* spec =
-      signature.mutable_list_value()->add_values()->mutable_tensor_spec_value();
-  spec->set_dtype(tensorflow::DT_FLOAT);
-  tensorflow::TensorShapeProto shape;
-  tensorflow::TensorShape({1, 2}).AsProto(spec->mutable_shape());
+      signature.mutable_list_value()->add_values()->mutable_tensor_spec();
+  spec->set_dtype(::reverb::tensor::DT_FLOAT32);
+  spec->mutable_shape()->add_dim(1);
+  spec->mutable_shape()->add_dim(2);
 
   auto table =
       MakeTable("dist", std::make_shared<UniformSelector>(),
@@ -563,7 +672,7 @@ TEST(TableTest, CheckpointSanityCheck) {
   want.mutable_rate_limiter()->set_min_size_to_sample(3);
   want.mutable_rate_limiter()->set_min_diff(-10);
 
-  EXPECT_THAT(checkpoint.checkpoint, Partially(testing::EqualsProto(R"pb(
+  EXPECT_THAT(checkpoint.checkpoint, Partially(EqualsProto(R"pb(
                 table_name: 'dist'
                 max_size: 10
                 max_times_sampled: 1
@@ -581,12 +690,9 @@ TEST(TableTest, CheckpointSanityCheck) {
                 signature: {
                   list_value: {
                     values: {
-                      tensor_spec_value: {
-                        shape: {
-                          dim: { size: 1 }
-                          dim: { size: 2 }
-                        }
-                        dtype: DT_FLOAT
+                      tensor_spec: {
+                        shape: { dim: 1 dim: 2 }
+                        dtype: DT_FLOAT32
                       }
                     }
                   }
@@ -594,7 +700,7 @@ TEST(TableTest, CheckpointSanityCheck) {
               )pb")));
 
   EXPECT_THAT(checkpoint.items,
-              ElementsAre(Partially(testing::EqualsProto("key: 1"))));
+              ElementsAre(Partially(EqualsProto("key: 1"))));
 }
 
 TEST(TableTest, BlocksSamplesWhenSizeToSmallDueToAutoDelete) {
@@ -728,9 +834,9 @@ TEST(TableTest, NumEpisodes) {
   auto table = MakeUniformTable("dist");
 
   std::vector<SequenceRange> ranges{
-      testing::MakeSequenceRange(100, 0, 5),
-      testing::MakeSequenceRange(100, 6, 10),
-      testing::MakeSequenceRange(101, 0, 5),
+      MakeSequenceRange(100, 0, 5),
+      MakeSequenceRange(100, 6, 10),
+      MakeSequenceRange(101, 0, 5),
   };
 
   // First item has a never seen episode before.
@@ -764,9 +870,9 @@ TEST(TableTest, NumDeletedEpisodes) {
   auto table = MakeUniformTable("dist");
 
   std::vector<SequenceRange> ranges{
-      testing::MakeSequenceRange(100, 0, 5),
-      testing::MakeSequenceRange(100, 6, 10),
-      testing::MakeSequenceRange(101, 0, 5),
+      MakeSequenceRange(100, 0, 5),
+      MakeSequenceRange(100, 6, 10),
+      MakeSequenceRange(101, 0, 5),
   };
 
   // Should initially be zero.
@@ -892,7 +998,7 @@ TEST(TableTest, Info) {
   auto info = table->info();
   info.clear_table_worker_time();
 
-  EXPECT_THAT(info, testing::EqualsProto(R"pb(
+  EXPECT_THAT(info, EqualsProto(R"pb(
                 name: 'dist'
                 sampler_options { uniform: true }
                 remover_options { fifo: true is_deterministic: true }
