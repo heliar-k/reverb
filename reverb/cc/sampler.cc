@@ -39,11 +39,10 @@
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/grpc_util.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/tensor_compression.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_util.h"
 
 namespace deepmind {
 namespace reverb {
@@ -59,14 +58,24 @@ constexpr absl::Duration kMinRetryBackoff = absl::Milliseconds(1);
 constexpr absl::Duration kMaxRetryBackoff = absl::Seconds(1);
 
 
+// ponytail: 标量 TensorBuffer 构造,替代 TF `Tensor(scalar)`。
+// T→DataType 映射硬编码为 WithInfoTensors 用到的 5 种。
 template <typename T>
-tensorflow::Tensor ScalarTensor(T value) {
-  // TODO(b/186669968): Move to the Tensor(scalar_value) constructor once
-  // alignment bug is fixed.
-  tensorflow::Tensor tensor(tensorflow::DataTypeToEnum<T>::v(),
-                            tensorflow::TensorShape({}));
-  tensor.scalar<T>()() = std::move(value);
-  return tensor;
+TensorBuffer MakeScalarBuffer(T value) {
+  DataType dt;
+  if constexpr (std::is_same_v<T, uint64_t>) {
+    dt = DataType::Uint64;
+  } else if constexpr (std::is_same_v<T, double>) {
+    dt = DataType::Float64;
+  } else if constexpr (std::is_same_v<T, int64_t>) {
+    dt = DataType::Int64;
+  } else if constexpr (std::is_same_v<T, int32_t>) {
+    dt = DataType::Int32;
+  } else {
+    static_assert(!sizeof(T*), "Unsupported scalar type for MakeScalarBuffer");
+  }
+  std::string bytes(reinterpret_cast<const char*>(&value), sizeof(T));
+  return TensorBuffer(TensorSpec{dt, {}}, std::move(bytes));
 }
 
 absl::Status AsSample(std::vector<SampleStreamResponse::SampleEntry> responses,
@@ -94,7 +103,7 @@ absl::Status AsSample(std::vector<SampleStreamResponse::SampleEntry> responses,
   // Extract all chunks belonging to this sample.
   const auto& columns = info.item().flat_trajectory().columns();
 
-  std::vector<std::vector<tensorflow::Tensor>> column_chunks(columns.size());
+  std::vector<std::vector<TensorBuffer>> column_chunks(columns.size());
   std::vector<bool> squeeze_columns(columns.size());
 
   for (int i = 0; i < columns.size(); i++) {
@@ -135,11 +144,11 @@ absl::Status AsSample(const Table::SampledItem& sampled_item,
     chunks[chunk->key()] = chunk;
   }
 
-  std::vector<std::vector<tensorflow::Tensor>> column_chunks;
+  std::vector<std::vector<TensorBuffer>> column_chunks;
   column_chunks.reserve(sampled_item.ref->flat_trajectory().columns_size());
 
   for (const auto& column : sampled_item.ref->flat_trajectory().columns()) {
-    std::vector<tensorflow::Tensor> unpacked_chunks;
+    std::vector<TensorBuffer> unpacked_chunks;
 
     for (const auto& slice : column.chunk_slices()) {
       unpacked_chunks.emplace_back();
@@ -528,7 +537,7 @@ Sampler::Sampler(std::shared_ptr<Table> table, const Options& options,
 
 Sampler::~Sampler() { Close(); }
 
-absl::Status Sampler::GetNextTimestep(std::vector<tensorflow::Tensor>* data,
+absl::Status Sampler::GetNextTimestep(std::vector<TensorBuffer>* data,
                                       bool* end_of_sequence,
                                       std::shared_ptr<const SampleInfo>* info) {
   REVERB_RETURN_IF_ERROR(MaybeSampleNext());
@@ -557,7 +566,7 @@ absl::Status Sampler::GetNextTimestep(std::vector<tensorflow::Tensor>* data,
 }
 
 absl::Status Sampler::GetNextTrajectory(
-    std::vector<tensorflow::Tensor>* data,
+    std::vector<TensorBuffer>* data,
     std::shared_ptr<const SampleInfo>* info) {
   std::unique_ptr<Sample> sample;
   REVERB_RETURN_IF_ERROR(PopNextSample(&sample));
@@ -574,12 +583,18 @@ absl::Status Sampler::GetNextTrajectory(
 }
 
 absl::Status Sampler::ValidateAgainstOutputSpec(
-    const std::vector<tensorflow::Tensor>& data) {
+    const std::vector<TensorBuffer>& data) {
   if (!dtypes_and_shapes_) {
     return absl::OkStatus();
   }
 
   if (data.size() != dtypes_and_shapes_->size()) {
+    // ponytail: 内联 SpecsFromTensors,避免为替代品新增函数。
+    std::vector<internal::TensorSpec> incoming;
+    incoming.reserve(data.size());
+    for (const auto& t : data) {
+      incoming.push_back({/*name=*/"", t.dtype(), t.shape()});
+    }
     return absl::InvalidArgumentError(absl::StrCat(
         "Inconsistent number of tensors received from table '", table_,
         "'.  Specification has ", dtypes_and_shapes_->size(),
@@ -587,20 +602,21 @@ absl::Status Sampler::ValidateAgainstOutputSpec(
         " tensors.\nTable signature: ",
         internal::DtypesShapesString(*dtypes_and_shapes_),
         ".\nIncoming tensor signature: ",
-        internal::DtypesShapesString(internal::SpecsFromTensors(data))));
+        internal::DtypesShapesString(incoming)));
   }
 
   for (int i = 0; i < data.size(); ++i) {
+    internal::TensorSpec incoming{/*name=*/"", data[i].dtype(), data[i].shape()};
     if (data[i].dtype() != dtypes_and_shapes_->at(i).dtype ||
-        !dtypes_and_shapes_->at(i).shape.IsCompatibleWith(data[i].shape())) {
+        !dtypes_and_shapes_->at(i).IsCompatibleWith(incoming)) {
       return absl::InvalidArgumentError(absl::StrCat(
           "Received incompatible tensor at flattened index ", i,
           " from table '", table_, "'.  Specification has (dtype, shape): (",
-          tensorflow::DataTypeString(dtypes_and_shapes_->at(i).dtype), ", ",
-          dtypes_and_shapes_->at(i).shape.DebugString(),
+          DataTypeName(dtypes_and_shapes_->at(i).dtype), ", ",
+          dtypes_and_shapes_->at(i).DebugString(),
           ").  Tensor has (dtype, shape): (",
-          tensorflow::DataTypeString(data[i].dtype()), ", ",
-          data[i].shape().DebugString(), ").\nTable signature: ",
+          DataTypeName(data[i].dtype()), ", ", incoming.DebugString(),
+          ").\nTable signature: ",
           internal::DtypesShapesString(*dtypes_and_shapes_)));
     }
   }
@@ -701,7 +717,7 @@ void Sampler::RunWorker(SamplerWorker* worker) {
 }
 
 Sample::Sample(std::shared_ptr<const SampleInfo> info,
-               std::vector<std::vector<tensorflow::Tensor>> column_chunks,
+               std::vector<std::vector<TensorBuffer>> column_chunks,
                std::vector<bool> squeeze_columns)
     : info_(std::move(info)),
       num_timesteps_(-1),
@@ -726,29 +742,33 @@ Sample::Sample(std::shared_ptr<const SampleInfo> info,
       // Note that we can safely assume that the tensor is not a scalar since a
       // batch dimension is always added when building a chunk. A scalar would
       // thus be represented as a tensor of shape [1].
-      num_timesteps_ += column_slice.tensor.dim_size(0);
+      num_timesteps_ += column_slice.tensor.shape().empty()
+                            ? 1
+                            : column_slice.tensor.shape()[0];
     }
   }
 }
 
-std::vector<tensorflow::Tensor> Sample::GetNextTimestep() {
+std::vector<TensorBuffer> Sample::GetNextTimestep() {
   REVERB_CHECK(!is_end_of_sample());
   REVERB_CHECK(is_composed_of_timesteps());
 
   next_timestep_called_ = true;
 
   // Construct the output tensors.
-  std::vector<tensorflow::Tensor> result;
+  std::vector<TensorBuffer> result;
   result.reserve(columns_.size());
 
   for (auto& col : columns_) {
+    // ponytail: TensorBuffer.SubSlice 已返回拷贝(无共享内存),
+    // 无需对齐检查/DeepCopy。
     auto slice = col.front().tensor.SubSlice(col.front().offset++);
-    if (!slice.IsAligned()) {
-      slice = tensorflow::tensor::DeepCopy(slice);
-    }
     result.push_back(std::move(slice));
 
-    if (col.front().offset == col.front().tensor.dim_size(0)) {
+    int64_t dim0 = col.front().tensor.shape().empty()
+                       ? 1
+                       : col.front().tensor.shape()[0];
+    if (col.front().offset == dim0) {
       col.pop_front();
     }
   }
@@ -769,7 +789,9 @@ bool Sample::is_composed_of_timesteps() const {
       // Note that we can safely assume that the tensor is not a scalar since a
       // batch dimension is always added when building a chunk. A scalar would
       // thus be represented as a tensor of shape [1].
-      column_length += column_slice.tensor.dim_size(0);
+      column_length += column_slice.tensor.shape().empty()
+                           ? 1
+                           : column_slice.tensor.shape()[0];
     }
 
     if (prev_column_length != -1 && prev_column_length != column_length) {
@@ -780,12 +802,12 @@ bool Sample::is_composed_of_timesteps() const {
   return true;
 }
 
-absl::Status Sample::AsTrajectory(std::vector<tensorflow::Tensor>* data) {
+absl::Status Sample::AsTrajectory(std::vector<TensorBuffer>* data) {
   if (next_timestep_called_) {
     return absl::DataLossError(
         "Sample::AsBatchedTimesteps: Some time steps have been lost.");
   }
-  std::vector<tensorflow::Tensor> sequences(columns_.size());
+  std::vector<TensorBuffer> sequences(columns_.size());
 
   // Unpack the data columns.
   for (int i = 0; i < columns_.size(); i++) {
@@ -796,29 +818,32 @@ absl::Status Sample::AsTrajectory(std::vector<tensorflow::Tensor>* data) {
     if (column.size() == 1) {
       sequences[i] = std::move(column.front().tensor);
     } else {
-      std::vector<tensorflow::Tensor> column_tensors;
+      std::vector<TensorBuffer> column_tensors;
       column_tensors.reserve(column.size());
       for (auto& slice : column) {
         column_tensors.push_back(std::move(slice.tensor));
       }
 
-      REVERB_RETURN_IF_ERROR(
-          tensorflow::tensor::Concat(column_tensors, &sequences[i]));
+      absl::StatusOr<TensorBuffer> concatenated =
+          TensorBuffer::Concat(column_tensors);
+      REVERB_RETURN_IF_ERROR(concatenated.status());
+      sequences[i] = *std::move(concatenated);
     }
   }
 
   // Remove batch dimension from squeezed columns.
   for (int i = 0; i < squeeze_columns_.size(); i++) {
     if (!squeeze_columns_[i]) continue;
-    if (int batch_dim = sequences[i].shape().dim_size(0); batch_dim != 1) {
+    int64_t batch_dim = sequences[i].shape().empty()
+                            ? 1
+                            : sequences[i].shape()[0];
+    if (batch_dim != 1) {
       return absl::InternalError(absl::StrCat(
           "Tried to squeeze column with batch size ", batch_dim, "."));
     }
 
+    // ponytail: SubSlice(0) 去掉 batch 维,返回拷贝(无需 DeepCopy)。
     sequences[i] = sequences[i].SubSlice(0);
-    if (!sequences[i].IsAligned()) {
-      sequences[i] = tensorflow::tensor::DeepCopy(sequences[i]);
-    }
   }
 
   std::swap(sequences, *data);
@@ -856,14 +881,14 @@ absl::Status Sampler::Options::Validate() const {
   return absl::OkStatus();
 }
 
-std::vector<tensorflow::Tensor> Sampler::WithInfoTensors(
-    const SampleInfo& info, std::vector<tensorflow::Tensor> data) {
-  std::vector<tensorflow::Tensor> flat(kNumInfoTensors + data.size());
-  flat[0] = ScalarTensor(info.item().key());
-  flat[1] = ScalarTensor(info.probability());
-  flat[2] = ScalarTensor(info.table_size());
-  flat[3] = ScalarTensor(info.item().priority());
-  flat[4] = ScalarTensor(info.item().times_sampled());
+std::vector<TensorBuffer> Sampler::WithInfoTensors(
+    const SampleInfo& info, std::vector<TensorBuffer> data) {
+  std::vector<TensorBuffer> flat(kNumInfoTensors + data.size());
+  flat[0] = MakeScalarBuffer(info.item().key());
+  flat[1] = MakeScalarBuffer(info.probability());
+  flat[2] = MakeScalarBuffer(info.table_size());
+  flat[3] = MakeScalarBuffer(info.item().priority());
+  flat[4] = MakeScalarBuffer(info.item().times_sampled());
   for (int i = 0; i < data.size(); i++) {
     flat[i + kNumInfoTensors] = std::move(data[i]);
   }

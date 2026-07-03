@@ -105,9 +105,19 @@ cc_test(
     ],
 )
 
-reverb_cc_test(
+# ponytail: 原生 cc_test,去 reverb_tf_deps() + :tensor_testutil(后者依赖 TF)。
+# 测试数据构造/比较内联(MakeTensor/SliceRows/ExpectTensorBufferEqual),
+# 见 sampler_test.cc。grpc++ 为 FakeStub/gRPC worker 所需。
+cc_test(
     name = "sampler_test",
     srcs = ["sampler_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :sampler -> :tensor_proxy(pybind11/numpy C-API),需链接 libpython。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunk_store",
         ":reverb_service_cc_grpc_proto",
@@ -118,15 +128,19 @@ reverb_cc_test(
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
         "//reverb/cc/selectors:fifo",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/testing:time_testutil",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_github_grpc_grpc//:grpc++_test",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 reverb_cc_test(
@@ -264,10 +278,19 @@ cc_library(
     ],
 )
 
-reverb_cc_library(
+# ponytail: 原生 cc_library,去 reverb_tf_deps() 注入(Task 9)。sampler.h/cc 已无 TF include,
+# 数据出口改为 TensorBuffer。GrpcSamplerWorker 仍需 grpc++。
+cc_library(
     name = "sampler",
     srcs = ["sampler.cc"],
     hdrs = ["sampler.h"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :tensor_proxy(pybind11/numpy C-API),需链接 libpython 解析 Py* 符号。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunk_store",
         ":errors",
@@ -284,14 +307,17 @@ reverb_cc_library(
         "//reverb/cc/support:grpc_util",
         "//reverb/cc/support:queue",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/support:trajectory_util",
+        "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+    ],
 )
 
 reverb_cc_library(

@@ -30,8 +30,8 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/queue.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/table.h"
-#include "tensorflow/core/framework/tensor.h"
 
 namespace deepmind {
 namespace reverb {
@@ -54,19 +54,19 @@ inline absl::Duration Int64MillisToNonnegativeDuration(int64_t milliseconds) {
 class Sample {
  public:
   Sample(std::shared_ptr<const SampleInfo> info,
-         std::vector<std::vector<tensorflow::Tensor>> column_chunks,
+         std::vector<std::vector<TensorBuffer>> column_chunks,
          std::vector<bool> squeeze_columns);
 
   // Returns the next time step from this sample as a flat sequence of tensors.
   // CHECK-fails if the entire sample has already been returned.
-  std::vector<tensorflow::Tensor> GetNextTimestep();
+  std::vector<TensorBuffer> GetNextTimestep();
 
   // Returns the trajectory as a flat sequence of tensors representing the
   // columns of the flattened trajectory.
   //
   // Fails with `DataLossError` if `GetNextTimestep()` has already been called
   // on this sample.
-  absl::Status AsTrajectory(std::vector<tensorflow::Tensor>* data);
+  absl::Status AsTrajectory(std::vector<TensorBuffer>* data);
 
   // Returns true if the end of the sample has been reached.
   ABSL_MUST_USE_RESULT bool is_end_of_sample() const;
@@ -89,7 +89,7 @@ class Sample {
 
   struct ColumnChunk {
     // Unpacked chunk, and potentially sliced, chunk content.
-    tensorflow::Tensor tensor;
+    TensorBuffer tensor;
 
     // Index of the next sub slice to return when emitting timesteps.
     int offset = 0;
@@ -203,8 +203,8 @@ class Sampler {
   //   * [int32_t] The number of times the item has been sampled (including this
   //     sample).
   //
-  static std::vector<tensorflow::Tensor> WithInfoTensors(
-      const SampleInfo& info, std::vector<tensorflow::Tensor> data);
+  static std::vector<TensorBuffer> WithInfoTensors(
+      const SampleInfo& info, std::vector<TensorBuffer> data);
 
   struct Options {
     // `max_samples` is the maximum number of samples the object will return.
@@ -277,7 +277,7 @@ class Sampler {
   // NOTE! `info.item` may not be fully populated. Only `key`, `priority` and
   // `times_sampled` are guaranteed to be set.
   absl::Status GetNextTimestep(
-      std::vector<tensorflow::Tensor>* data, bool* end_of_sequence,
+      std::vector<TensorBuffer>* data, bool* end_of_sequence,
       std::shared_ptr<const SampleInfo>* info = nullptr);
 
   // Blocks until a complete sample has been retrieved or until a non transient
@@ -289,7 +289,7 @@ class Sampler {
   // NOTE! `info.item` may not be fully populated. Only `key`, `priority` and
   // `times_sampled` are guaranteed to be set.
   absl::Status GetNextTrajectory(
-      std::vector<tensorflow::Tensor>* data,
+      std::vector<TensorBuffer>* data,
       std::shared_ptr<const SampleInfo>* info = nullptr);
 
   // Cancels all workers and joins their threads. Any blocking or future call
@@ -306,7 +306,7 @@ class Sampler {
           const Options& options, internal::DtypesAndShapes dtypes_and_shapes);
 
   absl::Status ValidateAgainstOutputSpec(
-      const std::vector<tensorflow::Tensor>& data);
+      const std::vector<TensorBuffer>& data);
 
   void RunWorker(SamplerWorker* worker) ABSL_LOCKS_EXCLUDED(mu_);
 
