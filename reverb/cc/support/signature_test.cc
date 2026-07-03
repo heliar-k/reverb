@@ -18,234 +18,259 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_matchers.h"
-#include "reverb/cc/testing/proto_test_util.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/protobuf/struct.pb.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
+// ponytail: 本地内联 proto 匹配工具,避免拉入 //reverb/cc/testing:proto_test_util
+// (该 cc_library 的 .cc 仍依赖 TF CompressTensorAsProto,Task 4 后未迁移)。
+// 升级路径: Task 7 迁完测试工具后改回 #include proto_test_util.h。
+#include "google/protobuf/text_format.h"
+#include "google/protobuf/util/message_differencer.h"
 
 namespace deepmind {
 namespace reverb {
 namespace internal {
 namespace {
 
-using ::deepmind::reverb::testing::EqualsProto;
+using ::reverb::tensor::SignatureProto;
 
-tensorflow::StructuredValue MakeLeaf(
-    const std::string& name,
-    tensorflow::DataType dtype = tensorflow::DT_FLOAT,
-    const tensorflow::PartialTensorShape& shape =
-        tensorflow::PartialTensorShape()) {
-  tensorflow::StructuredValue value;
-  tensorflow::TensorSpecProto* tensor_spec = value.mutable_tensor_spec_value();
+template <typename T>
+T CreateProto(const std::string& textual_proto) {
+  T proto;
+  REVERB_CHECK(google::protobuf::TextFormat::ParseFromString(textual_proto,
+                                                              &proto));
+  return proto;
+}
+
+// Compares two protos by full equality via MessageDifferencer.
+class ProtoStringMatcher {
+ public:
+  explicit ProtoStringMatcher(const std::string& expected)
+      : expected_proto_str_(expected) {}
+  template <typename Message>
+  bool MatchAndExplain(const Message& actual_proto,
+                      ::testing::MatchResultListener* listener) const {
+    Message expected_proto = CreateProto<Message>(expected_proto_str_);
+    google::protobuf::util::MessageDifferencer differencer;
+    std::string differences;
+    differencer.ReportDifferencesToString(&differences);
+    if (!differencer.Compare(expected_proto, actual_proto)) {
+      *listener << "the protos are different:\n" << differences;
+      return false;
+    }
+    return true;
+  }
+  void DescribeTo(::std::ostream* os) const { *os << expected_proto_str_; }
+  void DescribeNegationTo(::std::ostream* os) const {
+    *os << "not equal to expected message: " << expected_proto_str_;
+  }
+ private:
+  const std::string expected_proto_str_;
+};
+
+inline ::testing::PolymorphicMatcher<ProtoStringMatcher> EqualsProto(
+    const std::string& x) {
+  return ::testing::MakePolymorphicMatcher(ProtoStringMatcher(x));
+}
+
+// Builds a TensorSpec leaf. An empty `shape` represents a scalar (rank 0).
+SignatureProto MakeLeaf(const std::string& name,
+                        ::reverb::tensor::DataType dtype =
+                            ::reverb::tensor::DT_FLOAT32,
+                        const std::vector<int64_t>& shape = {}) {
+  SignatureProto value;
+  SignatureProto::TensorSpec* tensor_spec = value.mutable_tensor_spec();
   tensor_spec->set_name(name);
   tensor_spec->set_dtype(dtype);
-  shape.AsProto(tensor_spec->mutable_shape());
+  for (int64_t d : shape) tensor_spec->mutable_shape()->add_dim(d);
   return value;
 }
 
-TEST(FlatSignatureFromStructuredValueTest, TensorSpec) {
-  tensorflow::StructuredValue value =
-      MakeLeaf("leaf", tensorflow::DT_FLOAT, tensorflow::PartialTensorShape());
+TEST(FlatSignatureFromSignatureProtoTest, TensorSpec) {
+  SignatureProto value = MakeLeaf("leaf");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
   EXPECT_TRUE(status.ok());
   EXPECT_TRUE(dtypes_and_shapes.has_value());
   EXPECT_EQ(dtypes_and_shapes.value().size(), 1);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "leaf");
-  EXPECT_EQ(dtypes_and_shapes.value()[0].dtype, tensorflow::DT_FLOAT);
-  EXPECT_EQ(dtypes_and_shapes.value()[0].shape.dims(), -1);
+  EXPECT_EQ(dtypes_and_shapes.value()[0].dtype, DataType::Float32);
+  EXPECT_TRUE(dtypes_and_shapes.value()[0].shape.empty());
 }
 
-TEST(FlatSignatureFromStructuredValueTest, BoundedTensorSpec) {
-  tensorflow::StructuredValue value;
-  tensorflow::BoundedTensorSpecProto* bounded_tensor_spec =
-      value.mutable_bounded_tensor_spec_value();
+TEST(FlatSignatureFromSignatureProtoTest, BoundedTensorSpec) {
+  SignatureProto value;
+  SignatureProto::BoundedTensorSpec* bounded_tensor_spec =
+      value.mutable_bounded_tensor_spec();
   bounded_tensor_spec->set_name("leaf");
-  bounded_tensor_spec->set_dtype(tensorflow::DT_INT32);
-  tensorflow::PartialTensorShape({8}).AsProto(
-      bounded_tensor_spec->mutable_shape());
-  tensorflow::Tensor(0).AsProtoTensorContent(
-      bounded_tensor_spec->mutable_minimum());
-  tensorflow::Tensor(255).AsProtoTensorContent(
-      bounded_tensor_spec->mutable_maximum());
+  bounded_tensor_spec->set_dtype(::reverb::tensor::DT_INT32);
+  bounded_tensor_spec->mutable_shape()->add_dim(8);
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
   EXPECT_TRUE(status.ok());
   EXPECT_TRUE(dtypes_and_shapes.has_value());
   EXPECT_EQ(dtypes_and_shapes.value().size(), 1);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "leaf");
-  EXPECT_EQ(dtypes_and_shapes.value()[0].dtype, tensorflow::DT_INT32);
-  EXPECT_EQ(dtypes_and_shapes.value()[0].shape.dims(), 1);
+  EXPECT_EQ(dtypes_and_shapes.value()[0].dtype, DataType::Int32);
+  ASSERT_EQ(dtypes_and_shapes.value()[0].shape.size(), 1);
+  EXPECT_EQ(dtypes_and_shapes.value()[0].shape[0], 8);
 }
 
-TEST(FlatSignatureFromStructuredValueTest, ListNaming) {
-  tensorflow::StructuredValue value;
+TEST(FlatSignatureFromSignatureProtoTest, ListNaming) {
+  SignatureProto value;
   *value.mutable_list_value()->add_values() = MakeLeaf("one");
   *value.mutable_list_value()->add_values() = MakeLeaf("two");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 2);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 2);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "0/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "1/two");
 }
 
-TEST(FlatSignatureFromStructuredValueTest, TupleNaming) {
-  tensorflow::StructuredValue value;
+TEST(FlatSignatureFromSignatureProtoTest, TupleNaming) {
+  SignatureProto value;
   *value.mutable_tuple_value()->add_values() = MakeLeaf("one");
   *value.mutable_tuple_value()->add_values() = MakeLeaf("two");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 2);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 2);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "0/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "1/two");
 }
 
-TEST(FlatSignatureFromStructuredValueTest, DictNaming) {
-  tensorflow::StructuredValue value;
-  (*value.mutable_dict_value()->mutable_fields())["a"] = MakeLeaf("one");
-  (*value.mutable_dict_value()->mutable_fields())["b"] = MakeLeaf("two");
+TEST(FlatSignatureFromSignatureProtoTest, DictNaming) {
+  SignatureProto value;
+  (*value.mutable_dict_value()->mutable_values())["a"] = MakeLeaf("one");
+  (*value.mutable_dict_value()->mutable_values())["b"] = MakeLeaf("two");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 2);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 2);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "a/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "b/two");
 }
 
-TEST(FlatSignatureFromStructuredValueTest, NamedTupleNaming) {
-  tensorflow::StructuredValue value;
+TEST(FlatSignatureFromSignatureProtoTest, NamedTupleNaming) {
+  SignatureProto value;
   value.mutable_named_tuple_value()->set_name("namedtuple");
-  auto* one = value.mutable_named_tuple_value()->add_values();
-  one->set_key("a");
-  *one->mutable_value() = MakeLeaf("one");
-  auto* two = value.mutable_named_tuple_value()->add_values();
-  two->set_key("b");
-  *two->mutable_value() = MakeLeaf("two");
-  auto* three = value.mutable_named_tuple_value()->add_values();
-  three->set_key("c");
-  *three->mutable_value() = MakeLeaf("three");
+  value.mutable_named_tuple_value()->add_keys("a");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("one");
+  value.mutable_named_tuple_value()->add_keys("b");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("two");
+  value.mutable_named_tuple_value()->add_keys("c");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("three");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 3);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 3);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "a/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "b/two");
   EXPECT_EQ(dtypes_and_shapes.value()[2].name, "c/three");
 }
 
-TEST(FlatSignatureFromStructuredValueTest, NestedNaming) {
-  tensorflow::StructuredValue value;
+TEST(FlatSignatureFromSignatureProtoTest, NestedNaming) {
+  SignatureProto value;
   value.mutable_named_tuple_value()->set_name("namedtuple");
-  auto* one = value.mutable_named_tuple_value()->add_values();
-  one->set_key("a");
-  *one->mutable_value()->mutable_list_value()->add_values() = MakeLeaf("one");
-  *one->mutable_value()->mutable_list_value()->add_values() = MakeLeaf("two");
-  auto* two = value.mutable_named_tuple_value()->add_values();
-  two->set_key("b");
-  *two->mutable_value() = MakeLeaf("three");
-  auto* three = value.mutable_named_tuple_value()->add_values();
-  three->set_key("c");
-  *three->mutable_value() = MakeLeaf("four");
+  value.mutable_named_tuple_value()->add_keys("a");
+  *value.mutable_named_tuple_value()->add_values()->mutable_list_value()
+       ->add_values() = MakeLeaf("one");
+  *value.mutable_named_tuple_value()->mutable_values(0)
+       ->mutable_list_value()
+       ->add_values() = MakeLeaf("two");
+  value.mutable_named_tuple_value()->add_keys("b");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("three");
+  value.mutable_named_tuple_value()->add_keys("c");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("four");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 4);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 4);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "a/0/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "a/1/two");
   EXPECT_EQ(dtypes_and_shapes.value()[2].name, "b/three");
   EXPECT_EQ(dtypes_and_shapes.value()[3].name, "c/four");
 }
 
-TEST(FlatSignatureFromStructuredValueTest, EmptyLeaf) {
-  tensorflow::StructuredValue value;
+TEST(FlatSignatureFromSignatureProtoTest, EmptyLeaf) {
+  SignatureProto value;
   value.mutable_named_tuple_value()->set_name("namedtuple");
-  auto* one = value.mutable_named_tuple_value()->add_values();
-  one->set_key("a");
-  *one->mutable_value()->mutable_list_value()->add_values() = MakeLeaf("one");
-  *one->mutable_value()->mutable_list_value()->add_values() = MakeLeaf("");
-  auto* two = value.mutable_named_tuple_value()->add_values();
-  two->set_key("b");
-  *two->mutable_value() = MakeLeaf("two");
+  value.mutable_named_tuple_value()->add_keys("a");
+  *value.mutable_named_tuple_value()->add_values()->mutable_list_value()
+       ->add_values() = MakeLeaf("one");
+  *value.mutable_named_tuple_value()->mutable_values(0)
+       ->mutable_list_value()
+       ->add_values() = MakeLeaf("");
+  value.mutable_named_tuple_value()->add_keys("b");
+  *value.mutable_named_tuple_value()->add_values() = MakeLeaf("two");
 
   DtypesAndShapes dtypes_and_shapes = DtypesAndShapes::value_type({});
-  auto status = FlatSignatureFromStructuredValue(value, &dtypes_and_shapes);
-  EXPECT_EQ(dtypes_and_shapes.value().size(), 3);
+  auto status = FlatSignatureFromSignatureProto(value, &dtypes_and_shapes);
+  ASSERT_TRUE(dtypes_and_shapes.has_value());
+  ASSERT_EQ(dtypes_and_shapes.value().size(), 3);
   EXPECT_EQ(dtypes_and_shapes.value()[0].name, "a/0/one");
   EXPECT_EQ(dtypes_and_shapes.value()[1].name, "a/1");
   EXPECT_EQ(dtypes_and_shapes.value()[2].name, "b/two");
 }
 
 TEST(AddBatchDim, EmptyStructure) {
-  tensorflow::StructuredValue value;
+  SignatureProto value;
   REVERB_EXPECT_OK(AddBatchDim(&value, 10));
   EXPECT_THAT(value, EqualsProto(""));
 }
 
 TEST(AddBatchDim, NestedStructure) {
-  auto value = testing::CreateProto<tensorflow::StructuredValue>(R"pb(
+  auto value = CreateProto<SignatureProto>(R"pb(
     dict_value {
-      fields {
+      values {
         key: "a"
         value {
           list_value {
             values {
-              tensor_spec_value {
+              tensor_spec {
                 name: "spec_1"
-                shape {
-                  dim { size: 5 }
-                }
-                dtype: DT_FLOAT
+                shape { dim: 5 }
+                dtype: DT_FLOAT32
               }
             }
             values {
-              bounded_tensor_spec_value {
+              bounded_tensor_spec {
                 name: "bounded_spec_1"
                 shape {}
                 dtype: DT_INT32
-                minimum {
-                  dtype: DT_INT32
-                  tensor_shape {}
-                  int_val: 1
-                }
-                maximum {
-                  dtype: DT_INT32
-                  tensor_shape {}
-                  int_val: 3
-                }
               }
             }
           }
         }
       }
-      fields {
+      values {
         key: "b"
         value {
           tuple_value {
             values {
-              tensor_spec_value {
+              tensor_spec {
                 name: "spec_2"
-                shape {
-                  dim { size: 1 }
-                }
-                dtype: DT_DOUBLE
+                shape { dim: 1 }
+                dtype: DT_FLOAT64
               }
             }
             values {
               named_tuple_value {
                 name: "named_tuple"
+                keys: "first"
                 values {
-                  key: "first"
-                  value {
-                    tensor_spec_value {
-                      name: "spec_3"
-                      shape {}
-                      dtype: DT_BFLOAT16
-                    }
+                  tensor_spec {
+                    name: "spec_3"
+                    shape {}
+                    dtype: DT_BOOL
                   }
                 }
               }
@@ -258,69 +283,47 @@ TEST(AddBatchDim, NestedStructure) {
   REVERB_EXPECT_OK(AddBatchDim(&value, 10));
   EXPECT_THAT(value, EqualsProto(R"pb(
     dict_value {
-      fields {
+      values {
         key: "a"
         value {
           list_value {
             values {
-              tensor_spec_value {
+              tensor_spec {
                 name: "spec_1"
-                shape {
-                   dim { size: 10 }
-                   dim { size: 5 }
-                }
-                dtype: DT_FLOAT
+                shape { dim: 10 dim: 5 }
+                dtype: DT_FLOAT32
               }
             }
             values {
-              bounded_tensor_spec_value {
+              bounded_tensor_spec {
                 name: "bounded_spec_1"
-                shape {
-                  dim { size: 10 }
-                }
+                shape { dim: 10 }
                 dtype: DT_INT32
-                minimum {
-                  dtype: DT_INT32
-                  tensor_shape {}
-                  int_val: 1
-                }
-                maximum {
-                  dtype: DT_INT32
-                  tensor_shape {}
-                  int_val: 3
-                }
               }
             }
           }
         }
       }
-      fields {
+      values {
         key: "b"
         value {
           tuple_value {
             values {
-              tensor_spec_value {
+              tensor_spec {
                 name: "spec_2"
-                shape {
-                  dim { size: 10 }
-                  dim { size: 1 }
-                }
-                dtype: DT_DOUBLE
+                shape { dim: 10 dim: 1 }
+                dtype: DT_FLOAT64
               }
             }
             values {
               named_tuple_value {
                 name: "named_tuple"
+                keys: "first"
                 values {
-                  key: "first"
-                  value {
-                    tensor_spec_value {
-                      name: "spec_3"
-                      shape {
-                        dim { size: 10 }
-                      }
-                      dtype: DT_BFLOAT16
-                    }
+                  tensor_spec {
+                    name: "spec_3"
+                    shape { dim: 10 }
+                    dtype: DT_BOOL
                   }
                 }
               }

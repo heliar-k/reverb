@@ -15,6 +15,7 @@
 #ifndef REVERB_CC_SUPPORT_SIGNATURE_H_
 #define REVERB_CC_SUPPORT_SIGNATURE_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -22,19 +23,26 @@
 #include "absl/types/optional.h"
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/table.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/protobuf/struct.pb.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
 namespace reverb {
 namespace internal {
 
+// Description of a single tensor column. `shape` uses -1 for an unknown
+// (wildcard) dimension, mirroring the semantics of TF's PartialTensorShape
+// without pulling in TensorFlow.
 struct TensorSpec {
   std::string name;
-  tensorflow::DataType dtype;
-  tensorflow::PartialTensorShape shape;
+  DataType dtype;
+  std::vector<int64_t> shape;
+
+  // Two specs are compatible iff they have the same rank and, per dimension,
+  // either side is -1 (wildcard) or the sizes are equal. `dtype` must match.
+  bool IsCompatibleWith(const TensorSpec& other) const;
+  std::string DebugString() const;
 };
 
 typedef absl::optional<std::vector<TensorSpec>> DtypesAndShapes;
@@ -42,18 +50,21 @@ typedef absl::optional<std::vector<TensorSpec>> DtypesAndShapes;
 absl::Status FlatSignatureFromTableInfo(
     const TableInfo& info, DtypesAndShapes* dtypes_and_shapes);
 
-absl::Status FlatSignatureFromStructuredValue(
-    const tensorflow::StructuredValue& value,
+absl::Status FlatSignatureFromSignatureProto(
+    const ::reverb::tensor::SignatureProto& value,
     DtypesAndShapes* dtypes_and_shapes);
 
-absl::Status AddBatchDim(tensorflow::StructuredValue* value, int batch_size);
+absl::Status AddBatchDim(::reverb::tensor::SignatureProto* value,
+                         int batch_size);
 
-tensorflow::StructuredValue StructuredValueFromChunkData(
+// Infers a SignatureProto (a ListValue of TensorSpecs) from the tensors stored
+// in `chunk_data`. The leading (batch) dimension is dropped from each spec.
+::reverb::tensor::SignatureProto SignatureProtoFromChunkData(
     const ChunkData& chunk_data);
 
-// Create a structured value of the trajectory referenced by `item`. Non
+// Create a SignatureProto of the trajectory referenced by `item`. Non
 // squeezed columns are assigned a batch dimension of -1.
-tensorflow::StructuredValue StructuredValueFromItem(const TableItem& item);
+::reverb::tensor::SignatureProto SignatureProtoFromItem(const TableItem& item);
 
 // Map from table name to optional vector of flattened (dtype, shape) pairs.
 typedef internal::flat_hash_map<std::string, internal::DtypesAndShapes>
@@ -61,10 +72,6 @@ typedef internal::flat_hash_map<std::string, internal::DtypesAndShapes>
 
 std::string DtypesShapesString(
     const std::vector<internal::TensorSpec>& dtypes_and_shapes);
-std::string DtypesShapesString(const std::vector<tensorflow::Tensor>& tensors);
-
-std::vector<internal::TensorSpec> SpecsFromTensors(
-    const std::vector<tensorflow::Tensor>& tensors);
 
 }  // namespace internal
 }  // namespace reverb

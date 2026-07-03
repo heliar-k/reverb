@@ -122,34 +122,48 @@ reverb_cc_test(
     ],
 )
 
-reverb_cc_library(
+cc_library(
     name = "signature",
     srcs = ["signature.cc"],
     hdrs = ["signature.h"],
     deps = [
-        ":trajectory_util",
+        ":tensor_proxy",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:table",
         "//reverb/cc/platform:hash_map",
-        "//reverb/cc/platform:hash_set",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps(),
+    ],
+    visibility = ["//reverb:__subpackages__"],
 )
 
-reverb_cc_test(
+cc_test(
     name = "signature_test",
     srcs = ["signature_test.cc"],
+    # ponytail: :signature 依赖 :tensor_proxy(pybind11/numpy),运行时需 libpython。
+    # 升级路径: 若 :tensor_proxy 拆出无 Python 的 data_type 子库,可去掉此 linkopts。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":signature",
+        "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/testing:proto_test_util",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:string_view",
-    ] + reverb_tf_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
 )
 
 reverb_cc_library(
