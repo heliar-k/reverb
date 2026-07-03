@@ -185,6 +185,11 @@ cc_test(
     name = "simple_checkpointer_test",
     srcs = ["simple_checkpointer_test.cc"],
     copts = ["-Wno-sign-compare"],
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":simple_checkpointer",
         "//reverb/cc:chunk_store",
