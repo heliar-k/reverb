@@ -2,6 +2,6 @@ absl_py
 dm_tree
 numpy
 portpicker
-tf_nightly~=2.21.0.dev
 packaging
 build
+# ponytail: tf_nightly 已移除——内嵌 numpy 模式不需要 TF。

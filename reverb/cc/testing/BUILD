@@ -1,7 +1,6 @@
 load(
     "//reverb/cc/platform:build_rules.bzl",
     "reverb_cc_library",
-    "reverb_tf_deps",
 )
 
 package(
@@ -21,7 +20,11 @@ reverb_cc_library(
         "//reverb/cc:tensor_compression",
         "//reverb/cc/platform:logging",
         "@com_google_absl//absl/log:check",
-    ] + reverb_tf_deps(),
+        # ponytail: 此 TF-era 测试辅助直接 include tensorflow/... 头文件,显式依赖
+        # @pypi//tf_nightly。内嵌路径不依赖此 target,故不影响 numpy-only 链路。
+        "@pypi//tf_nightly:headers_lib",
+        "@pypi//tf_nightly:framework_lib",
+    ],
 )
 
 reverb_cc_library(
@@ -30,7 +33,10 @@ reverb_cc_library(
     hdrs = ["tensor_testutil.h"],
     deps = [
         "//reverb/cc/platform:logging",
-    ] + reverb_tf_deps(),
+        # ponytail: TF-era 测试辅助,显式依赖 TF 头文件(同上)。
+        "@pypi//tf_nightly:headers_lib",
+        "@pypi//tf_nightly:framework_lib",
+    ],
 )
 
 reverb_cc_library(

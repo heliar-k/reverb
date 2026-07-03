@@ -193,24 +193,26 @@ def patch_so(srcs_dir: str) -> None:
   Args:
     srcs_dir: target directory with .so files to patch.
   """
+  # ponytail: libpybind.so 已无 TF 符号,不再需要 rpath 指向 tensorflow 目录。
+  # 保留 patchelf 收缩 rpath 逻辑以适配 auditwheel。
   to_patch = {
-      "reverb/libpybind.so": "$ORIGIN/../tensorflow",
+      "reverb/libpybind.so": "",
   }
-  for file, path in to_patch.items():
+  for file, _ in to_patch.items():
+    path = "{}/{}".format(srcs_dir, file)
     rpath = (
         subprocess.check_output(
-            ["patchelf", "--print-rpath", "{}/{}".format(srcs_dir, file)]
+            ["patchelf", "--print-rpath", path]
         )
         .decode()
         .strip()
     )
-    new_rpath = rpath + ":" + path
     subprocess.run(
-        ["patchelf", "--set-rpath", new_rpath, "{}/{}".format(srcs_dir, file)],
+        ["patchelf", "--set-rpath", rpath, path],
         check=True,
     )
     subprocess.run(
-        ["patchelf", "--shrink-rpath", "{}/{}".format(srcs_dir, file)],
+        ["patchelf", "--shrink-rpath", path],
         check=True,
     )
 

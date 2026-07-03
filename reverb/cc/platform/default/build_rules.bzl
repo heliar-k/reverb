@@ -599,10 +599,10 @@ def reverb_tf_ops_visibility():
     ]
 
 def reverb_tf_deps():
-    return [
-        "@pypi//tf_nightly:headers_lib",
-        "@pypi//tf_nightly:framework_lib",
-    ]
+    # ponytail: TF 依赖已移除——内嵌 numpy 模式不需要 TF。保留函数签名
+    # 兼容 reverb_cc_library/reverb_cc_test 的调用点。client.cc 等仍含 TF
+    # include 的文件不在编译路径内,故返回空列表不破坏内嵌链路。
+    return []
 
 def reverb_grpc_deps():
     return ["@com_github_grpc_grpc//:grpc++"]
