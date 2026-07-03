@@ -15,18 +15,25 @@
 #ifndef REVERB_CC_PLATFORM_DEFAULT_HASH_H_
 #define REVERB_CC_PLATFORM_DEFAULT_HASH_H_
 
+#include <cstddef>
+
+#include "absl/hash/hash.h"
 #include "absl/strings/cord.h"
 #include "absl/strings/string_view.h"
-#include "tensorflow/core/platform/hash.h"
 
 namespace deepmind {
 namespace reverb {
 namespace internal {
 
+// ponytail: replaced tensorflow::hash with absl::Hash to drop the TF dependency
+// that was transitively pulled into every target via hash_map/hash_set. absl::Hash
+// covers the same key types (string_view, Cord, pointers, ints) with comparable
+// quality. Upgrade path: none needed unless a specific TF hash seed is required.
+
 // The hash of an object of type T is computed by using ConsistentHash.
 template <class T, class E = void>
 struct HashEq {
-  using Hash = tensorflow::hash<T>;
+  using Hash = absl::Hash<T>;
   using Eq = std::equal_to<T>;
 };
 
@@ -34,17 +41,11 @@ struct StringHash {
   using is_transparent = void;
 
   size_t operator()(absl::string_view v) const {
-    return tensorflow::hash<absl::string_view>{}(v);
+    return absl::Hash<absl::string_view>{}(v);
   }
 
-  // TODO(b/173569624): Use tensorflow::hash<absl::Cord> when available.
   size_t operator()(const absl::Cord& v) const {
-    tensorflow::hash<absl::string_view> hasher;
-    size_t h = hasher("");
-    for (auto sv : v.Chunks()) {
-      h = tensorflow::Hash64Combine(h, hasher(sv));
-    }
-    return h;
+    return absl::Hash<absl::Cord>{}(v);
   }
 };
 
@@ -82,7 +83,7 @@ struct HashEq<T*> {
     using is_transparent = void;
     template <class U>
     size_t operator()(const U& ptr) const {
-      return tensorflow::hash<const T*>{}(HashEq::ToPtr(ptr));
+      return absl::Hash<const T*>{}(HashEq::ToPtr(ptr));
     }
   };
   struct Eq {

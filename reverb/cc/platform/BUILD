@@ -76,7 +76,6 @@ reverb_cc_library(
     name = "server_hdr",
     hdrs = ["server.h"],
     deps = [
-        "//reverb/cc:client",
         "//reverb/cc:table",
         "//reverb/cc/checkpointing:interface",
         "@com_google_absl//absl/status",
@@ -88,7 +87,6 @@ reverb_cc_library(
     hdrs = ["server.h"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
-        "//reverb/cc:client",
         "//reverb/cc:table",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform/default:server",

@@ -30,8 +30,7 @@
 #include "pybind11/stl.h"
 #include "reverb/cc/checkpointing/interface.h"
 #include "reverb/cc/chunker.h"
-#include "reverb/cc/client.h"
-#include "reverb/cc/conversions.h"
+#include "reverb/cc/in_process_client.h"
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/checkpointing.h"
 #include "reverb/cc/platform/checkpointing_utils.h"
@@ -45,14 +44,12 @@
 #include "reverb/cc/selectors/lifo.h"
 #include "reverb/cc/selectors/prioritized.h"
 #include "reverb/cc/selectors/uniform.h"
-#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/table_extensions/interface.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "reverb/cc/writer.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace {
 
@@ -61,8 +58,6 @@ namespace {
 inline void MaybeRaiseFromStatus(const absl::Status& status) {
   if (status.ok()) return;
 
-  // TODO(b/152982733): Add tests that validates that casting behaviour is
-  //   aligned with what tensorflow does.
   switch (status.code()) {
 #define CODE_TO_PY_EXC(CODE, PY_EXC)                         \
   case CODE:                                                 \
@@ -74,8 +69,6 @@ inline void MaybeRaiseFromStatus(const absl::Status& status) {
     CODE_TO_PY_EXC(absl::StatusCode::kUnimplemented, PyExc_NotImplementedError)
     CODE_TO_PY_EXC(absl::StatusCode::kInternal, PyExc_RuntimeError)
 
-    // TODO(b/154927554): Map more status codes to Python exceptions.
-
 #undef CODE_TO_PY_EXC
 
     default:
@@ -85,16 +78,36 @@ inline void MaybeRaiseFromStatus(const absl::Status& status) {
   throw pybind11::error_already_set();
 }
 
+// Maps a Reverb `DataType` (numpy-aligned) to a numpy dtype string understood
+// by `py::dtype`. Avoids pulling in the TF-backed `conversions` target.
+// ponytail: 如果新增 DataType,这里同步加一行。
+const char* DataTypeToNumpyString(::deepmind::reverb::DataType dt) {
+  using ::deepmind::reverb::DataType;
+  switch (dt) {
+    case DataType::Float32: return "float32";
+    case DataType::Float64: return "float64";
+    case DataType::Int8: return "int8";
+    case DataType::Int16: return "int16";
+    case DataType::Int32: return "int32";
+    case DataType::Int64: return "int64";
+    case DataType::Uint8: return "uint8";
+    case DataType::Uint16: return "uint16";
+    case DataType::Uint32: return "uint32";
+    case DataType::Uint64: return "uint64";
+    case DataType::Bool: return "bool";
+    case DataType::Complex64: return "complex64";
+    case DataType::Complex128: return "complex128";
+    case DataType::String: return "object";
+    case DataType::Invalid: return "object";
+  }
+  return "object";
+}
+
 // This wrapper exists for the sole purpose of allowing the weak_ptr to be
 // handled in Python. Pybind supports shared_ptr and unique_ptr out of the box
 // and although it is possible to implement our own `SmartPointer, using a
 // minimal wrapper class like WeakCellRef is much simpler when the weak_ptr
 // is only required for one class (in Python).
-//
-// See https://pybind11.readthedocs.io/en/stable/advanced/smart_ptrs.html for
-// more information about smart pointers in pybind. To understand why a weak
-// pointer is needed in the first place, please refer to the header and
-// implementation of `CellRef`, `Chunker` and `TrajectoryWriter`.
 class WeakCellRef {
  public:
   explicit WeakCellRef(std::weak_ptr<::deepmind::reverb::CellRef> ref)
@@ -118,10 +131,6 @@ namespace detail {
 // pybind11 supports std::optional, and absl::optional is meant to be a
 // drop-in replacement for std::optional, so we can just use the built in
 // implementation.
-//
-// If we start getting errors due to this being defined in multiple places that
-// likely means that pybind11 has included the cast itself and we can remove
-// this implementation.
 #ifndef ABSL_USES_STD_OPTIONAL
 template <typename T>
 struct type_caster<absl::optional<T>>
@@ -131,40 +140,34 @@ template <>
 struct type_caster<absl::nullopt_t> : public void_caster<absl::nullopt_t> {};
 #endif
 
+// Automatic conversion between Python numpy arrays and Reverb `TensorBuffer`.
+// Python passes an ndarray -> `FromNdArray` builds a `TensorBuffer`. C++ returns
+// a `TensorBuffer` -> `ToNdArray` produces an ndarray. Replaces the old
+// `type_caster<tensorflow::Tensor>` so the higher-level bindings
+// (`Sampler`, `TrajectoryWriter`, `WeakCellRef`) need no per-call glue.
 template <>
-struct type_caster<tensorflow::Tensor> {
+struct type_caster<::deepmind::reverb::TensorBuffer> {
  public:
-  PYBIND11_TYPE_CASTER(tensorflow::Tensor, _("tensorflow::Tensor"));
+  PYBIND11_TYPE_CASTER(::deepmind::reverb::TensorBuffer,
+                       _("reverb.TensorBuffer"));
 
-  bool load(handle handle, bool) {
-    absl::Status status =
-        deepmind::reverb::pybind::NdArrayToTensor(handle.ptr(), &value);
-
-    if (!status.ok()) {
-      std::string message = status.ToString();
+  bool load(handle src, bool) {
+    auto buf = ::deepmind::reverb::TensorBuffer::FromNdArray(
+        pybind11::reinterpret_borrow<pybind11::object>(src));
+    if (!buf.ok()) {
       REVERB_LOG(REVERB_ERROR)
-          << "Tensor can't be extracted from the source represented as "
-             "ndarray: "
-          << message;
-      // When a conversion fails, PyErr is set. Returning from `load` with PyErr
-      // set results in crashes so we clear the error here to make the Python
-      // error slightly more readable.
+          << "TensorBuffer can't be extracted from the source ndarray: "
+          << buf.status().ToString();
       PyErr_Clear();
       return false;
     }
+    value = std::move(*buf);
     return true;
   }
 
-  static handle cast(const tensorflow::Tensor &src, return_value_policy,
-                     handle) {
-    PyObject *ret;
-    absl::Status status = deepmind::reverb::pybind::TensorToNdArray(src, &ret);
-    if (!status.ok()) {
-      std::string message = status.ToString();
-      PyErr_SetString(PyExc_ValueError, message.data());
-      return nullptr;
-    }
-    return ret;
+  static handle cast(const ::deepmind::reverb::TensorBuffer& src,
+                     return_value_policy, handle) {
+    return src.ToNdArray().release().ptr();
   }
 };
 
@@ -190,8 +193,12 @@ namespace {
 namespace py = pybind11;
 
 PYBIND11_MODULE(libpybind, m) {
-  // Initialization code to use numpy types in the type casters.
-  pybind::ImportNumpy();
+  // numpy C-API import; must run once after the interpreter is up.
+  if (_import_array() < 0) {
+    PyErr_Print();
+    PyErr_SetString(PyExc_ImportError, "numpy.core.multiarray failed to import");
+    throw py::error_already_set();
+  }
 
   py::class_<ItemSelector, std::shared_ptr<ItemSelector>>(m, "ItemSelector")
       .def("__repr__", &ItemSelector::DebugString,
@@ -255,14 +262,14 @@ PYBIND11_MODULE(libpybind, m) {
                       extensions,
                   const std::optional<std::string>& serialized_signature =
                       std::nullopt) -> Table* {
-                 std::optional<tensorflow::StructuredValue> signature =
-                     std::nullopt;
+                 absl::optional<::reverb::tensor::SignatureProto> signature =
+                     absl::nullopt;
                  if (serialized_signature) {
                    signature.emplace();
                    if (!signature->ParseFromString(*serialized_signature)) {
                      MaybeRaiseFromStatus(
                          absl::InvalidArgumentError(absl::StrCat(
-                             "Unable to deserialize StructuredValue from "
+                             "Unable to deserialize SignatureProto from "
                              "serialized proto bytes: '",
                              *serialized_signature, "'")));
                      return nullptr;
@@ -293,41 +300,13 @@ PYBIND11_MODULE(libpybind, m) {
       .def("__repr__", &Table::DebugString,
            py::call_guard<py::gil_scoped_release>());
 
-  py::class_<Writer>(m, "Writer")
-      .def("Append", &Writer::Append, py::call_guard<py::gil_scoped_release>())
-      .def("AppendSequence", &Writer::AppendSequence,
-           py::call_guard<py::gil_scoped_release>())
-      .def("CreateItem", &Writer::CreateItem,
-           py::call_guard<py::gil_scoped_release>())
-      .def(
-          "Flush",
-          [](Writer *writer) {
-            // Release the GIL only when waiting for the call to complete. If
-            // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-            // result in segfaults as the Python exception is populated with
-            // details from the status.
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = writer->Flush();
-            }
-            MaybeRaiseFromStatus(status);
-          })
-      .def("Close", &Writer::Close, py::call_guard<py::gil_scoped_release>())
-      .def("__repr__", &Writer::DebugString,
-           py::call_guard<py::gil_scoped_release>());
-
   py::class_<Sampler>(m, "Sampler")
       .def("GetNextTrajectory",
            [](Sampler *sampler) {
              absl::Status status;
              std::shared_ptr<const SampleInfo> info;
-             std::vector<tensorflow::Tensor> data;
+             std::vector<TensorBuffer> data;
 
-             // Release the GIL only when waiting for the call to complete. If
-             // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-             // result in segfaults as the Python exception is populated with
-             // details from the status.
              {
                py::gil_scoped_release g;
                status = sampler->GetNextTrajectory(&data, &info);
@@ -338,168 +317,6 @@ PYBIND11_MODULE(libpybind, m) {
            })
       .def_property_readonly_static("NUM_INFO_TENSORS", [](py::object) {
         return Sampler::kNumInfoTensors;
-      });
-
-  py::class_<Client>(m, "Client")
-      .def(py::init<std::string>(), py::arg("server_name"))
-      .def(
-          "NewWriter",
-          [](Client* client, int chunk_length, int max_timesteps,
-             bool delta_encoded, int max_in_flight_items) {
-            std::unique_ptr<Writer> writer;
-            // Release the GIL only when waiting for the call to complete. If
-            // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-            // result in segfaults as the Python exception is populated with
-            // details from the status.
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = client->NewWriter(
-                  chunk_length, max_timesteps, delta_encoded,
-                  max_in_flight_items, &writer);
-            }
-            MaybeRaiseFromStatus(status);
-            return writer;
-          },
-          py::arg("chunk_length"), py::arg("max_timesteps"),
-          py::arg("delta_encoded") = false, py::arg("max_in_flight_items"))
-      .def("NewSampler",
-           [](Client* client, const std::string& table, int64_t max_samples,
-              size_t buffer_size) {
-             std::unique_ptr<Sampler> sampler;
-             Sampler::Options options;
-             options.max_samples = max_samples;
-             options.max_in_flight_samples_per_worker = buffer_size;
-             // Release the GIL only when waiting for the call to complete. If
-             // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-             // result in segfaults as the Python exception is populated with
-             // details from the status.
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->NewSamplerWithoutSignatureCheck(table, options,
-                                                                &sampler);
-             }
-             MaybeRaiseFromStatus(status);
-             return sampler;
-           })
-      .def("NewTrajectoryWriter",
-           [](Client* client, std::shared_ptr<ChunkerOptions> chunker_options,
-              bool validate_items) {
-             std::unique_ptr<TrajectoryWriter> writer;
-
-             TrajectoryWriter::Options options;
-             options.chunker_options = std::move(chunker_options);
-
-             // Release the GIL only when waiting for the call to complete. If
-             // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-             // result in segfaults as the Python exception is populated with
-             // details from the status.
-             absl::Status status;
-             if (validate_items) {
-               py::gil_scoped_release g;
-
-               status = client->NewTrajectoryWriter(
-                   options,
-                   absl::InfiniteDuration(),
-                   &writer);
-             } else {
-               status = client->NewTrajectoryWriter(options, &writer);
-             }
-             MaybeRaiseFromStatus(status);
-
-             return writer.release();
-           })
-      .def("NewStructuredWriter",
-           [](Client* client, std::vector<std::string> serialized_configs)
-               -> StructuredWriter* {
-             std::vector<StructuredWriterConfig> configs;
-             for (const auto &serialised_config : serialized_configs) {
-               configs.emplace_back();
-
-               if (!configs.back().ParseFromString(
-                       std::string(serialised_config))) {
-                 MaybeRaiseFromStatus(absl::InvalidArgumentError(absl::StrCat(
-                     "Unable to deserialize StructuredWriterConfig from "
-                     "serialized proto bytes: '",
-                     std::string(serialised_config), "'")));
-                 return nullptr;
-               }
-             }
-
-             std::unique_ptr<StructuredWriter> writer;
-
-             // Release the GIL only when waiting for the call to complete. If
-             // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-             // result in segfaults as the Python exception is populated with
-             // details from the status.
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status =
-                   client->NewStructuredWriter(std::move(configs), &writer);
-             }
-
-             if (!status.ok()) {
-               MaybeRaiseFromStatus(status);
-               return nullptr;
-             }
-
-             return writer.release();
-           })
-      .def(
-          "MutatePriorities",
-          [](Client* client, const std::string& table,
-             const std::vector<std::pair<uint64_t, double>>& updates,
-             const std::vector<uint64_t>& deletes) {
-            std::vector<KeyWithPriority> update_protos;
-            for (const auto &update : updates) {
-              update_protos.emplace_back();
-              update_protos.back().set_key(update.first);
-              update_protos.back().set_priority(update.second);
-            }
-            return client->MutatePriorities(table, update_protos, deletes);
-          },
-          py::call_guard<py::gil_scoped_release>())
-      .def("Reset", &Client::Reset, py::call_guard<py::gil_scoped_release>())
-      .def("ServerInfo",
-           [](Client* client, int timeout_sec) {
-             // Wait indefinitely for server to startup when timeout not
-             // provided.
-             auto timeout = timeout_sec > 0 ? absl::Seconds(timeout_sec)
-                                            : absl::InfiniteDuration();
-
-             struct Client::ServerInfo info;
-
-             // Release the GIL only when waiting for the call to complete. If
-             // the GIL is not held when `MaybeRaiseFromStatus` is called it can
-             // result in segfaults as the Python exception is populated with
-             // details from the status.
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->ServerInfo(timeout, &info);
-             }
-             MaybeRaiseFromStatus(status);
-
-             // Return a serialized ServerInfo proto bytes string.
-             std::vector<py::bytes> serialized_table_info;
-             serialized_table_info.reserve(info.table_info.size());
-             for (const auto &table_info : info.table_info) {
-               serialized_table_info.push_back(
-                   py::bytes(table_info.SerializeAsString()));
-             }
-             return serialized_table_info;
-           })
-      .def("Checkpoint", [](Client* client) {
-        std::string path;
-        absl::Status status;
-        {
-          py::gil_scoped_release g;
-          status = client->Checkpoint(&path);
-        }
-        MaybeRaiseFromStatus(status);
-        return path;
       });
 
   py::class_<Checkpointer, std::shared_ptr<Checkpointer>>(m, "Checkpointer")
@@ -536,24 +353,24 @@ PYBIND11_MODULE(libpybind, m) {
   py::class_<WeakCellRef, std::shared_ptr<WeakCellRef>>(m, "WeakCellRef")
       .def_property_readonly("expired", &WeakCellRef::expired)
       .def("numpy",
-           [](WeakCellRef* ref) -> tensorflow::Tensor {
-             tensorflow::Tensor tensor;
+           [](WeakCellRef* ref) -> TensorBuffer {
+             TensorBuffer buffer;
 
              auto sp = ref->ref().lock();
              if (!sp) {
                MaybeRaiseFromStatus(absl::FailedPreconditionError(
                    "Cannot access data from expired WeakCellRef"));
-               return tensor;
+               return buffer;
              }
 
              absl::Status status;
              {
                py::gil_scoped_release g;
-               status = sp->GetData(&tensor);
+               status = sp->GetData(&buffer);
              }
              MaybeRaiseFromStatus(status);
 
-             return tensor;
+             return buffer;
            })
       .def_property_readonly(
           "shape",
@@ -572,12 +389,13 @@ PYBIND11_MODULE(libpybind, m) {
               py::gil_scoped_release g;
               internal::TensorSpec spec;
               status = sp->GetSpec(&spec);
-              out_shape.reserve(spec.shape.dims());
-              for (auto dim : spec.shape.dim_sizes()) {
+              out_shape.reserve(spec.shape.size());
+              for (auto dim : spec.shape) {
                 // Replace -1 with absl::nullopt because the Python API uses
                 // None instead of -1 to represent unknown dimensions.
                 out_shape.push_back(dim == -1 ? std::nullopt
-                                              : std::make_optional(dim));
+                                              : std::make_optional(
+                                                    static_cast<int>(dim)));
               }
             }
             MaybeRaiseFromStatus(status);
@@ -590,26 +408,17 @@ PYBIND11_MODULE(libpybind, m) {
             if (!sp) {
               MaybeRaiseFromStatus(absl::FailedPreconditionError(
                   "Cannot access data from expired WeakCellRef"));
+              return py::dtype();
             }
 
             absl::Status status;
-            py::dtype dtype;
+            internal::TensorSpec spec;
             {
               py::gil_scoped_release g;
-              internal::TensorSpec spec;
               status = sp->GetSpec(&spec);
-
-              if (status.ok()) {
-                PyArray_Descr *descr = nullptr;
-                status = pybind::GetPyDescrFromDataType(spec.dtype, &descr);
-                if (status.ok()) {
-                  dtype = py::reinterpret_steal<py::dtype>(
-                      reinterpret_cast<PyObject *>(descr));
-                }
-              }
             }
             MaybeRaiseFromStatus(status);
-            return dtype;
+            return py::dtype(DataTypeToNumpyString(spec.dtype));
           });
 
   py::class_<ChunkerOptions, std::shared_ptr<ChunkerOptions>>(m,
@@ -641,7 +450,7 @@ PYBIND11_MODULE(libpybind, m) {
       .def(
           "Append",
           [](TrajectoryWriter* writer,
-             std::vector<std::optional<tensorflow::Tensor>> data) {
+             std::vector<std::optional<TensorBuffer>> data) {
             std::vector<std::optional<std::weak_ptr<CellRef>>> refs;
             MaybeRaiseFromStatus(writer->Append(std::move(data), &refs));
 
@@ -661,7 +470,7 @@ PYBIND11_MODULE(libpybind, m) {
       .def(
           "AppendPartial",
           [](TrajectoryWriter* writer,
-             std::vector<std::optional<tensorflow::Tensor>> data) {
+             std::vector<std::optional<TensorBuffer>> data) {
             std::vector<std::optional<std::weak_ptr<CellRef>>> refs;
             MaybeRaiseFromStatus(writer->AppendPartial(std::move(data), &refs));
 
@@ -740,40 +549,112 @@ PYBIND11_MODULE(libpybind, m) {
       .def_property_readonly("episode_steps", &TrajectoryWriter::episode_steps,
                              py::call_guard<py::gil_scoped_release>());
 
-  py::class_<StructuredWriter, std::shared_ptr<StructuredWriter>>(
-      m, "StructuredWriter")
-      .def("Append", &StructuredWriter::Append,
-           py::call_guard<py::gil_scoped_release>())
-      .def("AppendPartial", &StructuredWriter::AppendPartial,
-           py::call_guard<py::gil_scoped_release>())
-      .def("Flush",
-           [](StructuredWriter* writer, int ignore_last_num_items,
-              std::optional<int> timeout_ms) {
+  // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
+  // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`/
+  // `StructuredWriter` bindings were removed because their C++ implementations
+  // still depend on TensorFlow; restore them once client.cc/writer.cc/
+  // structured_writer.cc are de-TF'd.
+  py::class_<InProcessClient, std::shared_ptr<InProcessClient>>(
+      m, "InProcessClient")
+      .def(py::init<std::vector<std::shared_ptr<Table>>,
+                    std::shared_ptr<Checkpointer>>(),
+           py::arg("tables"), py::arg("checkpointer") = nullptr)
+      .def(
+          "new_trajectory_writer",
+          [](InProcessClient* client, const std::string& table,
+             std::shared_ptr<ChunkerOptions> chunker_options)
+              -> TrajectoryWriter* {
+            TrajectoryWriter::Options options;
+            options.chunker_options = std::move(chunker_options);
+            std::unique_ptr<TrajectoryWriter> writer;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status =
+                  client->NewTrajectoryWriter(table, options, &writer);
+            }
+            MaybeRaiseFromStatus(status);
+            return writer.release();
+          },
+          py::arg("table"), py::arg("chunker_options"))
+      .def(
+          "new_sampler",
+          [](InProcessClient* client, const std::string& table,
+             int64_t max_samples, size_t buffer_size) -> Sampler* {
+            Sampler::Options options;
+            options.max_samples = max_samples;
+            options.max_in_flight_samples_per_worker = buffer_size;
+            std::unique_ptr<Sampler> sampler;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = client->NewSampler(table, options, &sampler);
+            }
+            MaybeRaiseFromStatus(status);
+            return sampler.release();
+          },
+          py::arg("table"), py::arg("max_samples") = 1,
+          py::arg("buffer_size") = 1)
+      .def(
+          "mutate_priorities",
+          [](InProcessClient* client, const std::string& table,
+             const std::vector<std::pair<uint64_t, double>>& updates,
+             const std::vector<uint64_t>& deletes) {
+            std::vector<KeyWithPriority> update_protos;
+            for (const auto &update : updates) {
+              update_protos.emplace_back();
+              update_protos.back().set_key(update.first);
+              update_protos.back().set_priority(update.second);
+            }
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = client->MutatePriorities(table, update_protos, deletes);
+            }
+            MaybeRaiseFromStatus(status);
+          },
+          py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("reset",
+           [](InProcessClient* client, const std::string& table) {
              absl::Status status;
              {
                py::gil_scoped_release g;
-               status =
-                   writer->Flush(ignore_last_num_items,
-                                 timeout_ms.has_value()
-                                     ? absl::Milliseconds(timeout_ms.value())
-                                     : absl::InfiniteDuration());
+               status = client->Reset(table);
              }
              MaybeRaiseFromStatus(status);
-           })
-      .def("EndEpisode",
-           [](StructuredWriter* writer, bool clear_buffers,
-              std::optional<int> timeout_ms) {
+           },
+           py::arg("table"))
+      .def("checkpoint",
+           [](InProcessClient* client) {
+             std::string path;
              absl::Status status;
              {
                py::gil_scoped_release g;
-               status = writer->EndEpisode(
-                   clear_buffers, timeout_ms.has_value()
-                                      ? absl::Milliseconds(timeout_ms.value())
-                                      : absl::InfiniteDuration());
+               status = client->Checkpoint(&path);
              }
              MaybeRaiseFromStatus(status);
+             return path;
            })
-      .def_property_readonly("step_is_open", &StructuredWriter::step_is_open);
+      .def(
+          "server_info",
+          [](InProcessClient* client) {
+            std::vector<TableInfo> table_info;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = client->ServerInfo(&table_info);
+            }
+            MaybeRaiseFromStatus(status);
+
+            // Return a list of serialized TableInfo proto bytes strings.
+            std::vector<py::bytes> serialized_table_info;
+            serialized_table_info.reserve(table_info.size());
+            for (const auto &info : table_info) {
+              serialized_table_info.push_back(
+                  py::bytes(info.SerializeAsString()));
+            }
+            return serialized_table_info;
+          });
 }  // NOLINT(readability/fn_size)
 
 }  // namespace

@@ -620,7 +620,10 @@ reverb_cc_proto_library(
 reverb_py_proto_library(
     name = "schema_py_pb2",
     srcs = ["schema.proto"],
-    deps = [":schema_cc_proto"],
+    deps = [
+        ":schema_cc_proto",
+        "//third_party/reverb_tensor:reverb_tensor_py_pb2",
+    ],
 )
 
 reverb_cc_proto_library(

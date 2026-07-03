@@ -22,14 +22,11 @@ exposes direct methods for both inserting (i.e `insert`) and sampling (i.e
 
 from typing import Any, Dict, Generator, List, Optional, Sequence, Union
 
-from absl import logging
 import numpy as np
 from reverb import errors
 from reverb import pybind
 from reverb import replay_sample
 from reverb import reverb_types
-from reverb import structured_writer as structured_writer_lib
-from reverb import trajectory_writer as trajectory_writer_lib
 import tree
 
 
@@ -39,7 +36,7 @@ class Writer:
   See Client.writer for documentation.
   """
 
-  def __init__(self, internal_writer: pybind.Writer):
+  def __init__(self, internal_writer):
     """Constructor for Writer (must only be called by Client.writer)."""
     self._writer = internal_writer
     self._closed = False
@@ -221,9 +218,19 @@ class Client:
 
     Args:
       server_address: Address to the Reverb ReverbService.
+
+    Raises:
+      NotImplementedError: The gRPC `Client` C++ binding was removed because
+        `reverb/cc/client.cc` still depends on TensorFlow. Use the in-process
+        mode (`reverb.Server(in_process=True)` + `Server.in_process_client`)
+        for numpy-only access. Restore once client.cc is de-TF'd.
     """
-    self._server_address = server_address
-    self._client = pybind.Client(server_address)
+    raise NotImplementedError(
+        'The gRPC Client is unavailable in this build: reverb/cc/client.cc '
+        'still depends on TensorFlow. Use reverb.Server(in_process=True) and '
+        'Server.in_process_client for the embedded / numpy-only mode.')
+    self._server_address = server_address  # pylint: disable=unreachable
+    self._client = None
     self._signature_cache = {}
 
   def __reduce__(self):
@@ -565,9 +572,10 @@ class Client:
     chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
     cpp_writer = self._client.NewTrajectoryWriter(chunker_options,
                                                   validate_items)
+    from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
     return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
-  def structured_writer(self, configs: Sequence[structured_writer_lib.Config]):
+  def structured_writer(self, configs):
     """Constructs a new `StructuredWriter`.
 
     See `StructuredWriter` for more detailed documentation.
@@ -587,6 +595,7 @@ class Client:
 
     serialized_configs = [config.SerializeToString() for config in configs]
     cpp_writer = self._client.NewStructuredWriter(serialized_configs)
+    from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
     return structured_writer_lib.StructuredWriter(cpp_writer)
 
   def _get_signature_for_table(self, table: str):
@@ -599,3 +608,97 @@ class Client:
           f'{", ".join(self._signature_cache.keys())}.')
 
     return self._signature_cache[table]
+
+
+class LocalClient:
+  """Python wrapper around the C++ `InProcessClient` for embedded mode.
+
+  Provides a numpy-friendly API mirroring the historical `Client`: writers are
+  context managers returned by `trajectory_writer`, and `sample` yields
+  `ReplaySample` objects. All data is exchanged as numpy arrays; no TensorFlow
+  is required.
+  """
+
+  def __init__(self, internal_client: 'pybind.InProcessClient'):
+    self._client = internal_client
+
+  def __repr__(self):
+    return 'LocalClient (in-process, numpy)'
+
+  def trajectory_writer(self,
+                        table: str,
+                        num_keep_alive_refs: int,
+                        *,
+                        max_chunk_length: Optional[int] = None):
+    """Constructs a `TrajectoryWriter` bound to `table` in local mode.
+
+    Args:
+      table: Name of the table that items created by this writer are inserted
+        into.
+      num_keep_alive_refs: Size of the circular buffer of recent data
+        references; the maximum trajectory length.
+      max_chunk_length: Optional constant chunk length. If None, the chunk
+        length is auto-tuned.
+
+    Returns:
+      A `TrajectoryWriter` context manager.
+    """
+    if num_keep_alive_refs < 1:
+      raise ValueError(
+          f'num_keep_alive_refs ({num_keep_alive_refs}) must be a positive '
+          f'integer'
+      )
+    if max_chunk_length is None:
+      chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
+    else:
+      chunker_options = pybind.ConstantChunkerOptions(
+          max_chunk_length=max_chunk_length,
+          num_keep_alive_refs=num_keep_alive_refs)
+    cpp_writer = self._client.new_trajectory_writer(table, chunker_options)
+    # Imported here to avoid a circular import (trajectory_writer imports
+    # pybind, not client) and to keep the module import TF-free.
+    from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
+    return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
+
+  def new_sampler(self, table: str, num_samples: int = 1, buffer_size: int = 1):
+    """Constructs a `Sampler` over `table` in local mode."""
+    return self._client.new_sampler(table, num_samples, buffer_size)
+
+  def sample(self, table: str, num_samples: int = 1):
+    """Yields `ReplaySample` objects sampled from `table`."""
+    sampler = self.new_sampler(table, num_samples)
+    for _ in range(num_samples):
+      flat = sampler.GetNextTrajectory()
+      info = replay_sample.SampleInfo(
+          key=int(flat[0]),
+          probability=float(flat[1]),
+          table_size=int(flat[2]),
+          priority=float(flat[3]),
+          times_sampled=int(flat[4]),
+      )
+      data = flat[len(info):]
+      yield replay_sample.ReplaySample(info=info, data=data)
+
+  def mutate_priorities(self,
+                        table: str,
+                        updates: Optional[Dict[int, float]] = None,
+                        deletes: Optional[List[int]] = None):
+    if updates is None:
+      updates = {}
+    if deletes is None:
+      deletes = []
+    self._client.mutate_priorities(table, list(updates.items()), deletes)
+
+  def reset(self, table: str):
+    self._client.reset(table)
+
+  def server_info(self) -> Dict[str, reverb_types.TableInfo]:
+    proto_strings = self._client.server_info()
+    table_infos = {}
+    for proto_string in proto_strings:
+      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
+      table_infos[table_info.name] = table_info
+    return table_infos
+
+  def checkpoint(self) -> str:
+    return self._client.checkpoint()

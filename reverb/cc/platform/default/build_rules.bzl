@@ -535,13 +535,10 @@ def reverb_pybind_extension(
     native.genrule(
         name = name + "_py_file",
         outs = [py_file],
-        cmd = """echo 'import tensorflow as _tf
-from reverb.platform.default import load_op_library as _load_op_library
-try:
-  from .%s import *
-except ImportError as e:
-  _load_op_library.reraise_wrapped_error(e)
-del _tf' >$@""" % module_name,
+        # ponytail: 去 `import tensorflow` —— libpybind.so 已无 TF 符号(内嵌
+        # numpy 模式),无需 ensure_tf_install / load_op_library 的符号检查,
+        # 使 `import reverb.pybind` 在无 TF 环境下也可用。
+        cmd = "echo 'try:\n  from .%s import *\nexcept ImportError as e:\n  raise e' >$@" % module_name,
         output_licenses = ["unencumbered"],
         visibility = visibility,
         testonly = testonly,
@@ -549,7 +546,7 @@ del _tf' >$@""" % module_name,
     py_library(
         name = name,
         data = [so_file, "//reverb:libreverb"],
-        deps = ["//reverb/platform/default:load_op_library"],
+        deps = [],
         srcs = [py_file],
         srcs_version = srcs_version,
         licenses = licenses,

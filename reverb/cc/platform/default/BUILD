@@ -57,7 +57,6 @@ reverb_cc_library(
     name = "server",
     srcs = ["server.cc"],
     deps = [
-        "//reverb/cc:client",
         "//reverb/cc:reverb_service_impl",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:grpc_utils",
@@ -110,7 +109,11 @@ reverb_cc_library(
 reverb_cc_library(
     name = "hash",
     hdrs = ["hash.h"],
-    deps = reverb_tf_deps(),
+    deps = [
+        "@com_google_absl//absl/hash:hash",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:cord",
+    ],
 )
 
 reverb_cc_library(

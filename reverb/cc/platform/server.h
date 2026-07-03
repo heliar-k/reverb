@@ -20,7 +20,6 @@
 
 #include "absl/status/status.h"
 #include "reverb/cc/checkpointing/interface.h"
-#include "reverb/cc/client.h"
 #include "reverb/cc/table.h"
 
 namespace deepmind {

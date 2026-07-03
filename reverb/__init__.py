@@ -12,24 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Top level import for Reverb."""
+"""Top level import for Reverb.
 
-# pylint: disable=g-import-not-at-top
+Reverb supports two modes:
+
+  * **In-process / numpy-only mode** (no TensorFlow required): construct a
+    `reverb.Server(in_process=True)` and interact with it through
+    `server.in_process_client` (an `InProcessClient` wrapped by `LocalClient`).
+    Data flows as numpy arrays. This is the path surfaced by the de-TF refactor.
+
+  * **gRPC mode** (TensorFlow required): the original `Client`/`Writer`/
+    `StructuredWriter` path. These C++ bindings (`client.cc`/`writer.cc`/
+    `structured_writer.cc`) still depend on TensorFlow and have been removed
+    from the pybind module until those files are de-TF'd. The Python `Client`/
+    `Writer` classes remain but raise `NotImplementedError` on construction.
+
+TensorFlow is intentionally NOT imported at module load time, even when
+installed: doing so would load TF's bundled gRPC and conflict with Reverb's own
+gRPC statically linked into `libreverb.so` (duplicate flag registration).
+"""
+
+# pylint: disable=g-import-notat-top
 # pylint: disable=g-bad-import-order
-from reverb.platform.default import ensure_tf_install
-
-ensure_tf_install.ensure_tf_version()
-
-# Cleanup symbols to avoid polluting namespace.
-del ensure_tf_install
-# pylint: enable=g-bad-import-order
 
 from reverb import item_selectors as selectors
 from reverb import rate_limiters
 
-from reverb import structured_writer as structured
-
 from reverb.client import Client
+from reverb.client import LocalClient
 from reverb.client import Writer
 
 from reverb.errors import DeadlineExceededError
@@ -45,3 +55,11 @@ from reverb.server import Table
 
 from reverb.trajectory_writer import TrajectoryColumn
 from reverb.trajectory_writer import TrajectoryWriter
+
+# Expose the in-process C++ client class directly for advanced users.
+from reverb import pybind as _pybind  # noqa: E402
+InProcessClient = _pybind.InProcessClient
+del _pybind
+
+# pylint: enable=g-bad-import-order
+# pylint: enable=g-import-not-at-top

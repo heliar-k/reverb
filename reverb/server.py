@@ -24,22 +24,22 @@ import abc
 import collections
 from typing import Optional, Sequence
 
-from absl import logging
 import portpicker
-from reverb import client
 from reverb import item_selectors
 from reverb import pybind
 from reverb import rate_limiters
 from reverb import reverb_types
 from reverb.platform.default import checkpointers
 
-import termcolor
 import tree
 
-# pylint: disable=g-direct-tensorflow-import
-from tensorflow.python.framework import tensor_spec
-from tensorflow.python.saved_model import nested_structure_coder
-# pylint: enable=g-direct-tensorflow-import
+# TF is only required to encode `tf.TypeSpec`-based table signatures, and
+# only when a signature is actually provided to `Table`. The in-process /
+# numpy-only mode never sets a signature, so TF is imported lazily inside
+# `Table.__init__` rather than at module load time (loading TF eagerly would
+# pull in its bundled gRPC and conflict with Reverb's own gRPC in libreverb.so).
+tensor_spec = None
+nested_structure_coder = None
 
 
 class TableExtensionBase(metaclass=abc.ABCMeta):
@@ -147,6 +147,12 @@ class Table:
       internal_extensions += list(extension.build_internal_extensions(name))
 
     if signature:
+      # Lazily import TF to encode the signature. The in-process / numpy-only
+      # mode never reaches here (signature is left None).
+      # pylint: disable=g-import-not-at-top
+      from tensorflow.python.framework import tensor_spec
+      from tensorflow.python.saved_model import nested_structure_coder
+      # pylint: enable=g-import-not-at-top
       flat_signature = tree.flatten(signature)
       for s in flat_signature:
         if not isinstance(s, tensor_spec.TensorSpec):
@@ -317,16 +323,22 @@ class Server:
   def __init__(self,
                tables: Optional[Sequence[Table]] = None,
                port: Optional[int] = None,
-               checkpointer: Optional[checkpointers.CheckpointerBase] = None):
+               checkpointer: Optional[checkpointers.CheckpointerBase] = None,
+               in_process: bool = False):
     """Constructor of Server serving the ReverbService.
 
     Args:
       tables: A sequence of tables to host on the server.
       port: The port number to serve the gRPC-service on. If `None` (default)
-        then a port is automatically picked and assigned.
+        then a port is automatically picked and assigned. Ignored when
+        `in_process=True`.
       checkpointer: Checkpointer used for storing/loading checkpoints. If None
         (default) then `checkpointers.default_checkpointer` is used to
         construct the checkpointer.
+      in_process: If True, run in embedded / numpy-only mode: no gRPC service is
+        started and clients interact with the tables directly via an
+        `InProcessClient` (see `Server.in_process_client`). This avoids the
+        TensorFlow-dependent gRPC `Client` entirely.
 
     Raises:
       ValueError: If tables is empty.
@@ -340,22 +352,48 @@ class Server:
       raise ValueError('Multiple items in tables have the same name: {}'.format(
           ', '.join(duplicates)))
 
-    if port is None:
-      port = portpicker.pick_unused_port()
+    self._tables = list(tables)
+    self._in_process = in_process
+    self._port = None
+    self._server = None
 
     if checkpointer is None:
       checkpointer = checkpointers.default_checkpointer()
+    self._checkpointer = checkpointer
 
-    self._server = pybind.Server([table.internal_table for table in tables],
-                                 port, checkpointer.internal_checkpointer())
-    self._port = port
+    if in_process:
+      # Embedded mode: hold the tables directly and expose an InProcessClient.
+      # No gRPC service, no port, no TF-backed gRPC Client.
+      from reverb import client as _client  # pylint: disable=g-import-not-at-top
+      self._in_process_client = _client.LocalClient(pybind.InProcessClient(
+          [table.internal_table for table in tables],
+          checkpointer.internal_checkpointer()))
+    else:
+      if port is None:
+        port = portpicker.pick_unused_port()
+      self._port = port
+      self._server = pybind.Server(
+          [table.internal_table for table in tables], port,
+          checkpointer.internal_checkpointer())
+
+  @property
+  def in_process_client(self):
+    """`InProcessClient` for embedded / numpy-only mode.
+
+    Only available when the server was constructed with `in_process=True`.
+    """
+    if not self._in_process:
+      raise ValueError(
+          'in_process_client is only available for servers constructed with '
+          'in_process=True.')
+    return self._in_process_client
 
   def __del__(self):
     """Stop server and free up the port if was reserved through portpicker."""
-    if hasattr(self, '_server'):
+    if hasattr(self, '_server') and self._server is not None:
       self.stop()
 
-    if hasattr(self, '_port'):
+    if hasattr(self, '_port') and self._port is not None:
       portpicker.return_port(self._port)
 
   def __repr__(self) -> str:
@@ -368,7 +406,8 @@ class Server:
 
   def stop(self):
     """Request that the ReverbService is terminated and wait for shutdown."""
-    return self._server.Stop()
+    if self._server is not None:
+      return self._server.Stop()
 
   def wait(self):
     """Blocks until the service is shut down.
@@ -383,9 +422,20 @@ class Server:
     Raises:
       KeyboardInterrupt: If the server was killed by a SIGINT.
     """
-    if self._server.Wait():
+    if self._server is not None and self._server.Wait():
       raise KeyboardInterrupt
 
   def localhost_client(self) -> client.Client:
-    """Creates a client connect to the localhost channel."""
+    """Creates a client connect to the localhost channel.
+
+    Not available in `in_process=True` mode: the gRPC `Client` binding was
+    removed because its C++ implementation still depends on TensorFlow. Use
+    `in_process_client` instead.
+    """
+    if self._in_process:
+      raise NotImplementedError(
+          'localhost_client is not available in in_process mode; use '
+          'Server.in_process_client instead. The gRPC Client requires '
+          'TensorFlow (client.cc not yet de-TF\'d).')
+    from reverb import client  # pylint: disable=g-import-not-at-top
     return client.Client(f'localhost:{self._port}')

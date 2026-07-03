@@ -46,14 +46,6 @@ class Table:
   def info(self) -> bytes: ...
 
 
-class Writer:
-  def Append(self, data): ...
-  def AppendSequence(self, data): ...
-  def CreateItem(self, table: str, num_timesteps: int, priority: float): ...
-  def Flush(self): ...
-  def Close(self, retry_on_unavailable: bool): ...
-
-
 class Sampler:
 
   NUM_INFO_TENSORS: int
@@ -61,58 +53,6 @@ class Sampler:
   def GetNextTrajectory(self) -> List[np.ndarray]:
     ...
 
-
-
-class Client:
-
-  def __init__(
-      self,
-      server_name: str):
-    ...
-
-  def NewWriter(
-      self,
-      chunk_length: int,
-      max_timesteps: int,
-      delta_encoded: bool,
-      max_in_flight_items: int) -> Writer:
-    ...
-
-  def NewSampler(self,
-      table: str,
-      max_samples: int,
-      buffer_size: int) -> Sampler:
-    ...
-
-  def NewTrajectoryWriter(
-      self,
-      chunker_options,
-      validate_items: bool) -> TrajectoryWriter:
-    ...
-
-  def NewStructuredWriter(
-      self,
-      serialized_configs: List[bytes]) -> StructuredWriter:
-    ...
-
-  def MutatePriorities(
-      self,
-      table: str,
-      updates: Sequence[Tuple[int, float]],
-      deletes: Sequence[int]):
-    ...
-
-  def Reset(
-      self,
-      table: str):
-    ...
-
-  def ServerInfo(
-      self,
-      timeout_sec: int) -> Sequence[bytes]:
-    ...
-
-  def Checkpoint(self): ...
 
 
 class Checkpointer: ...
@@ -204,22 +144,37 @@ class TrajectoryWriter:
     ...
 
 
-class StructuredWriter:
+# In-process client for the embedded / numpy-only mode (no gRPC, no TF).
+# The gRPC Client/Writer/StructuredWriter bindings were removed because their
+# C++ implementations still depend on TensorFlow; restore them once
+# client.cc/writer.cc/structured_writer.cc are de-TF'd.
+class InProcessClient:
+  def __init__(
+      self,
+      tables: Sequence[Table],
+      checkpointer: Optional[Checkpointer] = ...): ...
 
-  def Append(self, data: Sequence[Optional[Any]]):
-    ...
+  def new_trajectory_writer(
+      self,
+      table: str,
+      chunker_options: ChunkerOptions) -> TrajectoryWriter: ...
 
-  def AppendPartial(self, data: Sequence[Optional[Any]]):
-    ...
+  def new_sampler(
+      self,
+      table: str,
+      max_samples: int = ...,
+      buffer_size: int = ...) -> Sampler: ...
 
-  def Flush(self, ignore_last_num_items: int, timeout_ms: int):
-    ...
+  def mutate_priorities(
+      self,
+      table: str,
+      updates: Sequence[Tuple[int, float]],
+      deletes: Sequence[int]): ...
 
-  def EndEpisode(self, clear_buffers: bool, timeout_ms: Optional[int]):
-    ...
+  def reset(self, table: str): ...
 
-  @property
-  def step_is_open(self) -> bool:
-    ...
+  def checkpoint(self) -> str: ...
+
+  def server_info(self) -> Sequence[bytes]: ...
 
 # LINT.ThenChange(pybind.cc)

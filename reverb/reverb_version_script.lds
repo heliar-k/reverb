@@ -1,6 +1,15 @@
 libreverb {
   global:
     *deepmind*reverb*;
+    *reverb6tensor*;
+    *reverb*tensor*;
+    *absl*;
+    *google*protobuf*;
+    *protobuf*;
+    *grpc*;
+    *upb*;
+    *zlib*;
+    *utf8*;
   local:
     *;
 };

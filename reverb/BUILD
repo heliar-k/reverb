@@ -26,13 +26,12 @@ reverb_pytype_strict_library(
         ":client",
         ":errors",
         ":item_selectors",
+        ":pybind",
         ":rate_limiters",
         ":replay_sample",
         ":server",
-        ":structured_writer",
         ":trajectory_writer",
         "//reverb/platform/default:checkpointers",
-        "//reverb/platform/default:ensure_tf_install",
     ],
 )
 
@@ -94,6 +93,16 @@ reverb_cc_shared_library(
     exports_filter = [
         "//reverb/cc:__subpackages__",
         "@com_google_absl//absl:__subpackages__",
+        # ponytail: pybind 去 TF 后直连 protobuf/grpc/zlib(经 :table/
+        # :in_process_client/:sampler),这些库同时被 libreverb 与 :pybind
+        # 持有,必须声明由 libreverb 导出,否则 cc_shared_library 报
+        # "linked statically but not exported"。
+        "@com_google_protobuf//src/google/protobuf:__subpackages__",
+        "@com_google_protobuf//upb:__subpackages__",
+        "@com_google_protobuf//third_party/utf8_range:__pkg__",
+        "@zlib//:__pkg__",
+        "//third_party/reverb_tensor:__pkg__",
+        "@com_github_grpc_grpc//:__subpackages__",
     ],
     shared_lib_name = select(
         {
@@ -112,17 +121,17 @@ reverb_cc_shared_library(
         "//conditions:default": [],
     }),
     deps = [
+        # ponytail: 去 :client/:writer/:conversions/:structured_writer(均仍依赖
+        # TF,编译不过)。libreverb 为聚合共享库,内嵌模式仅需 :table/
+        # :trajectory_writer/:sampler/:in_process_client 等已去 TF 的目标。
+        # gRPC Client/Writer/StructuredWriter 待对应 .cc 去 TF 后再加回。
         "//reverb/cc:chunker",
-        "//reverb/cc:client",
-        "//reverb/cc:conversions",
         "//reverb/cc:errors",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
         "//reverb/cc:schema_cc_proto",
-        "//reverb/cc:structured_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",
-        "//reverb/cc:writer",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing",
         "//reverb/cc/platform:checkpointing_utils",
@@ -149,16 +158,17 @@ reverb_pybind_extension(
     module_name = "libpybind",
     pytype_srcs = ["pybind.pyi"],
     visibility = [":__subpackages__"],
+    # ponytail: 去 reverb_tf_deps() + :client/:writer/:structured_writer/
+    # :conversions(均仍依赖 TF,编译不过)。改用 :in_process_client +
+    # :tensor_proxy(numpy C-API)。gRPC Client/Writer/StructuredWriter 待
+    # 对应 .cc 去 TF 后再恢复绑定。
     deps = [
         "//reverb/cc:chunker",
-        "//reverb/cc:client",
-        "//reverb/cc:conversions",
+        "//reverb/cc:in_process_client",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
-        "//reverb/cc:structured_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",
-        "//reverb/cc:writer",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing",
         "//reverb/cc/platform:checkpointing_utils",
@@ -171,13 +181,15 @@ reverb_pybind_extension(
         "//reverb/cc/selectors:prioritized",
         "//reverb/cc/selectors:uniform",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/table_extensions:interface",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps() + reverb_pybind_deps(),
+    ] + reverb_pybind_deps(),
 )
 
 reverb_pytype_library(
@@ -288,3 +300,19 @@ reverb_py_test(
         ":replay_sample",
     ],
 )
+
+# ponytail: 普通 py_test(非 reverb_py_test)以避免隐式拉入 @pypi//tf_nightly
+# 到运行时 import 路径。内嵌 numpy 模式不需要 TF;:reverb 仍作 build 依赖,
+# 但 __init__.py 会 try/except 跳过 ensure_tf_install。
+py_test(
+    name = "in_process_test",
+    srcs = ["in_process_test.py"],
+    main = "in_process_test.py",
+    python_version = "PY3",
+    deps = [
+        ":reverb",
+        "@pypi//numpy",
+    ],
+)
+
+
