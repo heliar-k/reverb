@@ -383,6 +383,31 @@ cc_library(
     ] + reverb_grpc_deps(),
 )
 
+# ponytail: 原生 cc_library,进程内 Client(零 gRPC)。本地路径直接调 :table /
+# :trajectory_writer / :sampler 的本地构造函数。NewStructuredWriter 未实现
+# (StructuredWriter.cc 仍依赖 TF,本仓编译不过),故不依赖 :structured_writer。
+cc_library(
+    name = "in_process_client",
+    srcs = ["in_process_client.cc"],
+    hdrs = ["in_process_client.h"],
+    copts = ["-Wno-sign-compare"],
+    visibility = ["//reverb:__subpackages__"],
+    deps = [
+        ":sampler",
+        ":schema_cc_proto",
+        ":table",
+        ":trajectory_writer",
+        "//reverb/cc/checkpointing:interface",
+        "//reverb/cc/platform:hash_map",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 reverb_cc_library(
     name = "streaming_trajectory_writer",
     srcs = ["streaming_trajectory_writer.cc"],
@@ -410,6 +435,35 @@ reverb_cc_library(
     ] + reverb_tf_deps() + reverb_grpc_deps(),
 )
 
+cc_test(
+    name = "in_process_client_test",
+    srcs = ["in_process_client_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :in_process_client -> :trajectory_writer/:sampler -> :tensor_proxy
+    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :trajectory_writer_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
+    deps = [
+        ":chunker",
+        ":in_process_client",
+        ":schema_cc_proto",
+        ":table",
+        ":trajectory_writer",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/support:tensor_proxy",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
 cc_test(
     name = "trajectory_writer_test",
     srcs = ["trajectory_writer_test.cc"],
