@@ -5,6 +5,8 @@ load(
     "reverb_grpc_deps",
     "reverb_tf_deps",
 )
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 package(
     default_applicable_licenses = ["//third_party/reverb:license"],
@@ -237,4 +239,43 @@ reverb_cc_library(
     name = "key_generators",
     hdrs = ["key_generators.h"],
     deps = ["@com_google_absl//absl/random"],
+)
+
+# --- TensorBuffer: numpy bytes 载体,原生 cc_library(不注入 TF 依赖) ---
+cc_library(
+    name = "tensor_proxy",
+    srcs = ["tensor_proxy.cc"],
+    hdrs = ["tensor_proxy.h"],
+    copts = ["-Wno-sign-compare"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@pybind11",
+        "@pypi//numpy:numpy_headers",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_protobuf//:protobuf",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "tensor_proxy_test",
+    srcs = ["tensor_proxy_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # 嵌入解释器需链接 libpython;系统 Python 3.10(numpy 1.23.5 基于此构建)
+    # ponytail: host libpython 依赖 host libc,但 bazel sysroot(glibc 2.27) 的
+    # Scrt1.o 需 __libc_csu_init(在 sysroot libc_nonshared.a 内)。host -L 会错误地
+    # 解析到 host libc_nonshared.a(无 csu 符号),故用 sysroot 绝对路径显式提供。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
+    deps = [
+        ":tensor_proxy",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@pybind11",
+        "@pypi//numpy:numpy_headers",
+    ],
 )
