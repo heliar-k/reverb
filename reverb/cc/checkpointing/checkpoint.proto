@@ -3,7 +3,7 @@ syntax = "proto3";
 package deepmind.reverb;
 
 import "reverb/cc/schema.proto";
-import "tensorflow/core/protobuf/struct.proto";
+import "third_party/reverb_tensor/reverb_tensor.proto";
 
 // Configs for reconstructing a distribution to its initial state.
 
@@ -43,7 +43,7 @@ message PriorityTableCheckpoint {
   int64 num_deleted_episodes = 8;
 
   // Optional data signature for tensors stored in the table.
-  tensorflow.StructuredValue signature = 9;
+  .reverb.tensor.SignatureProto signature = 9;
 
   // Number of unique items sampled from the table since the last reset.
   int64 num_unique_samples = 10;

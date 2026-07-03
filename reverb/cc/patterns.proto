@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package deepmind.reverb;
 
-import "tensorflow/core/protobuf/struct.proto";
+import "third_party/reverb_tensor/reverb_tensor.proto";
 
 message PatternNode {
   // Index of the source column in the flattened step structure.
@@ -109,7 +109,7 @@ message StructuredWriterConfig {
 
   // Serialised structure of the pattern. All leaf nodes must be None. If empty
   // then pattern will be treated as a flat list.
-  tensorflow.StructuredValue pattern_structure = 2;
+  .reverb.tensor.SignatureProto pattern_structure = 2;
 
   // The table that generated trajectories will be inserted into.
   string table = 3;

@@ -3,8 +3,7 @@ syntax = "proto3";
 package deepmind.reverb;
 
 import "google/protobuf/timestamp.proto";
-import "tensorflow/core/framework/tensor.proto";
-import "tensorflow/core/protobuf/struct.proto";
+import "third_party/reverb_tensor/reverb_tensor.proto";
 
 // The actual data is stored in chunks. The data can be arbitrary tensors. We do
 // not interpret the bytes data of the tensors on the server side. It is up to
@@ -18,7 +17,7 @@ message ChunkData {
 
   // Actual tensor data.
   message Data {
-    repeated tensorflow.TensorProto tensors = 1;
+    repeated .reverb.tensor.TensorProto tensors = 1;
   }
   Data data = 5 [lazy = true];
 
@@ -35,7 +34,7 @@ message ChunkData {
 
   // Deprecated December 2020 and retained to provide backward
   // compatibility with checkpoints created before this point.
-  repeated tensorflow.TensorProto deprecated_data = 3 [deprecated = true];
+  repeated .reverb.tensor.TensorProto deprecated_data = 3 [deprecated = true];
 }
 
 // A range that specifies which items to slice out from a sequence of chunks.
@@ -178,7 +177,7 @@ message TableInfo {
   // that this data type is more flexible than we use.  For example,
   // we only store tensors (TensorSpecProto, TypeSpecProto) and not
   // any special data types (no NoneValue or other special fixed values).
-  tensorflow.StructuredValue signature = 6;
+  .reverb.tensor.SignatureProto signature = 6;
 
   // Current size of table.
   int64 current_size = 7;

@@ -14,8 +14,6 @@ load(
 
 package(default_visibility = ["//reverb:__subpackages__"])
 
-license(name = "license")
-
 licenses(["notice"])
 
 exports_files(["LICENSE"])
@@ -489,6 +487,7 @@ reverb_cc_library(
 reverb_cc_proto_library(
     name = "schema_cc_proto",
     srcs = ["schema.proto"],
+    deps = ["//third_party/reverb_tensor:reverb_tensor_cc_proto"],
 )
 
 reverb_py_proto_library(
@@ -500,6 +499,7 @@ reverb_py_proto_library(
 reverb_cc_proto_library(
     name = "patterns_cc_proto",
     srcs = ["patterns.proto"],
+    deps = ["//third_party/reverb_tensor:reverb_tensor_cc_proto"],
     visibility = ["//reverb:__subpackages__"],
 )
 

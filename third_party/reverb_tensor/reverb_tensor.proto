@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package reverb.tensor;
+
+// 对齐 numpy dtype,不对齐 TF(避免概念残留)
+enum DataType {
+  DT_INVALID = 0;
+  DT_FLOAT32 = 1;
+  DT_FLOAT64 = 2;
+  DT_INT8 = 3;
+  DT_INT16 = 4;
+  DT_INT32 = 5;
+  DT_INT64 = 6;
+  DT_UINT8 = 7;
+  DT_UINT16 = 8;
+  DT_UINT32 = 9;
+  DT_UINT64 = 10;
+  DT_BOOL = 11;
+  DT_COMPLEX64 = 12;
+  DT_COMPLEX128 = 13;
+  DT_STRING = 14;
+}
+
+message TensorShapeProto {
+  repeated int64 dim = 1;
+}
+
+message TensorProto {
+  DataType dtype = 1;
+  TensorShapeProto shape = 2;
+  bytes tensor_content = 3;
+  repeated bytes string_val = 4;
+}
+
+// 精简版 StructuredValue,只含 Reverb 用到的 6 种节点
+message SignatureProto {
+  message TensorSpec {
+    string name = 1;
+    DataType dtype = 2;
+    TensorShapeProto shape = 3;
+  }
+  message BoundedTensorSpec {
+    string name = 1;
+    DataType dtype = 2;
+    TensorShapeProto shape = 3;
+    TensorProto minimum = 4;
+    TensorProto maximum = 5;
+  }
+  message ListValue { repeated SignatureProto values = 1; }
+  message TupleValue { repeated SignatureProto values = 1; }
+  message DictValue {
+    map<string, SignatureProto> values = 1;
+  }
+  message NamedTupleValue {
+    string name = 1;
+    repeated string keys = 2;
+    repeated SignatureProto values = 3;
+  }
+  oneof kind {
+    TensorSpec tensor_spec = 1;
+    BoundedTensorSpec bounded_tensor_spec = 2;
+    ListValue list_value = 3;
+    TupleValue tuple_value = 4;
+    DictValue dict_value = 5;
+    NamedTupleValue named_tuple_value = 6;
+  }
+}
