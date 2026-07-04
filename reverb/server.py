@@ -365,9 +365,17 @@ class Server:
       # Embedded mode: hold the tables directly and expose an InProcessClient.
       # No gRPC service, no port, no TF-backed gRPC Client.
       from reverb import client as _client  # pylint: disable=g-import-not-at-top
-      self._in_process_client = _client.LocalClient(pybind.InProcessClient(
+      internal_client = pybind.InProcessClient(
           [table.internal_table for table in tables],
-          checkpointer.internal_checkpointer()))
+          checkpointer.internal_checkpointer())
+      # 恢复最新 checkpoint(若有)。首次启动无 checkpoint 是正常的 -> 警告不崩溃。
+      try:
+        internal_client.load_latest()
+      except Exception as e:  # pylint: disable=broad-except
+        # NotFound -> RuntimeError(pybind 默认映射),首次启动正常。
+        import logging  # pylint: disable=g-import-not-at-top
+        logging.warning('In-process server did not restore a checkpoint: %s', e)
+      self._in_process_client = _client.LocalClient(internal_client)
     else:
       if port is None:
         port = portpicker.pick_unused_port()

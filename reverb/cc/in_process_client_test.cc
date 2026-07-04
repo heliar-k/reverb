@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <string>
@@ -26,6 +27,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "reverb/cc/chunker.h"
+#include "reverb/cc/platform/default/simple_checkpointer.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/rate_limiter.h"
@@ -208,6 +210,74 @@ TEST(InProcessClientTest, CheckpointWithoutCheckpointerFails) {
   std::string path;
   auto status = client.Checkpoint(&path);
   EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+}
+
+// ponytail: 临时 checkpoint 根目录用 mkdtemp 生成唯一名,避免跨测试冲突。
+static std::string MakeCkptRoot() {
+  auto base = std::filesystem::temp_directory_path() / "inproc_ckptXXXXXX";
+  std::string tmpl = base.string();
+  char* dir = mkdtemp(tmpl.data());
+  REVERB_CHECK(dir != nullptr) << "mkdtemp failed for " << tmpl;
+  return dir;
+}
+
+TEST(InProcessClientTest, CheckpointSaveAndLoadLatestRoundTrip) {
+  // Save 阶段:写一个 item,checkpoint。
+  auto table = MakeTable("ckpt_table");
+  auto checkpointer =
+      std::make_shared<SimpleCheckpointer>(MakeCkptRoot());
+
+  std::vector<std::shared_ptr<Table>> save_tables{table};
+  InProcessClient saver(save_tables, checkpointer);
+
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(
+      saver.NewTrajectoryWriter("ckpt_table", MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(
+      writer->CreateItem("ckpt_table", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush());
+  ASSERT_EQ(table->size(), 1);
+
+  std::string path;
+  REVERB_ASSERT_OK(saver.Checkpoint(&path));
+  ASSERT_TRUE(std::filesystem::exists(path));
+
+  // LoadLatest 阶段:用一个 *同 name* 的空 table 的新 client 从同 checkpointer 恢复。
+  auto loaded_table = MakeTable("ckpt_table");
+  std::vector<std::shared_ptr<Table>> load_tables{loaded_table};
+  InProcessClient loader(load_tables, checkpointer);
+  REVERB_ASSERT_OK(loader.LoadLatest());
+  // item 数量恢复为 1。
+  EXPECT_EQ(loaded_table->size(), 1);
+
+  // 采样 round-trip:加载的 item 能正常采样出原数据。
+  Sampler::Options sopts;
+  sopts.max_samples = 1;
+  std::unique_ptr<Sampler> sampler;
+  REVERB_ASSERT_OK(loader.NewSampler("ckpt_table", sopts, &sampler));
+  std::vector<TensorBuffer> data;
+  REVERB_ASSERT_OK(sampler->GetNextTrajectory(&data));
+  ASSERT_EQ(data.size(), 1u);
+  EXPECT_EQ(data[0].dtype(), DataType::Int32);
+  EXPECT_EQ(data[0].shape(), std::vector<int64_t>({1, 1}));
+}
+
+TEST(InProcessClientTest, LoadLatestWithoutCheckpointerFails) {
+  auto table = MakeTable("t");
+  InProcessClient client({table});  // no checkpointer
+  EXPECT_EQ(client.LoadLatest().code(), absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(InProcessClientTest, LoadLatestOnEmptyRootReturnsNotFound) {
+  auto table = MakeTable("t");
+  auto checkpointer =
+      std::make_shared<SimpleCheckpointer>(MakeCkptRoot());
+  InProcessClient client({table}, checkpointer);
+  // 空根目录无 checkpoint -> NotFound(首次启动正常)。
+  EXPECT_EQ(client.LoadLatest().code(), absl::StatusCode::kNotFound);
 }
 
 }  // namespace

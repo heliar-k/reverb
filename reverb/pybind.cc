@@ -635,6 +635,25 @@ PYBIND11_MODULE(libpybind, m) {
              MaybeRaiseFromStatus(status);
              return path;
            })
+      .def("load_latest",
+           [](InProcessClient* client) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = client->LoadLatest();
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def("load",
+           [](InProcessClient* client, const std::string& path) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = client->Load(path);
+             }
+             MaybeRaiseFromStatus(status);
+           },
+           py::arg("path"))
       .def(
           "server_info",
           [](InProcessClient* client) {

@@ -112,6 +112,34 @@ absl::Status InProcessClient::Checkpoint(std::string* path) {
   return checkpointer_->Save(std::move(raw_tables), /*keep_latest=*/1, path);
 }
 
+absl::Status InProcessClient::LoadLatest() {
+  if (checkpointer_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "InProcessClient::LoadLatest: no checkpointer provided.");
+  }
+  std::vector<std::shared_ptr<Table>> tables;
+  tables.reserve(tables_.size());
+  for (auto& [_, table] : tables_) {
+    tables.push_back(table);
+  }
+  // LoadLatest 原地改写各 Table 对象(不改 shared_ptr),故 tables_ map
+  // 仍指向同一对象,无需重建。
+  return checkpointer_->LoadLatest(&tables);
+}
+
+absl::Status InProcessClient::Load(absl::string_view path) {
+  if (checkpointer_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "InProcessClient::Load: no checkpointer provided.");
+  }
+  std::vector<std::shared_ptr<Table>> tables;
+  tables.reserve(tables_.size());
+  for (auto& [_, table] : tables_) {
+    tables.push_back(table);
+  }
+  return checkpointer_->Load(path, &chunk_store_, &tables);
+}
+
 absl::Status InProcessClient::ServerInfo(std::vector<TableInfo>* table_info) {
   table_info->clear();
   table_info->reserve(tables_.size());

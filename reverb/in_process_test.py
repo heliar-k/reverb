@@ -222,36 +222,55 @@ def test_rate_limiter_min_size():
 
 
 def test_checkpoint_save_load():
-  """Checkpoint save is exposed; load into a fresh in-process server is not.
+  """Checkpoint save -> load round-trip across two in-process servers.
 
-  `LocalClient.checkpoint()` writes a timestamped checkpoint directory
-  (tables.ckpt / items.ckpt / chunks.ckpt / DONE) under the checkpointer root.
-  Restoring into a new `in_process=True` server is NOT wired up: unlike the
-  gRPC path, the in-process `Server`/`InProcessClient` never calls
-  `Checkpointer::LoadLatest` at construction, so a rebuilt server starts empty.
-  # TODO: expose restore (LoadLatest) on the in-process path; until then only
-  # save is testable end-to-end.
+  Server A writes items and checkpoints them to a shared root. Server B is
+  constructed with the same checkpointer root; `Server.__init__` calls
+  `InProcessClient.load_latest()` at construction (in_process mode), so B's
+  table is restored from the checkpoint. Sampling B then yields the same data
+  that was inserted into A.
   """
   root = tempfile.mkdtemp()
+  values = [float(i) for i in range(3)]
+
+  # Server A: insert + checkpoint.
   table = lambda: reverb.Table(
       name='c', sampler=reverb.selectors.Fifo(),
       remover=reverb.selectors.Fifo(), max_size=10,
       max_times_sampled=1,
       rate_limiter=reverb.rate_limiters.MinSize(1))
-  server = reverb.Server(
+  server_a = reverb.Server(
       tables=[table()],
       in_process=True,
       checkpointer=checkpointers.DefaultCheckpointer(path=root))
-  client = server.in_process_client
+  client_a = server_a.in_process_client
+  for v in values:
+    _insert_one(client_a, 'c', np.array([v], dtype=np.float32))
 
-  for i in range(3):
-    _insert_one(client, 'c', np.array([float(i)], dtype=np.float32))
-
-  ckpt_path = client.checkpoint()
+  ckpt_path = client_a.checkpoint()
   assert ckpt_path and os.path.isdir(ckpt_path), ckpt_path
   # A complete checkpoint writes all four artifacts.
   for name in ('tables.ckpt', 'items.ckpt', 'chunks.ckpt', 'DONE'):
     assert os.path.exists(os.path.join(ckpt_path, name)), name
+
+  # Drop server A so it doesn't share the checkpointer root's lock-ish state
+  # with B (tables are independent, but the python object is released).
+  del server_a
+
+  # Server B: same checkpointer root -> construction restores the checkpoint.
+  server_b = reverb.Server(
+      tables=[table()],
+      in_process=True,
+      checkpointer=checkpointers.DefaultCheckpointer(path=root))
+  client_b = server_b.in_process_client
+
+  # The restored table holds the same items; FIFO + max_times_sampled=1 means
+  # sampling drains them in insertion order.
+  restored = [
+      float(np.asarray(sample.data[0]).reshape(-1)[0])
+      for sample in client_b.sample('c', num_samples=len(values))
+  ]
+  assert restored == values, (restored, values)
 
 
 if __name__ == '__main__':

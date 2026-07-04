@@ -393,6 +393,7 @@ cc_library(
     copts = ["-Wno-sign-compare"],
     visibility = ["//reverb:__subpackages__"],
     deps = [
+        ":chunk_store",
         ":sampler",
         ":schema_cc_proto",
         ":table",
@@ -454,6 +455,7 @@ cc_test(
         ":trajectory_writer",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:simple_checkpointer",
         "//reverb/cc/selectors:fifo",
         "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/status",

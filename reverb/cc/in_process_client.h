@@ -22,6 +22,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "reverb/cc/checkpointing/interface.h"
+#include "reverb/cc/chunk_store.h"
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/schema.pb.h"
@@ -68,6 +69,18 @@ class InProcessClient {
   // 调 `checkpointer_->Save`(若未提供 checkpointer 则报错)。
   absl::Status Checkpoint(std::string* path);
 
+  // 从最新 checkpoint 恢复所有 table 的内部状态。需构造时提供 checkpointer。
+  // SimpleCheckpointer::LoadLatest 原地改写 `tables_` 中各 Table 对象
+  // (调 Table::InitializeFromCheckpoint / InsertCheckpointItem),
+  // shared_ptr 本身不被替换,故 `tables_` map 无需重建。
+  // 调用前提:各 table 必须为空(Table::InitializeFromCheckpoint 断言之),
+  // 即仅在新建 Server/Client 时调用一次。
+  absl::Status LoadLatest();
+
+  // 从指定 `path` 恢复。用 InProcessClient 自有的 `chunk_store_` 接收
+  // checkpoint 中的 chunk(后续采样靠 item 持有的 shared_ptr<Chunk> 存活)。
+  absl::Status Load(absl::string_view path);
+
   // 聚合所有 table 的 `info()`。
   absl::Status ServerInfo(std::vector<TableInfo>* table_info);
 
@@ -77,6 +90,9 @@ class InProcessClient {
 
   internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
   std::shared_ptr<Checkpointer> checkpointer_;
+  // `Load(path)` 时接收 checkpoint chunk;本地 Sampler 直接从 item 持有的
+  // shared_ptr<Chunk> 取数据,不查此 store,故成员仅为 Load 接口所需。
+  ChunkStore chunk_store_;
 };
 
 }  // namespace reverb
