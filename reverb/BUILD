@@ -213,6 +213,7 @@ reverb_pytype_strict_library(
         ":pybind",
         ":reverb_types",
         "//reverb/cc:patterns_py_pb2",
+        "//third_party/reverb_tensor:reverb_tensor_py_pb2",
     ],
 )
 
@@ -229,19 +230,6 @@ reverb_pytype_library(
     deps = [
         ":errors",
         ":pybind",
-    ],
-)
-
-reverb_py_test(
-    name = "client_test",
-    srcs = ["client_test.py"],
-    shard_count = 2,
-    deps = [
-        ":client",
-        ":errors",
-        ":item_selectors",
-        ":rate_limiters",
-        ":server",
     ],
 )
 
@@ -271,6 +259,39 @@ reverb_py_test(
     deps = [
         ":pybind",
         ":replay_sample",
+    ],
+)
+
+reverb_py_test(
+    name = "server_test",
+    srcs = ["server_test.py"],
+    deps = [
+        ":item_selectors",
+        ":pybind",
+        ":rate_limiters",
+        ":server",
+    ],
+)
+
+reverb_py_test(
+    name = "client_test",
+    srcs = ["client_test.py"],
+    deps = [
+        ":client",
+        ":errors",
+        ":item_selectors",
+        ":rate_limiters",
+        ":server",
+    ],
+)
+
+reverb_py_test(
+    name = "structured_writer_test",
+    srcs = ["structured_writer_test.py"],
+    deps = [
+        ":client",
+        ":server",
+        ":structured_writer",
     ],
 )
 

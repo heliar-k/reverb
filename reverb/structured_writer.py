@@ -29,12 +29,51 @@ from reverb import reverb_types
 import tree
 
 from reverb.cc import patterns_pb2
+from third_party.reverb_tensor import reverb_tensor_pb2
 
-# pylint: disable=g-direct-tensorflow-import
-from tensorflow.python.framework import tensor_shape
-from tensorflow.python.framework import tensor_spec
-from tensorflow.python.saved_model import nested_structure_coder
-# pylint: enable=g-direct-tensorflow-import
+# ponytail: TF 已从 reverb 移除。structured_writer 原依赖 TF 的
+# nested_structure_coder 编解码 pattern_structure,但 C++ 端完全忽略该字段
+# (仅 Python unpack_pattern 在测试中用于重建结构),且项目已换成对齐 numpy 的
+# 自定义 SignatureProto。故用纯 Python 实现 encode/decode_structure,覆盖
+# Reverb 实际用到的 dict/list/tuple 容器 + None 叶子(tree.map_structure(
+# lambda _: None, pattern) 产生)。infer_signature 仍返回 tf.TensorSpec,
+# 仅在 TF 可用时可用,保留惰性 import。
+# 升级路径:若需 BoundedTensorSpec/NamedTuple,扩展下面两个函数。
+
+
+def encode_structure(structure) -> reverb_tensor_pb2.SignatureProto:
+  """纯 Python 版 nested_structure_coder.encode_structure。
+
+  将嵌套结构(dict/list/tuple,叶子为任意值,实际调用方传 None)序列化为
+  自定义 SignatureProto。叶子一律编码为空 tensor_spec;解码时还原为 None。
+  """
+  proto = reverb_tensor_pb2.SignatureProto()
+  if isinstance(structure, dict):
+    for key, value in structure.items():
+      proto.dict_value.values[key].CopyFrom(encode_structure(value))
+  elif isinstance(structure, list):
+    for value in structure:
+      proto.list_value.values.add().CopyFrom(encode_structure(value))
+  elif isinstance(structure, tuple):
+    for value in structure:
+      proto.tuple_value.values.add().CopyFrom(encode_structure(value))
+  else:
+    # 叶子节点(实际为 None):用空 tensor_spec 占位,解码时还原 None。
+    proto.tensor_spec.SetInParent()
+  return proto
+
+
+def decode_structure(proto: reverb_tensor_pb2.SignatureProto):
+  """encode_structure 的逆运算,还原嵌套结构(叶子为 None)。"""
+  kind = proto.WhichOneof('kind')
+  if kind == 'dict_value':
+    return {k: decode_structure(v) for k, v in proto.dict_value.values.items()}
+  if kind == 'list_value':
+    return [decode_structure(v) for v in proto.list_value.values]
+  if kind == 'tuple_value':
+    return tuple(decode_structure(v) for v in proto.tuple_value.values)
+  # tensor_spec / 未设置 / 其它:叶子节点。
+  return None
 
 # TODO(b/204423296): Expose Python abstractions rather than the raw protos.
 Config = patterns_pb2.StructuredWriterConfig
@@ -151,7 +190,8 @@ class StructuredWriter:
           f'block_until_num_items must be >= 0, got {block_until_num_items}')
 
     try:
-      self._writer.Flush(block_until_num_items, timeout_ms)
+      # pybind Flush 取 int timeout_ms(<=0 视为无限等待);None 需转为 0。
+      self._writer.Flush(block_until_num_items, timeout_ms or 0)
     except RuntimeError as e:
       if 'Timeout exceeded' in str(e) and timeout_ms is not None:
         raise errors.DeadlineExceededError(
@@ -297,7 +337,7 @@ def create_config(pattern: Pattern,
     priority = constant_priority_fn(1.0)
   return patterns_pb2.StructuredWriterConfig(
       flat=tree.flatten(pattern),
-      pattern_structure=nested_structure_coder.encode_structure(structure),
+      pattern_structure=encode_structure(structure),
       table=table,
       priority=priority,
       conditions=conditions)
@@ -306,7 +346,7 @@ def create_config(pattern: Pattern,
 def unpack_pattern(config: Config) -> Pattern:
   if not config.HasField('pattern_structure'):
     return config.flat
-  structure = nested_structure_coder.decode_proto(config.pattern_structure)
+  structure = decode_structure(config.pattern_structure)
   return tree.unflatten_as(structure, config.flat)
 
 
@@ -342,6 +382,13 @@ def infer_signature(configs: Sequence[Config],
         f'included {", ".join(sorted(set(c.table for c in configs)))}.')
 
   flat_step_spec = tree.flatten(step_spec)
+
+  # infer_signature 返回 tf.TensorSpec,需 TF。numpy-only 模式下不可用;
+  # 调用方(测试)应在无 TF 时 skip。
+  # pylint: disable=g-import-not-at-top
+  from tensorflow.python.framework import tensor_shape
+  from tensorflow.python.framework import tensor_spec
+  # pylint: enable=g-import-not-at-top
 
   def _validate_and_convert_to_spec(path, *nodes):
     # Check that all nodes share the same dtype.
@@ -515,3 +562,16 @@ def td_error(
   return patterns_pb2.Priority(
       td_error=patterns_pb2.Priority.TDError(
           max_priority_weight=max_priority_weight, flat_source_index=index))
+
+
+if __name__ == '__main__':
+  # ponytail: encode/decode_structure 往返自检(dict/list/tuple + None 叶子)。
+  for struct in (
+      {'a': None, 'b': {'c': None}},
+      [None, None, None],
+      ({'x': None}, [None]),
+      None,
+  ):
+    got = decode_structure(encode_structure(struct))
+    assert got == struct, (struct, got)
+  print('PASS')
