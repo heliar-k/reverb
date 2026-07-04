@@ -154,6 +154,17 @@ load("@org_tensorflow//tensorflow:workspace2.bzl", "tf_workspace2")
 
 tf_workspace2()
 
+# 覆盖 tf_workspace2 注册的 @pybind11:用 reverb 自有 BUILD(third_party:pybind11.BUILD),
+# 去掉 @local_xla//third_party/python_runtime:headers 依赖,改用 rules_python 的
+# current_py_cc_headers,使 //reverb:pybind / //reverb:libreverb 闭包不再含 @local_xla。
+http_archive(
+    name = "pybind11",
+    urls = ["https://github.com/pybind/pybind11/archive/v2.13.6.tar.gz"],
+    sha256 = "e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20",
+    strip_prefix = "pybind11-2.13.6",
+    build_file = "//third_party:pybind11.BUILD",
+)
+
 load("@org_tensorflow//tensorflow:workspace1.bzl", "tf_workspace1")
 
 tf_workspace1()

@@ -1,4 +1,4 @@
-load("@local_xla//third_party/py:python_wheel.bzl", "collect_data_files", "transitive_py_deps")
+load("//reverb/pip_package:python_wheel.bzl", "collect_data_files", "transitive_py_deps")
 load("@python_version_repo//:py_version.bzl", "REQUIREMENTS")
 load("@rules_python//python:pip.bzl", "compile_pip_requirements")
 load("@rules_python//python:py_binary.bzl", "py_binary")
