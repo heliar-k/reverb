@@ -257,12 +257,21 @@ def reverb_cc_test(name, srcs, deps = [], **kwargs):
         "@com_google_absl//absl/status:status_matchers",
     ] + reverb_tf_deps()
     size = kwargs.pop("size", "small")
+    # ponytail: reverb 闭包经 tensor_proxy(pybind11/numpy C-API)传递依赖 libpython,
+    # 所有 cc_test 需链接 libpython 解析 Py* 符号。在此统一注入,避免逐测试补 linkopts。
+    linkopts = kwargs.pop("linkopts", [])
+    linkopts = linkopts + [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ]
     cc_test(
         name = name,
         size = size,
         copts = tf_copts(),
         srcs = srcs,
         deps = depset(deps + new_deps).to_list(),
+        linkopts = linkopts,
         **kwargs
     )
 
