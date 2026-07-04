@@ -434,6 +434,51 @@ absl::Status ValidateStructuredWriterConfig(
   return absl::OkStatus();
 }
 
+absl::StatusOr<int> PrepareStructuredWriterConfigs(
+    std::vector<StructuredWriterConfig>& configs) {
+  // Keep track of the maximum history length required by any of the configs and
+  // use this to build the `TrajectoryWriter` that the `StructuredWriter` will
+  // wrap.
+  int max_num_keep_alive_refs = 0;
+  for (int i = 0; i < configs.size(); i++) {
+    // Find the maximum history length required by this config.
+    int num_keep_alive_refs = 0;
+    for (const auto& node : configs[i].flat()) {
+      num_keep_alive_refs = std::max(
+          num_keep_alive_refs, std::abs(std::min(node.start(), node.stop())));
+    }
+
+    // Update the global maximum history length required.
+    max_num_keep_alive_refs =
+        std::max(max_num_keep_alive_refs, num_keep_alive_refs);
+
+    // If we wish to avoid segfault then it is important that the buffers
+    // contains enough steps for the pattern to be applied before anything is
+    // attempted. We therefore check if the config already contains a condition
+    // that ensures that the config is not applied prematurely. If none of the
+    // existing conditions fulfill this responsibility then we create and add
+    // one to the config.
+    if (std::none_of(configs[i].conditions().begin(),
+                     configs[i].conditions().end(), [&](const auto& c) {
+                       return c.buffer_length() &&
+                              c.ge() >= num_keep_alive_refs;
+                     })) {
+      auto* cond = configs[i].add_conditions();
+      cond->set_buffer_length(true);
+      cond->set_ge(num_keep_alive_refs);
+    }
+
+    if (auto status = ValidateStructuredWriterConfig(configs[i]);
+        !status.ok()) {
+      return absl::Status(
+          status.code(),
+          absl::StrFormat("Invalid configuration at position %d: %s", i,
+                          status.message()));
+    }
+  }
+  return max_num_keep_alive_refs;
+}
+
 StructuredWriter::StructuredWriter(std::unique_ptr<ColumnWriter> writer,
                                    std::vector<StructuredWriterConfig> configs)
     : writer_(std::move(writer)),

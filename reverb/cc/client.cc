@@ -440,47 +440,9 @@ absl::Status Client::NewStructuredWriter(
     return absl::InvalidArgumentError("At least one config must be provided.");
   }
 
-  // Keep track of the maximum history length required by any of the configs and
-  // use this to build the `TrajectoryWriter` that the `StructuredWriter` will
-  // wrap.
-  int max_num_keep_alive_refs = 0;
-  for (int i = 0; i < configs.size(); i++) {
-    // Find the maximum history length required by this config.
-    int num_keep_alive_refs = 0;
-    for (const auto& node : configs[i].flat()) {
-      num_keep_alive_refs = std::max(
-          num_keep_alive_refs, std::abs(std::min(node.start(), node.stop())));
-    }
-
-    // Update the global maximum history length required.
-    max_num_keep_alive_refs =
-        std::max(max_num_keep_alive_refs, num_keep_alive_refs);
-
-    // If we wish to avoid segfault then it is important that the buffers
-    // contains enough steps for the pattern to be applied before anything is
-    // attempted. We therefore check if the config already contains a condition
-    // that ensures that the config is not applied prematurely. If none of the
-    // existing conditions fulfill this responsibility then we create and add
-    // one to the config.
-    // Add a condition for the buffer length if it doesn't already have one.
-    if (std::none_of(configs[i].conditions().begin(),
-                     configs[i].conditions().end(), [&](const auto& c) {
-                       return c.buffer_length() &&
-                              c.ge() >= num_keep_alive_refs;
-                     })) {
-      auto* cond = configs[i].add_conditions();
-      cond->set_buffer_length(true);
-      cond->set_ge(num_keep_alive_refs);
-    }
-
-    if (auto status = ValidateStructuredWriterConfig(configs[i]);
-        !status.ok()) {
-      return absl::Status(
-          status.code(),
-          absl::StrFormat("Invalid configuration at position %d: %s", i,
-                          status.message()));
-    }
-  }
+  REVERB_ASSIGN_OR_RETURN(
+      int max_num_keep_alive_refs,
+      PrepareStructuredWriterConfigs(configs));
 
   TrajectoryWriter::Options options = {
       .chunker_options =

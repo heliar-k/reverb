@@ -72,36 +72,11 @@ absl::Status InProcessClient::NewStructuredWriter(
     return absl::InvalidArgumentError("At least one config must be provided.");
   }
 
-  // 镜像 Client::NewStructuredWriter:算全局 max_num_keep_alive_refs,
-  // 为缺 buffer_length 条件的 config 补上,避免 pattern 在数据不足时被应用。
-  int max_num_keep_alive_refs = 0;
-  for (int i = 0; i < configs.size(); i++) {
-    int num_keep_alive_refs = 0;
-    for (const auto& node : configs[i].flat()) {
-      num_keep_alive_refs = std::max(
-          num_keep_alive_refs, std::abs(std::min(node.start(), node.stop())));
-    }
-    max_num_keep_alive_refs =
-        std::max(max_num_keep_alive_refs, num_keep_alive_refs);
-
-    if (std::none_of(configs[i].conditions().begin(),
-                     configs[i].conditions().end(), [&](const auto& c) {
-                       return c.buffer_length() &&
-                              c.ge() >= num_keep_alive_refs;
-                     })) {
-      auto* cond = configs[i].add_conditions();
-      cond->set_buffer_length(true);
-      cond->set_ge(num_keep_alive_refs);
-    }
-
-    if (auto status = ValidateStructuredWriterConfig(configs[i]);
-        !status.ok()) {
-      return absl::Status(
-          status.code(),
-          absl::StrFormat("Invalid configuration at position %d: %s", i,
-                          status.message()));
-    }
-  }
+  // ponytail: configs 的补条件/校验/max_num_keep_alive_refs 计算已收敛到
+  // PrepareStructuredWriterConfigs(与 Client::NewStructuredWriter 共用)。
+  REVERB_ASSIGN_OR_RETURN(
+      int max_num_keep_alive_refs,
+      PrepareStructuredWriterConfigs(configs));
 
   TrajectoryWriter::Options options = {
       .chunker_options =

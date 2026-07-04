@@ -14,6 +14,63 @@ namespace py = pybind11;
 
 namespace {
 
+// ponytail: 用 numpy C-API 而非 pybind11 的 py::array/py::dtype。
+// pybind11 3.0.4 的 npy_api::lookup 会访问 ModuleSpec._initializing,
+// 该属性 Python 3.10 没有(3.11+ 才有),嵌入 3.10 时必崩。直走 C-API 绕过。
+
+// ponytail: 收敛 6 个 DataType switch 到一张映射表。加新 dtype 只改表一行。
+// proto 枚举(::reverb::tensor::DT_*)由 protobuf 生成,是 constexpr;NPY_* 是整数宏。
+struct DataTypeMapping {
+  DataType dt;
+  int npy_type;                   // NPY_FLOAT32 等(NPY_NOTYPE for Invalid)
+  ::reverb::tensor::DataType proto_type;
+  const char* name;
+  int itemsize;
+};
+constexpr DataTypeMapping kMappings[] = {
+    {DataType::Float32,    NPY_FLOAT32,    ::reverb::tensor::DT_FLOAT32,    "Float32",    4},
+    {DataType::Float64,    NPY_FLOAT64,    ::reverb::tensor::DT_FLOAT64,    "Float64",    8},
+    {DataType::Int8,       NPY_INT8,       ::reverb::tensor::DT_INT8,       "Int8",       1},
+    {DataType::Int16,      NPY_INT16,      ::reverb::tensor::DT_INT16,      "Int16",      2},
+    {DataType::Int32,      NPY_INT32,      ::reverb::tensor::DT_INT32,      "Int32",      4},
+    {DataType::Int64,      NPY_INT64,      ::reverb::tensor::DT_INT64,      "Int64",      8},
+    {DataType::Uint8,      NPY_UINT8,      ::reverb::tensor::DT_UINT8,      "Uint8",      1},
+    {DataType::Uint16,     NPY_UINT16,     ::reverb::tensor::DT_UINT16,     "Uint16",     2},
+    {DataType::Uint32,     NPY_UINT32,     ::reverb::tensor::DT_UINT32,     "Uint32",     4},
+    {DataType::Uint64,     NPY_UINT64,     ::reverb::tensor::DT_UINT64,     "Uint64",     8},
+    {DataType::Bool,       NPY_BOOL,       ::reverb::tensor::DT_BOOL,       "Bool",       1},
+    {DataType::Complex64,  NPY_COMPLEX64,  ::reverb::tensor::DT_COMPLEX64,  "Complex64",  4},
+    {DataType::Complex128, NPY_COMPLEX128, ::reverb::tensor::DT_COMPLEX128, "Complex128", 8},
+    {DataType::String,     NPY_OBJECT,     ::reverb::tensor::DT_STRING,     "String",     0},
+    {DataType::Invalid,    NPY_NOTYPE,     ::reverb::tensor::DT_INVALID,    "Invalid",    0},
+};
+
+DataType NpyTypeToDataType(int type_num) {
+  // numpy 的 NPY_STRING/UNICODE 都映射到 String(bytes/str 变长)。
+  if (type_num == NPY_STRING || type_num == NPY_UNICODE ||
+      type_num == NPY_OBJECT) {
+    return DataType::String;
+  }
+  for (const auto& m : kMappings) {
+    if (m.npy_type == type_num) return m.dt;
+  }
+  return DataType::Invalid;
+}
+
+int DataTypeToNpy(DataType dt) {
+  for (const auto& m : kMappings) {
+    if (m.dt == dt) return m.npy_type;
+  }
+  return NPY_NOTYPE;
+}
+
+int DataTypeItemsize(DataType dt) {
+  for (const auto& m : kMappings) {
+    if (m.dt == dt) return m.itemsize;
+  }
+  return 0;
+}
+
 // numpy 的 import_array 必须在 interpreter 启动后调一次。懒加载,避免在
 // 静态初始化期或无 interpreter 时崩溃。
 void ImportNumpyOnce() {
@@ -26,79 +83,6 @@ void ImportNumpyOnce() {
     }
     imported = true;
   }
-}
-
-// ponytail: 用 numpy C-API 而非 pybind11 的 py::array/py::dtype。
-// pybind11 3.0.4 的 npy_api::lookup 会访问 ModuleSpec._initializing,
-// 该属性 Python 3.10 没有(3.11+ 才有),嵌入 3.10 时必崩。直走 C-API 绕过。
-DataType NpyTypeToDataType(int type_num) {
-  switch (type_num) {
-    case NPY_FLOAT32: return DataType::Float32;
-    case NPY_FLOAT64: return DataType::Float64;
-    case NPY_INT8: return DataType::Int8;
-    case NPY_INT16: return DataType::Int16;
-    case NPY_INT32: return DataType::Int32;
-    case NPY_INT64: return DataType::Int64;
-    case NPY_UINT8: return DataType::Uint8;
-    case NPY_UINT16: return DataType::Uint16;
-    case NPY_UINT32: return DataType::Uint32;
-    case NPY_UINT64: return DataType::Uint64;
-    case NPY_BOOL: return DataType::Bool;
-    case NPY_COMPLEX64: return DataType::Complex64;
-    case NPY_COMPLEX128: return DataType::Complex128;
-    case NPY_STRING:
-    case NPY_UNICODE:
-    case NPY_OBJECT: return DataType::String;
-    default: return DataType::Invalid;
-  }
-}
-
-int DataTypeToNpy(DataType dt) {
-  switch (dt) {
-    case DataType::Float32: return NPY_FLOAT32;
-    case DataType::Float64: return NPY_FLOAT64;
-    case DataType::Int8: return NPY_INT8;
-    case DataType::Int16: return NPY_INT16;
-    case DataType::Int32: return NPY_INT32;
-    case DataType::Int64: return NPY_INT64;
-    case DataType::Uint8: return NPY_UINT8;
-    case DataType::Uint16: return NPY_UINT16;
-    case DataType::Uint32: return NPY_UINT32;
-    case DataType::Uint64: return NPY_UINT64;
-    case DataType::Bool: return NPY_BOOL;
-    case DataType::Complex64: return NPY_COMPLEX64;
-    case DataType::Complex128: return NPY_COMPLEX128;
-    case DataType::String: return NPY_OBJECT;
-    case DataType::Invalid: return NPY_NOTYPE;
-  }
-  return NPY_NOTYPE;
-}
-
-int DataTypeItemsize(DataType dt) {
-  switch (dt) {
-    case DataType::Float32:
-    case DataType::Int32:
-    case DataType::Uint32:
-    case DataType::Complex64:
-      return 4;
-    case DataType::Float64:
-    case DataType::Int64:
-    case DataType::Uint64:
-    case DataType::Complex128:
-      return 8;
-    case DataType::Int16:
-    case DataType::Uint16:
-      return 2;
-    case DataType::Int8:
-    case DataType::Uint8:
-    case DataType::Bool:
-      return 1;
-    case DataType::String:
-      return 0;  // 变长
-    case DataType::Invalid:
-      return 0;
-  }
-  return 0;
 }
 
 // string bytes 编码:每个元素 [4 字节 little-endian 长度][内容]。
@@ -132,67 +116,25 @@ TensorBuffer::TensorBuffer(TensorSpec spec, std::string bytes)
     : spec_(std::move(spec)), bytes_(std::move(bytes)) {}
 
 const char* DataTypeName(DataType dt) {
-  switch (dt) {
-    case DataType::Float32: return "Float32";
-    case DataType::Float64: return "Float64";
-    case DataType::Int8: return "Int8";
-    case DataType::Int16: return "Int16";
-    case DataType::Int32: return "Int32";
-    case DataType::Int64: return "Int64";
-    case DataType::Uint8: return "Uint8";
-    case DataType::Uint16: return "Uint16";
-    case DataType::Uint32: return "Uint32";
-    case DataType::Uint64: return "Uint64";
-    case DataType::Bool: return "Bool";
-    case DataType::Complex64: return "Complex64";
-    case DataType::Complex128: return "Complex128";
-    case DataType::String: return "String";
-    case DataType::Invalid: return "Invalid";
+  for (const auto& m : kMappings) {
+    if (m.dt == dt) return m.name;
   }
   return "Invalid";
 }
 
 ::reverb::tensor::DataType DataTypeToProto(DataType dt) {
-  switch (dt) {
-    case DataType::Float32: return ::reverb::tensor::DT_FLOAT32;
-    case DataType::Float64: return ::reverb::tensor::DT_FLOAT64;
-    case DataType::Int8: return ::reverb::tensor::DT_INT8;
-    case DataType::Int16: return ::reverb::tensor::DT_INT16;
-    case DataType::Int32: return ::reverb::tensor::DT_INT32;
-    case DataType::Int64: return ::reverb::tensor::DT_INT64;
-    case DataType::Uint8: return ::reverb::tensor::DT_UINT8;
-    case DataType::Uint16: return ::reverb::tensor::DT_UINT16;
-    case DataType::Uint32: return ::reverb::tensor::DT_UINT32;
-    case DataType::Uint64: return ::reverb::tensor::DT_UINT64;
-    case DataType::Bool: return ::reverb::tensor::DT_BOOL;
-    case DataType::Complex64: return ::reverb::tensor::DT_COMPLEX64;
-    case DataType::Complex128: return ::reverb::tensor::DT_COMPLEX128;
-    case DataType::String: return ::reverb::tensor::DT_STRING;
-    case DataType::Invalid: return ::reverb::tensor::DT_INVALID;
+  for (const auto& m : kMappings) {
+    if (m.dt == dt) return m.proto_type;
   }
   return ::reverb::tensor::DT_INVALID;
 }
 
 absl::StatusOr<DataType> DataTypeFromProto(::reverb::tensor::DataType dt) {
-  switch (dt) {
-    case ::reverb::tensor::DT_FLOAT32: return DataType::Float32;
-    case ::reverb::tensor::DT_FLOAT64: return DataType::Float64;
-    case ::reverb::tensor::DT_INT8: return DataType::Int8;
-    case ::reverb::tensor::DT_INT16: return DataType::Int16;
-    case ::reverb::tensor::DT_INT32: return DataType::Int32;
-    case ::reverb::tensor::DT_INT64: return DataType::Int64;
-    case ::reverb::tensor::DT_UINT8: return DataType::Uint8;
-    case ::reverb::tensor::DT_UINT16: return DataType::Uint16;
-    case ::reverb::tensor::DT_UINT32: return DataType::Uint32;
-    case ::reverb::tensor::DT_UINT64: return DataType::Uint64;
-    case ::reverb::tensor::DT_BOOL: return DataType::Bool;
-    case ::reverb::tensor::DT_COMPLEX64: return DataType::Complex64;
-    case ::reverb::tensor::DT_COMPLEX128: return DataType::Complex128;
-    case ::reverb::tensor::DT_STRING: return DataType::String;
-    case ::reverb::tensor::DT_INVALID:
-      return absl::InvalidArgumentError("DT_INVALID in proto");
-    default:
-      break;
+  if (dt == ::reverb::tensor::DT_INVALID) {
+    return absl::InvalidArgumentError("DT_INVALID in proto");
+  }
+  for (const auto& m : kMappings) {
+    if (m.proto_type == dt) return m.dt;
   }
   return absl::InvalidArgumentError(absl::StrCat(
       "Unknown proto DataType: ", static_cast<int>(dt)));

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "reverb/cc/chunker.h"
@@ -106,6 +107,13 @@ class StructuredWriter {
 // invalid.
 absl::Status ValidateStructuredWriterConfig(
     const StructuredWriterConfig& config);
+
+// ponytail: 收敛 Client/InProcessClient::NewStructuredWriter 的重复逻辑。
+// 遍历 configs:算 max_num_keep_alive_refs、为缺 buffer_length 条件的 config
+// 补条件、调 ValidateStructuredWriterConfig。返回 max_num_keep_alive_refs,
+// 供调用方构造 AutoTunedChunkerOptions。两处调用模式一致(table 由调用方处理)。
+absl::StatusOr<int> PrepareStructuredWriterConfigs(
+    std::vector<StructuredWriterConfig>& configs);
 
 }  // namespace deepmind::reverb
 
