@@ -507,6 +507,45 @@ cc_test(
     ] + reverb_grpc_deps(),
 )
 
+cc_test(
+    name = "reverb_service_impl_test",
+    srcs = ["reverb_service_impl_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: 原生 cc_test,去 reverb_tf_deps() + TF 头(struct.pb/env.h/tensor_shape)。
+    # :reverb_service_impl -> :table -> :chunker -> :tensor_proxy(pybind11/numpy
+    # C-API),需链接 libpython 解析 Py* 符号(同 :streaming_trajectory_writer_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
+    deps = [
+        ":reverb_service_impl",
+        ":schema_cc_proto",
+        ":table",
+        ":task_worker",
+        "//reverb/cc/checkpointing:interface",
+        "//reverb/cc/platform:checkpointing",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/selectors:interface",
+        "//reverb/cc/selectors:uniform",
+        "//reverb/cc/testing:proto_test_util",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
+        "@com_github_grpc_grpc//:grpc++_test",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ] + reverb_grpc_deps(),
+)
+
 cc_library(
     name = "chunker",
     srcs = ["chunker.cc"],
