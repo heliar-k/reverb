@@ -58,7 +58,7 @@ def _normalize_proto(x):
 def _filegroup_name(x):
     return _normalize_proto(x) + "_filegroup"
 
-def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwargs):
+def reverb_cc_proto_library(name, srcs = [], deps = [], **kwargs):
     """Build a proto cc_library.
 
     This rule does three things:
@@ -66,8 +66,7 @@ def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
     1) Create a filegroup with name `<name>_filegroup` that contains `srcs`
        and any sources from deps named "x_proto" or "x_cc_proto".
 
-    2) Uses protoc to compile srcs to .h/.cc files, allowing any
-       tensorflow imports.
+    2) Uses protoc to compile srcs to .h/.cc files.
 
     3) Creates a cc_library with name `name` building the resulting .h/.cc
        files.
@@ -76,9 +75,6 @@ def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
       name: The name, should end with "_cc_proto".
       srcs: The .proto files.
       deps: Any reverb_cc_proto_library targets.
-      tf_proto: If True, link TF protos (proto_path + srcs) and reverb_tf_deps()
-        into the generated code and cc_library. Use only for protos that still
-        import tensorflow/... protos.
       **kwargs: Any additional args for the cc_library rule.
     """
     gen_srcs = [_removesuffix(x, ".proto") + ".pb.cc" for x in srcs]
@@ -97,7 +93,7 @@ def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
         name = name + "_gen",
         srcs = srcs + dep_srcs + [
             "@com_google_protobuf//:well_known_type_protos",
-        ] + (["@org_tensorflow//tensorflow/core:protos_srcs"] if tf_proto else []),
+        ],
         outs = gen_srcs + gen_hdrs,
         tools = [
             "@com_google_protobuf//:protoc",
@@ -105,10 +101,9 @@ def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
         cmd = """
         OUTDIR=$$(echo $(RULEDIR) | sed -E -e 's#reverb(/.*|$$)##')
         $(location @com_google_protobuf//:protoc) \
-          {tf}--proto_path=external/com_google_protobuf/src \
+          --proto_path=external/com_google_protobuf/src \
           --proto_path=. \
           --cpp_out=$$OUTDIR {srcs}""".format(
-            tf = "--proto_path=external/org_tensorflow/ " if tf_proto else "",
             srcs = " ".join(src_paths),
         ),
     )
@@ -116,12 +111,12 @@ def reverb_cc_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
         name = "{}".format(name),
         srcs = gen_srcs,
         hdrs = gen_hdrs,
-        deps = deps + (reverb_tf_deps() if tf_proto else ["@com_google_protobuf//:protobuf"]),
+        deps = deps + ["@com_google_protobuf//:protobuf"],
         alwayslink = 1,
         **kwargs
     )
 
-def reverb_py_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwargs):
+def reverb_py_proto_library(name, srcs = [], deps = [], **kwargs):
     """Build a proto py_library.
 
     This rule does three things:
@@ -129,8 +124,7 @@ def reverb_py_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
     1) Create a filegroup with name `<name>_filegroup` that contains `srcs`
        and any sources from deps named "x_proto" or "x_py_proto".
 
-    2) Uses protoc to compile srcs to _pb2.py files, allowing any
-       tensorflow imports.
+    2) Uses protoc to compile srcs to _pb2.py files.
 
     3) Creates a py_library with name `name` building the resulting .py
        files.
@@ -139,8 +133,6 @@ def reverb_py_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
       name: The name, should end with "_py_pb2".
       srcs: The .proto files.
       deps: Any reverb_cc_proto_library targets.
-      tf_proto: If True, link TF protos (proto_path + srcs) into the generated
-        code. Use only for protos that still import tensorflow/... protos.
       **kwargs: Any additional args for the cc_library rule.
     """
     gen_srcs = [_removesuffix(x, ".proto") + "_pb2.py" for x in srcs]
@@ -161,7 +153,7 @@ def reverb_py_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
         name = name + "_gen",
         srcs = srcs + proto_deps + [
             "@com_google_protobuf//:well_known_type_protos",
-        ] + (["@org_tensorflow//tensorflow/core:protos_srcs"] if tf_proto else []),
+        ],
         outs = gen_srcs,
         tools = [
             "@com_google_protobuf//:protoc",
@@ -169,10 +161,9 @@ def reverb_py_proto_library(name, srcs = [], deps = [], tf_proto = False, **kwar
         cmd = """
         OUTDIR=$$(echo $(RULEDIR) | sed -E -e 's#reverb(/.*|$$)##')
         $(location @com_google_protobuf//:protoc) \
-          {tf}--proto_path=external/com_google_protobuf/src \
+          --proto_path=external/com_google_protobuf/src \
           --proto_path=. \
           --python_out=$$OUTDIR {srcs}""".format(
-            tf = "--proto_path=external/org_tensorflow " if tf_proto else "",
             srcs = " ".join(src_paths),
         ),
     )
@@ -189,14 +180,13 @@ def reverb_cc_grpc_library(
         srcs = [],
         deps = [],
         generate_mocks = False,
-        tf_proto = False,
         **kwargs):
     """Build a grpc cc_library.
 
     This rule does two things:
 
-    1) Uses protoc + grpc plugin to compile srcs to .h/.cc files, allowing any
-       tensorflow imports.  Also creates mock headers if requested.
+    1) Uses protoc + grpc plugin to compile srcs to .h/.cc files.
+       Also creates mock headers if requested.
 
     2) Creates a cc_library with name `name` building the resulting .h/.cc
        files.
@@ -207,8 +197,6 @@ def reverb_cc_grpc_library(
       deps: reverb_cc_proto_library targets.  Must include src + "_cc_proto",
         the cc_proto library, for each src in srcs.
       generate_mocks: If true, creates mock headers for each source.
-      tf_proto: If True, link TF protos (proto_path + srcs) into the generated
-        code. Use only for protos that still import tensorflow/... protos.
       **kwargs: Any additional args for the cc_library rule.
     """
     gen_srcs = [_removesuffix(x, ".proto") + ".grpc.pb.cc" for x in srcs]
@@ -228,7 +216,7 @@ def reverb_cc_grpc_library(
         name = name + "_gen",
         srcs = srcs + proto_src_deps + [
             "@com_google_protobuf//:well_known_type_protos",
-        ] + (["@org_tensorflow//tensorflow/core:protos_srcs"] if tf_proto else []),
+        ],
         outs = gen_srcs + gen_hdrs + gen_mocks,
         tools = [
             "@com_google_protobuf//:protoc",
@@ -238,11 +226,10 @@ def reverb_cc_grpc_library(
         OUTDIR=$$(echo $(RULEDIR) | sed -e 's#reverb/.*##')
         $(location @com_google_protobuf//:protoc) \
           --plugin=protoc-gen-grpc=$(location @com_github_grpc_grpc//src/compiler:grpc_cpp_plugin) \
-          {tf}--proto_path=external/com_google_protobuf/src \
+          --proto_path=external/com_google_protobuf/src \
           --proto_path=. \
           --grpc_out={out} {srcs}""".format(
             out = "generate_mock_code=true:$$OUTDIR" if generate_mocks else "$$OUTDIR",
-            tf = "--proto_path=external/org_tensorflow/ " if tf_proto else "",
             srcs = " ".join(src_paths),
         ),
     )
