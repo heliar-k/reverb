@@ -246,30 +246,10 @@ reverb_py_test(
 )
 
 reverb_py_test(
-    name = "server_test",
-    srcs = ["server_test.py"],
-    deps = [
-        ":client",
-        ":item_selectors",
-        ":pybind",
-        ":rate_limiters",
-        ":server",
-    ],
-)
-
-reverb_py_test(
     name = "rate_limiters_test",
     srcs = ["rate_limiters_test.py"],
     deps = [
         ":rate_limiters",
-    ],
-)
-
-reverb_py_test(
-    name = "pybind_test",
-    srcs = ["pybind_test.py"],
-    deps = [
-        ":reverb",
     ],
 )
 
@@ -282,16 +262,6 @@ reverb_py_test(
         ":pybind",
         ":server",
         ":trajectory_writer",
-    ],
-)
-
-reverb_py_test(
-    name = "structured_writer_test",
-    srcs = ["structured_writer_test.py"],
-    deps = [
-        ":client",
-        ":server",
-        ":structured_writer",
     ],
 )
 

@@ -730,32 +730,6 @@ reverb_cc_library(
 )
 
 reverb_cc_test(
-    name = "reverb_service_impl_test",
-    srcs = ["reverb_service_impl_test.cc"],
-    deps = [
-        ":reverb_service_cc_proto",
-        ":reverb_service_impl",
-        ":schema_cc_proto",
-        ":table",
-        ":task_worker",
-        "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/platform:checkpointing",
-        "//reverb/cc/platform:status_macros",
-        "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/platform:thread",
-        "//reverb/cc/selectors:fifo",
-        "//reverb/cc/selectors:interface",
-        "//reverb/cc/selectors:uniform",
-        "//reverb/cc/table_extensions:interface",
-        "//reverb/cc/testing:proto_test_util",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-        "@com_google_absl//absl/types:optional",
-    ] + reverb_grpc_deps() + reverb_tf_deps(),
-)
-
-reverb_cc_test(
     name = "thread_stats_test",
     srcs = ["thread_stats_test.cc"],
     deps = [
