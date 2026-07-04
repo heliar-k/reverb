@@ -121,17 +121,18 @@ reverb_cc_shared_library(
         "//conditions:default": [],
     }),
     deps = [
-        # ponytail: 去 :client/:writer/:conversions/:structured_writer(均仍依赖
-        # TF,编译不过)。libreverb 为聚合共享库,内嵌模式仅需 :table/
-        # :trajectory_writer/:sampler/:in_process_client 等已去 TF 的目标。
-        # gRPC Client/Writer/StructuredWriter 待对应 .cc 去 TF 后再加回。
+        # ponytail: P4 — client.cc/writer.cc/streaming_trajectory_writer.cc 已去 TF,
+        # 恢复 gRPC 模式聚合。
         "//reverb/cc:chunker",
+        "//reverb/cc:client",
         "//reverb/cc:errors",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
         "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:streaming_trajectory_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",
+        "//reverb/cc:writer",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing",
         "//reverb/cc/platform:checkpointing_utils",
@@ -158,18 +159,19 @@ reverb_pybind_extension(
     module_name = "libpybind",
     pytype_srcs = ["pybind.pyi"],
     visibility = [":__subpackages__"],
-    # ponytail: 去 reverb_tf_deps() + :client/:writer/:conversions
-    # (均仍依赖 TF,编译不过)。改用 :in_process_client +
-    # :structured_writer + :tensor_proxy(numpy C-API)。gRPC Client/Writer
-    # 待对应 .cc 去 TF 后再恢复绑定。
+    # ponytail: P4 — client.cc/writer.cc/streaming_trajectory_writer.cc 已去 TF,
+    # 恢复 gRPC Client/Writer pybind 绑定。
     deps = [
         "//reverb/cc:chunker",
+        "//reverb/cc:client",
         "//reverb/cc:in_process_client",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
+        "//reverb/cc:streaming_trajectory_writer",
         "//reverb/cc:structured_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",
+        "//reverb/cc:writer",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing",
         "//reverb/cc/platform:checkpointing_utils",
@@ -313,6 +315,20 @@ py_test(
     deps = [
         ":reverb",
         "@pypi//numpy",
+    ],
+)
+
+# ponytail: P4 — gRPC 模式(numpy-only)端到端冒烟。Server(in_process=False) +
+# Client(gRPC),走 InsertStream/Writer 路径。无 TF 签名。
+py_test(
+    name = "grpc_roundtrip_test",
+    srcs = ["grpc_roundtrip_test.py"],
+    main = "grpc_roundtrip_test.py",
+    python_version = "PY3",
+    deps = [
+        ":reverb",
+        "@pypi//numpy",
+        "@pypi//portpicker",
     ],
 )
 

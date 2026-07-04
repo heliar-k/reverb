@@ -15,6 +15,7 @@
 #include "reverb/cc/testing/proto_test_util.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,13 +23,30 @@
 #include "absl/log/check.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/tensor_compression.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.pb.h"
 
 namespace deepmind {
 namespace reverb {
 namespace testing {
+
+namespace {
+
+// Builds a DT_INT32 TensorBuffer of the given shape filled with 1, mirroring
+// the historical `tensorflow::Tensor(DT_INT32, shape).setConstant(1)` helper
+// without pulling in TF.
+TensorBuffer MakeInt32Filled(const std::vector<int64_t>& shape) {
+  int64_t num = 1;
+  for (int64_t d : shape) num *= d;
+  std::string bytes(sizeof(int32_t) * num, '\0');
+  int32_t one = 1;
+  for (int64_t i = 0; i < num; ++i) {
+    std::memcpy(&bytes[i * sizeof(int32_t)], &one, sizeof(int32_t));
+  }
+  return TensorBuffer(TensorSpec{DataType::Int32, shape}, std::move(bytes));
+}
+
+}  // namespace
 
 ChunkData MakeChunkData(uint64_t key) {
   return MakeChunkData(key, MakeSequenceRange(key * 100, 0, 1), 1);
@@ -41,9 +59,8 @@ ChunkData MakeChunkData(uint64_t key, SequenceRange range) {
 ChunkData MakeChunkData(uint64_t key, SequenceRange range, int num_tensors) {
   ChunkData chunk;
   chunk.set_chunk_key(key);
-  tensorflow::Tensor t(tensorflow::DT_INT32,
-                       {range.end() - range.start() + 1, 10});
-  t.flat<int32_t>().setConstant(1);
+  TensorBuffer t = MakeInt32Filled(
+      {range.end() - range.start() + 1, 10});
   for (int i = 0; i < num_tensors; i++) {
     CHECK_OK(CompressTensorAsProto(t, chunk.mutable_data()->add_tensors()));
   }
@@ -83,7 +100,7 @@ PrioritizedItem MakePrioritizedItem(uint64_t key, double priority,
       auto* slice = col->add_chunk_slices();
       slice->set_chunk_key(chunk.chunk_key());
       slice->set_offset(0);
-      slice->set_length(chunk.data().tensors(0).tensor_shape().dim(0).size());
+      slice->set_length(chunk.data().tensors(0).shape().dim(0));
       slice->set_index(i);
     }
   }

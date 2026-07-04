@@ -238,8 +238,8 @@ absl::Status Client::GetDtypesAndShapesForSampler(
 
 absl::Status Client::NewSampler(
     const std::string& table, const Sampler::Options& options,
-    const tensorflow::DataTypeVector& validation_dtypes,
-    const std::vector<tensorflow::PartialTensorShape>& validation_shapes,
+    const std::vector<DataType>& validation_dtypes,
+    const std::vector<std::vector<int64_t>>& validation_shapes,
     absl::Duration validation_timeout, std::unique_ptr<Sampler>* sampler) {
   if (validation_dtypes.size() != validation_shapes.size()) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -261,17 +261,18 @@ absl::Status Client::NewSampler(
           internal::DtypesShapesString(*dtypes_and_shapes)));
     }
     for (int i = 0; i < dtypes_and_shapes->size(); ++i) {
-      if (dtypes_and_shapes->at(i).dtype != validation_dtypes[i] ||
-          !dtypes_and_shapes->at(i).shape.IsCompatibleWith(
-              validation_shapes[i])) {
+      const internal::TensorSpec requested{/*name=*/"?", validation_dtypes[i],
+                                          validation_shapes[i]};
+      if (!dtypes_and_shapes->at(i).IsCompatibleWith(requested)) {
         return absl::InvalidArgumentError(absl::StrCat(
             "Requested incompatible tensor at flattened index ", i,
             " from table '", table, "'.  Requested (dtype, shape): (",
-            tensorflow::DataTypeString(validation_dtypes[i]), ", ",
-            validation_shapes[i].DebugString(),
+            DataTypeName(validation_dtypes[i]), ", ", requested.DebugString(),
             ").  Signature (dtype, shape): (",
-            tensorflow::DataTypeString(dtypes_and_shapes->at(i).dtype), ", ",
-            dtypes_and_shapes->at(i).shape.DebugString(),
+            DataTypeName(dtypes_and_shapes->at(i).dtype), ", ",
+            dtypes_and_shapes->at(i).shape.empty()
+                ? std::string("[]")
+                : dtypes_and_shapes->at(i).DebugString(),
             ").  Table signature: ",
             internal::DtypesShapesString(*dtypes_and_shapes)));
       }

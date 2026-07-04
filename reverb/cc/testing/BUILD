@@ -19,11 +19,10 @@ reverb_cc_library(
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
         "//reverb/cc/platform:logging",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/log:check",
-        # ponytail: 此 TF-era 测试辅助直接 include tensorflow/... 头文件,显式依赖
-        # @pypi//tf_nightly。内嵌路径不依赖此 target,故不影响 numpy-only 链路。
-        "@pypi//tf_nightly:headers_lib",
-        "@pypi//tf_nightly:framework_lib",
+        "@com_google_protobuf//:protobuf",
     ],
 )
 

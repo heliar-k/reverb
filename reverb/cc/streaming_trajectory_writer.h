@@ -32,8 +32,8 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "tensorflow/core/framework/tensor.h"
 
 namespace deepmind::reverb {
 
@@ -77,12 +77,12 @@ class StreamingTrajectoryWriter : public ColumnWriter {
 
   // See `ColumnWriter::Append` in trajectory_writer.h.
   absl::Status Append(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs) override;
 
   // See `ColumnWriter::AppendPartial` in trajectory_writer.h.
   absl::Status AppendPartial(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs);
 
   // See `ColumnWriter::CreateItem` in trajectory_writer.h.
@@ -112,7 +112,7 @@ class StreamingTrajectoryWriter : public ColumnWriter {
 
   // See `Append` and `AppendPartial`.
   absl::Status AppendInternal(
-      std::vector<absl::optional<tensorflow::Tensor>> data,
+      std::vector<absl::optional<TensorBuffer>> data,
       bool increment_episode_step,
       std::vector<absl::optional<std::weak_ptr<CellRef>>>* refs);
 

@@ -19,17 +19,18 @@ Reverb supports two modes:
   * **In-process / numpy-only mode** (no TensorFlow required): construct a
     `reverb.Server(in_process=True)` and interact with it through
     `server.in_process_client` (an `InProcessClient` wrapped by `LocalClient`).
-    Data flows as numpy arrays. This is the path surfaced by the de-TF refactor.
+    Data flows as numpy arrays. Zero gRPC overhead; tables are held directly.
 
-  * **gRPC mode** (TensorFlow required): the original `Client`/`Writer`/
-    `StructuredWriter` path. These C++ bindings (`client.cc`/`writer.cc`/
-    `structured_writer.cc`) still depend on TensorFlow and have been removed
-    from the pybind module until those files are de-TF'd. The Python `Client`/
-    `Writer` classes remain but raise `NotImplementedError` on construction.
+  * **gRPC mode** (numpy-only): the original `Client`/`Writer`/
+    `StructuredWriter` path over a networked `Server(in_process=False)`. The
+    C++ `client.cc`/`writer.cc`/`streaming_trajectory_writer.cc` were de-TF'd
+    (data flows as numpy-backed `TensorBuffer`), so the gRPC bindings are
+    restored and `Client`/`Writer` no longer raise `NotImplementedError`.
 
-TensorFlow is intentionally NOT imported at module load time, even when
-installed: doing so would load TF's bundled gRPC and conflict with Reverb's own
-gRPC statically linked into `libreverb.so` (duplicate flag registration).
+TensorFlow is intentionally NOT imported at module load time: TF is only
+needed to encode `tf.TypeSpec`-based table signatures, and importing it
+eagerly would load TF's bundled gRPC and conflict with Reverb's own gRPC
+statically linked into `libreverb.so` (duplicate flag registration).
 """
 
 # pylint: disable=g-import-notat-top

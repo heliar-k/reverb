@@ -34,8 +34,7 @@
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/signature.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
+#include "reverb/cc/support/tensor_proxy.h"
 
 namespace deepmind {
 namespace reverb {
@@ -61,12 +60,12 @@ class Writer {
   // If all operations are successful then `buffer_` is cleared, a new
   // `next_chunk_key_` is set and old items are removed from `chunks_` until its
   // size is <= `max_chunks_`. If unsuccessful all internal state is reverted.
-  absl::Status Append(std::vector<tensorflow::Tensor> data);
+  absl::Status Append(std::vector<TensorBuffer> data);
 
   // Appends a batched sequence of timesteps. Equivalent to calling `Append` `T`
   // times where `T` is batch size of `sequence`. The shapes of the elements of
   // `sequence` thus have `[T] + shape_of_single_timestep_element`.
-  absl::Status AppendSequence(std::vector<tensorflow::Tensor> sequence);
+  absl::Status AppendSequence(std::vector<TensorBuffer> sequence);
 
   // Adds a new PrioritizedItem to `table` spanning the last `num_timesteps` and
   // pushes new item to `pending_items_`. If `buffer_` is empty then the new
@@ -213,7 +212,7 @@ class Writer {
   std::list<PrioritizedItem> pending_items_;
 
   // Timesteps not yet batched up and put into `chunks_`.
-  std::vector<std::vector<tensorflow::Tensor>> buffer_;
+  std::vector<std::vector<TensorBuffer>> buffer_;
 
   // Batched timesteps that can be referenced by new items.
   std::list<ChunkData> chunks_;

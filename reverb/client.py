@@ -20,6 +20,7 @@ exposes direct methods for both inserting (i.e `insert`) and sampling (i.e
 `TrajectoryDataset` directly whenever possible.
 """
 
+import logging
 from typing import Any, Dict, Generator, List, Optional, Sequence, Union
 
 import numpy as np
@@ -218,19 +219,9 @@ class Client:
 
     Args:
       server_address: Address to the Reverb ReverbService.
-
-    Raises:
-      NotImplementedError: The gRPC `Client` C++ binding was removed because
-        `reverb/cc/client.cc` still depends on TensorFlow. Use the in-process
-        mode (`reverb.Server(in_process=True)` + `Server.in_process_client`)
-        for numpy-only access. Restore once client.cc is de-TF'd.
     """
-    raise NotImplementedError(
-        'The gRPC Client is unavailable in this build: reverb/cc/client.cc '
-        'still depends on TensorFlow. Use reverb.Server(in_process=True) and '
-        'Server.in_process_client for the embedded / numpy-only mode.')
-    self._server_address = server_address  # pylint: disable=unreachable
-    self._client = None
+    self._server_address = server_address
+    self._client = pybind.Client(server_address)
     self._signature_cache = {}
 
   def __reduce__(self):

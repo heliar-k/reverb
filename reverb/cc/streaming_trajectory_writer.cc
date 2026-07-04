@@ -39,8 +39,8 @@
 #include "reverb/cc/support/grpc_util.h"
 #include "reverb/cc/support/key_generators.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "tensorflow/core/framework/tensor.h"
 
 namespace deepmind::reverb {
 namespace {
@@ -101,20 +101,20 @@ StreamingTrajectoryWriter::~StreamingTrajectoryWriter() {
 }
 
 absl::Status StreamingTrajectoryWriter::Append(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   return AppendInternal(std::move(data), /*increment_episode_step=*/true, refs);
 }
 
 absl::Status StreamingTrajectoryWriter::AppendPartial(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   return AppendInternal(std::move(data), /*increment_episode_step=*/false,
                         refs);
 }
 
 absl::Status StreamingTrajectoryWriter::AppendInternal(
-    std::vector<std::optional<tensorflow::Tensor>> data,
+    std::vector<std::optional<TensorBuffer>> data,
     bool increment_episode_step,
     std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
   REVERB_CHECK(refs != nullptr);
@@ -128,7 +128,7 @@ absl::Status StreamingTrajectoryWriter::AppendInternal(
   // create a chunker using the spec of the item.
   for (int i = 0; i < data.size(); i++) {
     if (data[i].has_value() && !chunkers_.contains(i)) {
-      const tensorflow::Tensor& tensor = data[i].value();
+      const TensorBuffer& tensor = data[i].value();
       chunkers_[i] = std::make_shared<Chunker>(
           internal::TensorSpec{std::to_string(i), tensor.dtype(),
                                tensor.shape()},

@@ -194,16 +194,6 @@ reverb_cc_library(
 )
 
 reverb_cc_library(
-    name = "conversions",
-    srcs = ["conversions.cc"],
-    hdrs = ["conversions.h"],
-    deps = reverb_tf_deps() + reverb_pybind_deps() + [
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-    ],
-)
-
-reverb_cc_library(
     name = "chunk_store",
     srcs = ["chunk_store.cc"],
     hdrs = ["chunk_store.h"],
@@ -335,6 +325,7 @@ reverb_cc_library(
         "//reverb/cc/platform:thread",
         "//reverb/cc/support:grpc_util",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/support:trajectory_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/functional:bind_front",
@@ -346,7 +337,7 @@ reverb_cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+    ] + reverb_grpc_deps(),
 )
 
 cc_library(
@@ -429,6 +420,7 @@ reverb_cc_library(
         "//reverb/cc/support:grpc_util",
         "//reverb/cc/support:key_generators",
         "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
@@ -436,7 +428,7 @@ reverb_cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+    ] + reverb_grpc_deps(),
 )
 
 cc_test(

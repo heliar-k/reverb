@@ -433,17 +433,14 @@ class Server:
     if self._server is not None and self._server.Wait():
       raise KeyboardInterrupt
 
-  def localhost_client(self) -> client.Client:
+  def localhost_client(self) -> 'client.Client':
     """Creates a client connect to the localhost channel.
 
-    Not available in `in_process=True` mode: the gRPC `Client` binding was
-    removed because its C++ implementation still depends on TensorFlow. Use
-    `in_process_client` instead.
+    Not available in `in_process=True` mode: use `in_process_client` instead.
     """
     if self._in_process:
-      raise NotImplementedError(
+      raise ValueError(
           'localhost_client is not available in in_process mode; use '
-          'Server.in_process_client instead. The gRPC Client requires '
-          'TensorFlow (client.cc not yet de-TF\'d).')
+          'Server.in_process_client instead.')
     from reverb import client  # pylint: disable=g-import-not-at-top
     return client.Client(f'localhost:{self._port}')

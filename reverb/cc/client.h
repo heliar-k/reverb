@@ -35,6 +35,7 @@
 #include "reverb/cc/streaming_trajectory_writer.h"
 #include "reverb/cc/structured_writer.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
 #include "reverb/cc/writer.h"
 
@@ -106,8 +107,8 @@ class Client {
   //
   absl::Status NewSampler(
       const std::string& table, const Sampler::Options& options,
-      const tensorflow::DataTypeVector& validation_dtypes,
-      const std::vector<tensorflow::PartialTensorShape>& validation_shapes,
+      const std::vector<DataType>& validation_dtypes,
+      const std::vector<std::vector<int64_t>>& validation_shapes,
       absl::Duration validation_timeout, std::unique_ptr<Sampler>* sampler);
 
   // Simultaneously mutates priorities and deletes elements from replay table

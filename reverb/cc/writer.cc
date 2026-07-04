@@ -44,12 +44,9 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/grpc_util.h"
 #include "reverb/cc/support/signature.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
 #include "reverb/cc/tensor_compression.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/tensor_util.h"
-#include "tensorflow/core/framework/types.h"
 
 namespace deepmind {
 namespace reverb {
@@ -92,7 +89,7 @@ Writer::~Writer() {
   if (!closed_) Close().IgnoreError();
 }
 
-absl::Status Writer::Append(std::vector<tensorflow::Tensor> data) {
+absl::Status Writer::Append(std::vector<TensorBuffer> data) {
   if (closed_) {
     return absl::FailedPreconditionError(
         "Calling method Append after Close has been called");
@@ -109,7 +106,7 @@ absl::Status Writer::Append(std::vector<tensorflow::Tensor> data) {
   dtypes_and_shapes_t->reserve(data.size());
   for (const auto& t : data) {
     dtypes_and_shapes_t->push_back(
-        {/*name=*/"", t.dtype(), tensorflow::PartialTensorShape(t.shape())});
+        {/*name=*/"", t.dtype(), t.shape()});
   }
   std::swap(dtypes_and_shapes_t,
             inserted_dtypes_and_shapes_[insert_dtypes_and_shapes_location_]);
@@ -131,32 +128,33 @@ absl::Status Writer::Append(std::vector<tensorflow::Tensor> data) {
   return status;
 }
 
-absl::Status Writer::AppendSequence(std::vector<tensorflow::Tensor> sequence) {
+absl::Status Writer::AppendSequence(std::vector<TensorBuffer> sequence) {
   if (sequence.empty()) {
     return absl::InvalidArgumentError("AppendSequence called with empty data.");
   }
   for (int i = 0; i < sequence.size(); i++) {
-    if (sequence[i].shape().dims() == 0) {
+    if (sequence[i].shape().empty()) {
       return absl::InvalidArgumentError(absl::StrCat(
           "AppendSequence called with scalar tensor at index ", i, "."));
     }
-    if (sequence[i].shape().dim_size(0) != sequence[0].shape().dim_size(0)) {
+    if (sequence[i].shape()[0] != sequence[0].shape()[0]) {
+      std::vector<internal::TensorSpec> specs;
+      specs.reserve(sequence.size());
+      for (const auto& t : sequence) {
+        specs.push_back({/*name=*/"", t.dtype(), t.shape()});
+      }
       return absl::InvalidArgumentError(
           absl::StrCat("AppendSequence called with tensors of non equal batch "
                        "dimension: ",
-                       internal::DtypesShapesString(sequence), "."));
+                       internal::DtypesShapesString(specs), "."));
     }
   }
 
-  for (int i = 0; i < sequence[0].dim_size(0); i++) {
-    std::vector<tensorflow::Tensor> step;
+  for (int i = 0; i < sequence[0].shape()[0]; i++) {
+    std::vector<TensorBuffer> step;
     step.reserve(sequence.size());
     for (const auto& column : sequence) {
-      auto slice = column.SubSlice(i);
-      if (!slice.IsAligned()) {
-        slice = tensorflow::tensor::DeepCopy(slice);
-      }
-      step.push_back(std::move(slice));
+      step.push_back(column.SubSlice(i));
     }
     REVERB_RETURN_IF_ERROR(Append(std::move(step)));
   }
@@ -228,12 +226,20 @@ absl::Status Writer::CreateItem(const std::string& table, int num_timesteps,
         // we consider the shape valid if either a single step matches the
         // signature or if the entire trajectory matches the signature.
         const bool timestep_shape_compatible =
-            signature_dtype_and_shape.shape.IsCompatibleWith(
-                seen_dtype_and_shape.shape);
+            signature_dtype_and_shape.IsCompatibleWith(seen_dtype_and_shape);
+        // Prepend the trajectory length to the per-step shape and check
+        // compatibility against the (possibly wildcarded) table signature.
+        std::vector<int64_t> trajectory_shape;
+        trajectory_shape.reserve(seen_dtype_and_shape.shape.size() + 1);
+        trajectory_shape.push_back(num_timesteps);
+        for (int64_t d : seen_dtype_and_shape.shape) {
+          trajectory_shape.push_back(d);
+        }
+        const internal::TensorSpec trajectory_spec{
+            seen_dtype_and_shape.name, seen_dtype_and_shape.dtype,
+            std::move(trajectory_shape)};
         const bool trajectory_shape_compatible =
-            signature_dtype_and_shape.shape.IsCompatibleWith(
-                tensorflow::PartialTensorShape({num_timesteps})
-                    .Concatenate(seen_dtype_and_shape.shape));
+            signature_dtype_and_shape.IsCompatibleWith(trajectory_spec);
 
         if (!dtypes_equal ||
             !(timestep_shape_compatible || trajectory_shape_compatible)) {
@@ -242,12 +248,12 @@ absl::Status Writer::CreateItem(const std::string& table, int num_timesteps,
               "' because Append was called with a tensor signature "
               "inconsistent with the table signature. At timestep offset ",
               t, ", flattened index ", c, ", saw a tensor of dtype ",
-              DataTypeString(seen_dtype_and_shape.dtype), ", shape ",
-              seen_dtype_and_shape.shape.DebugString(),
+              DataTypeName(seen_dtype_and_shape.dtype), ", shape ",
+              seen_dtype_and_shape.DebugString(),
               ", but expected tensor '", signature_dtype_and_shape.name,
-              "' of dtype ", DataTypeString(signature_dtype_and_shape.dtype),
+              "' of dtype ", DataTypeName(signature_dtype_and_shape.dtype),
               " and shape compatible with ",
-              signature_dtype_and_shape.shape.DebugString(),
+              signature_dtype_and_shape.DebugString(),
               ".  (Flattened) table signature: ",
               internal::DtypesShapesString(**dtypes_and_shapes),
               ", data signature: ",
@@ -417,28 +423,29 @@ absl::Status Writer::Close(bool retry_on_unavailable) {
 }
 
 absl::Status Writer::Finish(bool retry_on_unavailable) {
-  std::vector<tensorflow::Tensor> batched_tensors;
+  std::vector<TensorBuffer> batched_tensors;
   for (int i = 0; i < buffer_[0].size(); ++i) {
-    std::vector<tensorflow::Tensor> tensors(buffer_.size());
+    std::vector<TensorBuffer> tensors;
+    tensors.reserve(buffer_.size());
     for (int j = 0; j < buffer_.size(); ++j) {
-      const tensorflow::Tensor& item = buffer_[j][i];
-      tensorflow::TensorShape shape = item.shape();
-      if (j > 0 && shape != buffer_[0][i].shape()) {
+      const TensorBuffer& item = buffer_[j][i];
+      if (j > 0 && item.shape() != buffer_[0][i].shape()) {
         return absl::InvalidArgumentError(
             absl::StrCat("Unable to concatenate tensors at index ", i,
                          " due to mismatched shapes.  Tensor 0 has shape: ",
-                         buffer_[0][i].shape().DebugString(), ", but tensor ",
-                         j, " has shape: ", shape.DebugString()));
+                         internal::TensorSpec{"", item.dtype(),
+                                              buffer_[0][i].shape()}
+                             .DebugString(),
+                         ", but tensor ", j, " has shape: ",
+                         internal::TensorSpec{"", item.dtype(), item.shape()}
+                             .DebugString()));
       }
-      shape.InsertDim(0, 1);
-      // This should never fail due to dtype or shape differences, because the
-      // dtype of tensors[j] is UNKNOWN and `shape` has the same number of
-      // elements as `item`.
-      REVERB_CHECK(tensors[j].CopyFrom(item, shape));
+      // Insert a leading batch dimension of 1 so Concat stacks the timesteps.
+      tensors.push_back(item.InsertBatchDim());
     }
-    batched_tensors.emplace_back();
-    REVERB_RETURN_IF_ERROR(
-        tensorflow::tensor::Concat(tensors, &batched_tensors.back()));
+    auto concat_result = TensorBuffer::Concat(tensors);
+    REVERB_RETURN_IF_ERROR(concat_result.status());
+    batched_tensors.emplace_back(std::move(*concat_result));
   }
 
   ChunkData chunk_data;

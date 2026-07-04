@@ -30,6 +30,7 @@
 #include "pybind11/stl.h"
 #include "reverb/cc/checkpointing/interface.h"
 #include "reverb/cc/chunker.h"
+#include "reverb/cc/client.h"
 #include "reverb/cc/in_process_client.h"
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/checkpointing.h"
@@ -50,6 +51,7 @@
 #include "reverb/cc/table.h"
 #include "reverb/cc/table_extensions/interface.h"
 #include "reverb/cc/trajectory_writer.h"
+#include "reverb/cc/writer.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace {
@@ -80,7 +82,8 @@ inline void MaybeRaiseFromStatus(const absl::Status& status) {
 }
 
 // Maps a Reverb `DataType` (numpy-aligned) to a numpy dtype string understood
-// by `py::dtype`. Avoids pulling in the TF-backed `conversions` target.
+// by `py::dtype`. Replaces the historical TF-backed `conversions` target
+// (now deleted) which depended on `tensorflow::Tensor`.
 // ponytail: 如果新增 DataType,这里同步加一行。
 const char* DataTypeToNumpyString(::deepmind::reverb::DataType dt) {
   using ::deepmind::reverb::DataType;
@@ -320,6 +323,185 @@ PYBIND11_MODULE(libpybind, m) {
         return Sampler::kNumInfoTensors;
       });
 
+  // gRPC-backed `Writer` (see reverb/cc/writer.h). The data interface is now
+  // numpy-backed: `Append`/`AppendSequence` take flattened `TensorBuffer`
+  // vectors (auto-converted from Python ndarrays by `type_caster<TensorBuffer>`).
+  py::class_<Writer>(m, "Writer")
+      .def("Append",
+           [](Writer *writer, std::vector<TensorBuffer> data) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = writer->Append(std::move(data));
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def("AppendSequence",
+           [](Writer *writer, std::vector<TensorBuffer> sequence) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = writer->AppendSequence(std::move(sequence));
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def("CreateItem", &Writer::CreateItem,
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "Flush",
+          [](Writer *writer) {
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = writer->Flush();
+            }
+            MaybeRaiseFromStatus(status);
+          })
+      .def("Close", &Writer::Close, py::arg("retry_on_unavailable") = true,
+           py::call_guard<py::gil_scoped_release>())
+      .def("__repr__", &Writer::DebugString,
+           py::call_guard<py::gil_scoped_release>());
+
+  // gRPC-backed `Client` (see reverb/cc/client.h). Connects to a Reverb
+  // `Server` over gRPC. The numpy-only in-process mode uses `InProcessClient`.
+  py::class_<Client>(m, "Client")
+      .def(py::init<std::string>(), py::arg("server_name"))
+      .def(
+          "NewWriter",
+          [](Client* client, int chunk_length, int max_timesteps,
+             bool delta_encoded, int max_in_flight_items) {
+            std::unique_ptr<Writer> writer;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = client->NewWriter(
+                  chunk_length, max_timesteps, delta_encoded,
+                  max_in_flight_items, &writer);
+            }
+            MaybeRaiseFromStatus(status);
+            return writer;
+          },
+          py::arg("chunk_length"), py::arg("max_timesteps"),
+          py::arg("delta_encoded") = false, py::arg("max_in_flight_items"))
+      .def("NewSampler",
+           [](Client* client, const std::string& table, int64_t max_samples,
+              size_t buffer_size) {
+             std::unique_ptr<Sampler> sampler;
+             Sampler::Options options;
+             options.max_samples = max_samples;
+             options.max_in_flight_samples_per_worker = buffer_size;
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = client->NewSamplerWithoutSignatureCheck(table, options,
+                                                                &sampler);
+             }
+             MaybeRaiseFromStatus(status);
+             return sampler;
+           })
+      .def("NewTrajectoryWriter",
+           [](Client* client, std::shared_ptr<ChunkerOptions> chunker_options,
+              bool validate_items) {
+             std::unique_ptr<TrajectoryWriter> writer;
+             TrajectoryWriter::Options options;
+             options.chunker_options = std::move(chunker_options);
+             absl::Status status;
+             if (validate_items) {
+               py::gil_scoped_release g;
+               status = client->NewTrajectoryWriter(
+                   options, absl::InfiniteDuration(), &writer);
+             } else {
+               status = client->NewTrajectoryWriter(options, &writer);
+             }
+             MaybeRaiseFromStatus(status);
+             return writer.release();
+           })
+      .def("NewStructuredWriter",
+           [](Client* client, std::vector<std::string> serialized_configs)
+               -> StructuredWriter* {
+             std::vector<StructuredWriterConfig> configs;
+             for (const auto &serialised_config : serialized_configs) {
+               configs.emplace_back();
+               if (!configs.back().ParseFromString(
+                       std::string(serialised_config))) {
+                 MaybeRaiseFromStatus(absl::InvalidArgumentError(absl::StrCat(
+                     "Unable to deserialize StructuredWriterConfig from "
+                     "serialized proto bytes: '",
+                     std::string(serialised_config), "'")));
+                 return nullptr;
+               }
+             }
+             std::unique_ptr<StructuredWriter> writer;
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status =
+                   client->NewStructuredWriter(std::move(configs), &writer);
+             }
+             if (!status.ok()) {
+               MaybeRaiseFromStatus(status);
+               return nullptr;
+             }
+             return writer.release();
+           })
+      .def(
+          "MutatePriorities",
+          [](Client* client, const std::string& table,
+             const std::vector<std::pair<uint64_t, double>>& updates,
+             const std::vector<uint64_t>& deletes) {
+            std::vector<KeyWithPriority> update_protos;
+            for (const auto &update : updates) {
+              update_protos.emplace_back();
+              update_protos.back().set_key(update.first);
+              update_protos.back().set_priority(update.second);
+            }
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = client->MutatePriorities(table, update_protos, deletes);
+            }
+            MaybeRaiseFromStatus(status);
+          },
+          py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("Reset", [](Client* client, const std::string& table) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = client->Reset(table);
+             }
+             MaybeRaiseFromStatus(status);
+           },
+           py::arg("table"))
+      .def("ServerInfo",
+           [](Client* client, int timeout_sec) {
+             auto timeout = timeout_sec > 0 ? absl::Seconds(timeout_sec)
+                                            : absl::InfiniteDuration();
+             struct Client::ServerInfo info;
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = client->ServerInfo(timeout, &info);
+             }
+             MaybeRaiseFromStatus(status);
+             std::vector<py::bytes> serialized_table_info;
+             serialized_table_info.reserve(info.table_info.size());
+             for (const auto &table_info : info.table_info) {
+               serialized_table_info.push_back(
+                   py::bytes(table_info.SerializeAsString()));
+             }
+             return serialized_table_info;
+           })
+      .def("Checkpoint", [](Client* client) {
+        std::string path;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->Checkpoint(&path);
+        }
+        MaybeRaiseFromStatus(status);
+        return path;
+      });
+
   py::class_<Checkpointer, std::shared_ptr<Checkpointer>>(m, "Checkpointer")
       .def("__repr__", &Checkpointer::DebugString,
            py::call_guard<py::gil_scoped_release>());
@@ -550,10 +732,9 @@ PYBIND11_MODULE(libpybind, m) {
       .def_property_readonly("episode_steps", &TrajectoryWriter::episode_steps,
                              py::call_guard<py::gil_scoped_release>());
 
-  // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
-  // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`/
-  // `StructuredWriter` bindings: wraps a `TrajectoryWriter` and applies
-  // `StructuredWriterConfig` patterns. Created via `InProcessClient`.
+  // `StructuredWriter`: wraps a `TrajectoryWriter` and applies
+  // `StructuredWriterConfig` patterns. Created via `Client` (gRPC) or
+  // `InProcessClient` (in-process).
   py::class_<StructuredWriter, std::shared_ptr<StructuredWriter>>(
       m, "StructuredWriter")
       .def(
@@ -607,8 +788,7 @@ PYBIND11_MODULE(libpybind, m) {
 
   // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
   // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`
-  // bindings were removed because their C++ implementations still depend on
-  // TensorFlow; restore them once client.cc/writer.cc are de-TF'd.
+  // bindings are defined above.
   py::class_<InProcessClient, std::shared_ptr<InProcessClient>>(
       m, "InProcessClient")
       .def(py::init<std::vector<std::shared_ptr<Table>>,
