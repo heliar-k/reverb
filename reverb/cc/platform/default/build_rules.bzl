@@ -545,13 +545,15 @@ def reverb_pybind_extension(
     )
 
 def reverb_py_standard_imports():
+    # ponytail: tf_nightly 已移除——内嵌 numpy 模式不依赖 TF。
+    # 若恢复 gRPC TF ops 集成,需重新加 @pypi//tf_nightly。
     return [
         "@pypi//absl_py",
-        "@pypi//tf_nightly",
         "@pypi//dm_tree",
         "@pypi//portpicker",
         "@pypi//numpy",
         "@pypi//packaging",
+        "@pypi//protobuf",
     ]
 
 def reverb_py_test(
