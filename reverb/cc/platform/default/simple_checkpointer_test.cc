@@ -27,6 +27,7 @@
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/rate_limiter.h"
@@ -140,16 +141,25 @@ TEST(SimpleCheckpointerTest, SaveAndLoad) {
   std::vector<std::shared_ptr<ChunkStore::Chunk>> chunks;
   REVERB_EXPECT_OK(loaded_chunk_store.Get(chunk_keys, &chunks));
 
-  // 每个 item 的 key/priority/table 与原表一致。
+  // 每个 item 的 key/priority/table 与原表一致。`Table::Copy()` 迭代
+  // `flat_hash_map`,其顺序依赖 key 的 hash 与内部布局,不保证原表与
+  // 加载表一致,故按 key 建索引后逐个比较。
   auto original_items = table->Copy();
   auto loaded_items = loaded_tables[0]->Copy();
   ASSERT_EQ(original_items.size(), loaded_items.size());
-  for (size_t i = 0; i < original_items.size(); i++) {
-    EXPECT_EQ(original_items[i].key(), loaded_items[i].key());
-    EXPECT_DOUBLE_EQ(original_items[i].priority(), loaded_items[i].priority());
-    EXPECT_EQ(original_items[i].table(), loaded_items[i].table());
-    EXPECT_EQ(original_items[i].flat_trajectory().SerializeAsString(),
-              loaded_items[i].flat_trajectory().SerializeAsString());
+  internal::flat_hash_map<uint64_t, const Table::Item*> loaded_by_key;
+  for (const auto& item : loaded_items) {
+    loaded_by_key[item.key()] = &item;
+  }
+  for (const auto& orig : original_items) {
+    auto it = loaded_by_key.find(orig.key());
+    ASSERT_NE(it, loaded_by_key.end());
+    const Table::Item* loaded = it->second;
+    EXPECT_EQ(orig.key(), loaded->key());
+    EXPECT_DOUBLE_EQ(orig.priority(), loaded->priority());
+    EXPECT_EQ(orig.table(), loaded->table());
+    EXPECT_EQ(orig.flat_trajectory().SerializeAsString(),
+              loaded->flat_trajectory().SerializeAsString());
   }
 }
 
