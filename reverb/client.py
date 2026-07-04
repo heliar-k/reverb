@@ -660,15 +660,47 @@ class LocalClient:
     from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
     return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
-  def new_sampler(self, table: str, num_samples: int = 1, buffer_size: int = 1):
-    """Constructs a `Sampler` over `table` in local mode."""
-    return self._client.new_sampler(table, num_samples, buffer_size)
+  def new_sampler(self, table: str, num_samples: int = 1, buffer_size: int = 1,
+                   timeout_ms: Optional[int] = None):
+    """Constructs a `Sampler` over `table` in local mode.
 
-  def sample(self, table: str, num_samples: int = 1):
-    """Yields `ReplaySample` objects sampled from `table`."""
-    sampler = self.new_sampler(table, num_samples)
+    Args:
+      table: Name of the table to sample from.
+      num_samples: Maximum number of samples the sampler will yield.
+      buffer_size: Max in-flight samples per worker.
+      timeout_ms: Per-sample rate-limiter timeout in milliseconds. `None` (or a
+        negative value) waits forever (the historical default). A positive
+        value surfaces a `reverb.errors.DeadlineExceededError` when the table's
+        rate limiter blocks longer than `timeout_ms`.
+    """
+    # -1 is the C++ sentinel for InfiniteDuration (see sampler.h).
+    timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
+    return self._client.new_sampler(
+        table, num_samples, buffer_size, timeout_ms_arg)
+
+  def sample(self, table: str, num_samples: int = 1,
+             timeout_ms: Optional[int] = None):
+    """Yields `ReplaySample` objects sampled from `table`.
+
+    Args:
+      table: Name of the table to sample from.
+      num_samples: Number of samples to yield.
+      timeout_ms: Rate-limiter timeout in milliseconds per sample. `None` waits
+        forever. A positive value raises `reverb.errors.DeadlineExceededError`
+        if the table's rate limiter blocks longer than `timeout_ms`.
+    """
+    sampler = self.new_sampler(table, num_samples, timeout_ms=timeout_ms)
     for _ in range(num_samples):
-      flat = sampler.GetNextTrajectory()
+      try:
+        flat = sampler.GetNextTrajectory()
+      except RuntimeError as e:
+        # The C++ layer returns absl::DeadlineExceededError, which pybind maps
+        # to RuntimeError (no DeadlineExceeded mapping in MaybeRaiseFromStatus).
+        # Mirror the server_info() conversion below.
+        if 'Deadline Exceeded' in str(e) or 'Timeout exceeded' in str(e):
+          raise errors.DeadlineExceededError(
+              f'Rate limiter blocked longer than timeout_ms={timeout_ms}ms')
+        raise
       info = replay_sample.SampleInfo(
           key=int(flat[0]),
           probability=float(flat[1]),

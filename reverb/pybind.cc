@@ -580,10 +580,13 @@ PYBIND11_MODULE(libpybind, m) {
       .def(
           "new_sampler",
           [](InProcessClient* client, const std::string& table,
-             int64_t max_samples, size_t buffer_size) -> Sampler* {
+             int64_t max_samples, size_t buffer_size,
+             int64_t rate_limiter_timeout_ms) -> Sampler* {
             Sampler::Options options;
             options.max_samples = max_samples;
             options.max_in_flight_samples_per_worker = buffer_size;
+            options.rate_limiter_timeout =
+                Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
             std::unique_ptr<Sampler> sampler;
             absl::Status status;
             {
@@ -594,7 +597,9 @@ PYBIND11_MODULE(libpybind, m) {
             return sampler.release();
           },
           py::arg("table"), py::arg("max_samples") = 1,
-          py::arg("buffer_size") = 1)
+          py::arg("buffer_size") = 1,
+          // -1 (or any negative) means wait forever (InfiniteDuration).
+          py::arg("rate_limiter_timeout_ms") = -1)
       .def(
           "mutate_priorities",
           [](InProcessClient* client, const std::string& table,

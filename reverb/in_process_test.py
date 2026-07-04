@@ -21,6 +21,7 @@ and broadened (more selectors / dtypes) in Task 17.
 
 import os
 import tempfile
+import time
 
 import numpy as np
 import reverb
@@ -202,13 +203,7 @@ def test_multiple_dtypes():
 
 
 def test_rate_limiter_min_size():
-  """MinSize(N): once N items are present, sampling succeeds.
-
-  The blocking-under-N case cannot be asserted here: `LocalClient.sample`
-  blocks indefinitely (no timeout argument is exposed on the numpy path), so
-  a pre-threshold sample call would hang the test rather than fail it.
-  # TODO: expose a timeout on LocalClient.sample to test the block.
-  """
+  """MinSize(N): once N items are present, sampling succeeds."""
   server = _make_server(
       table_name='r', max_size=20, min_size=5,
       sampler=reverb.selectors.Fifo())
@@ -219,6 +214,51 @@ def test_rate_limiter_min_size():
 
   samples = list(client.sample('r', num_samples=5))
   assert len(samples) == 5
+
+
+def test_rate_limiter_timeout():
+  """MinSize(5) with only 2 items: sample blocks past the timeout.
+
+  Replaces the historical TODO: `LocalClient.sample` now exposes
+  `timeout_ms`, so the blocking-under-threshold path can be asserted instead
+  of hanging the test.
+  """
+  server = _make_server(
+      table_name='r', max_size=20, min_size=5,
+      sampler=reverb.selectors.Fifo())
+  client = server.in_process_client
+
+  # Only 2 items inserted; rate limiter demands 5 before it lets any sample
+  # through, so a sample call must block.
+  for i in range(2):
+    _insert_one(client, 'r', np.array([float(i)], dtype=np.float32))
+
+  start = time.time()
+  try:
+    list(client.sample('r', num_samples=1, timeout_ms=500))
+    assert False, 'expected DeadlineExceededError, sample did not block'
+  except reverb.errors.DeadlineExceededError:
+    pass  # expected
+  elapsed = time.time() - start
+  # Should return promptly after the timeout, not hang forever. Allow a
+  # generous margin above 500ms for worker-wakeup latency.
+  assert elapsed < 5.0, f'timeout took too long: {elapsed:.1f}s'
+
+
+def test_rate_limiter_timeout_none_waits_forever_compatible():
+  """timeout_ms=None keeps the historical default (no timeout arg).
+
+  This is a regression guard: the new `timeout_ms` parameter must not change
+  the no-timeout happy path. We insert enough items up front so the call
+  returns instead of blocking, confirming None doesn't early-fail.
+  """
+  server = _make_server(
+      table_name='n', max_size=10, min_size=1,
+      sampler=reverb.selectors.Fifo())
+  client = server.in_process_client
+  _insert_one(client, 'n', np.array([42.0], dtype=np.float32))
+  samples = list(client.sample('n', num_samples=1))
+  assert len(samples) == 1
 
 
 def test_checkpoint_save_load():
@@ -282,5 +322,7 @@ if __name__ == '__main__':
   test_prioritized_replay()
   test_multiple_dtypes()
   test_rate_limiter_min_size()
+  test_rate_limiter_timeout()
+  test_rate_limiter_timeout_none_waits_forever_compatible()
   test_checkpoint_save_load()
   print('PASS')

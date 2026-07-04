@@ -163,7 +163,8 @@ class InProcessClient:
       self,
       table: str,
       max_samples: int = ...,
-      buffer_size: int = ...) -> Sampler: ...
+      buffer_size: int = ...,
+      rate_limiter_timeout_ms: int = ...) -> Sampler: ...
 
   def mutate_priorities(
       self,
