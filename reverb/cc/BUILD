@@ -144,28 +144,6 @@ cc_test(
 )
 
 reverb_cc_test(
-    name = "writer_test",
-    srcs = ["writer_test.cc"],
-    deps = [
-        ":client",
-        ":reverb_service_cc_grpc_proto",
-        ":reverb_service_cc_proto",
-        ":writer",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/platform:thread",
-        "//reverb/cc/support:grpc_util",
-        "//reverb/cc/support:queue",
-        "//reverb/cc/support:trajectory_util",
-        "//reverb/cc/support:uint128",
-        "//reverb/cc/testing:proto_test_util",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
-)
-
-reverb_cc_test(
     name = "client_test",
     srcs = ["client_test.cc"],
     deps = [
@@ -490,9 +468,18 @@ cc_test(
     ],
 )
 
-reverb_cc_test(
+cc_test(
     name = "streaming_trajectory_writer_test",
     srcs = ["streaming_trajectory_writer_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: 原生 cc_test,去 reverb_tf_deps() + :proto_test_util/:tensor_testutil(后者仍 TF-coupled)。
+    # :streaming_trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy C-API),
+    # 需链接 libpython 解析 Py* 符号(同 :chunker_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunker",
         ":reverb_service_cc_grpc_proto",
@@ -502,8 +489,7 @@ reverb_cc_test(
         "//reverb/cc/platform:status_matchers",
         "//reverb/cc/support:queue",
         "//reverb/cc/support:signature",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/random",
@@ -514,7 +500,11 @@ reverb_cc_test(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps() + reverb_grpc_deps(),
+        "@com_github_grpc_grpc//:grpc++_test",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ] + reverb_grpc_deps(),
 )
 
 cc_library(

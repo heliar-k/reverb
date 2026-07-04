@@ -14,9 +14,12 @@
 
 #include "reverb/cc/streaming_trajectory_writer.h"
 
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "grpcpp/impl/codegen/status.h"
 #include "grpcpp/impl/codegen/sync_stream.h"
@@ -45,14 +48,7 @@
 #include "reverb/cc/reverb_service_mock.grpc.pb.h"
 #include "reverb/cc/support/queue.h"
 #include "reverb/cc/support/signature.h"
-#include "reverb/cc/testing/proto_test_util.h"
-#include "reverb/cc/testing/tensor_testutil.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/tensor.pb.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/tensor_shape.pb.h"
-#include "tensorflow/core/framework/types.h"
-#include "tensorflow/core/framework/types.pb.h"
+#include "reverb/cc/support/tensor_proxy.h"
 
 namespace deepmind {
 namespace reverb {
@@ -70,11 +66,12 @@ using ::testing::UnorderedElementsAre;
 using MockStream =
     MockClientReaderWriter<InsertStreamRequest, InsertStreamResponse>;
 
-using Step = ::std::vector<std::optional<tensorflow::Tensor>>;
+using Tensor = TensorBuffer;
+using Step = ::std::vector<std::optional<Tensor>>;
 using StepRef = ::std::vector<std::optional<std::weak_ptr<CellRef>>>;
 
-const auto kIntSpec = internal::TensorSpec{"0", tensorflow::DT_INT32, {1}};
-const auto kFloatSpec = internal::TensorSpec{"0", tensorflow::DT_FLOAT, {1}};
+const auto kIntSpec = internal::TensorSpec{"0", DataType::Int32, {1}};
+const auto kFloatSpec = internal::TensorSpec{"0", DataType::Float32, {1}};
 
 MATCHER(IsChunk, "") { return arg.chunks_size() == 1; }
 
@@ -90,48 +87,51 @@ MATCHER_P2(StatusIs, code, message, "") {
 
 MATCHER(IsItem, "") { return arg.items_size() > 0; }
 
-inline std::string Int32Str() {
-  return tensorflow::DataTypeString(tensorflow::DT_INT32);
-}
+inline std::string Int32Str() { return DataTypeName(DataType::Int32); }
 
-inline tensorflow::Tensor MakeTensor(const internal::TensorSpec& spec) {
-  if (spec.shape.dims() < 1) {
-    return tensorflow::Tensor(spec.dtype, {});
-  }
+// Builds a TensorBuffer from a spec, filling element i with value i. Supports
+// Int32, Float32, and Float64. A scalar spec ({}) yields a single element.
+// Mirrors the old TF-based MakeTensor using TensorBuffer raw bytes.
+inline Tensor MakeTensor(const internal::TensorSpec& spec) {
+  int64_t n = 1;
+  for (int64_t d : spec.shape) n *= d;
 
-  tensorflow::TensorShape shape;
-  REVERB_CHECK(spec.shape.AsTensorShape(&shape));
-  tensorflow::Tensor tensor(spec.dtype, shape);
-
-  for (int i = 0; i < tensor.NumElements(); i++) {
-    if (spec.dtype == tensorflow::DT_FLOAT) {
-      tensor.flat<float>()(i) = i;
-    } else if (spec.dtype == tensorflow::DT_INT32) {
-      tensor.flat<int32_t>()(i) = i;
-    } else if (spec.dtype == tensorflow::DT_DOUBLE) {
-      tensor.flat<double>()(i) = i;
-    } else {
-      REVERB_LOG(REVERB_FATAL) << "Unexpeted dtype";
+  std::string bytes;
+  auto fill = [&](auto /*tag*/, auto value_zero) {
+    using T = decltype(value_zero);
+    bytes.resize(static_cast<size_t>(n) * sizeof(T));
+    auto* dst = reinterpret_cast<T*>(&bytes[0]);
+    for (int64_t i = 0; i < n; ++i) {
+      dst[i] = static_cast<T>(i);
     }
+  };
+
+  if (spec.dtype == DataType::Float32) {
+    fill(nullptr, float{0});
+  } else if (spec.dtype == DataType::Int32) {
+    fill(nullptr, int32_t{0});
+  } else if (spec.dtype == DataType::Float64) {
+    fill(nullptr, double{0});
+  } else {
+    REVERB_LOG(REVERB_FATAL) << "Unexpected dtype";
   }
 
-  return tensor;
+  return Tensor(TensorSpec{spec.dtype, spec.shape}, std::move(bytes));
 }
 
-inline tensorflow::Tensor MakeRandomTensor(const internal::TensorSpec& spec) {
-  auto tensor = MakeTensor(spec);
+inline Tensor MakeRandomTensor(const internal::TensorSpec& spec) {
+  int64_t n = 1;
+  for (int64_t d : spec.shape) n *= d;
 
+  std::string bytes;
+  bytes.resize(static_cast<size_t>(n) * sizeof(int32_t));
+  auto* dst = reinterpret_cast<int32_t*>(&bytes[0]);
   absl::BitGen bit_gen;
-  for (int i = 0; i < tensor.NumElements(); i++) {
-    if (spec.dtype == tensorflow::DT_INT32) {
-      tensor.flat<int32_t>()(i) = absl::Uniform<int32_t>(
-          bit_gen, 0, std::numeric_limits<int32_t>::max());
-    } else {
-      REVERB_LOG(REVERB_FATAL) << "Unexpeted dtype";
-    }
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = absl::Uniform<int32_t>(bit_gen, 0,
+                                    std::numeric_limits<int32_t>::max());
   }
-
-  return tensor;
+  return Tensor(TensorSpec{spec.dtype, spec.shape}, std::move(bytes));
 }
 
 std::vector<TrajectoryColumn> MakeTrajectory(
@@ -248,7 +248,7 @@ TEST(StreamingTrajectoryWriter, AppendValidatesDtype) {
   EXPECT_THAT(std::string(status.message()),
               ::testing::HasSubstr(absl::StrCat(
                   "Tensor of wrong dtype provided for column 1. Got ",
-                  Int32Str(), " but expected float.")));
+                  Int32Str(), " but expected Float32.")));
 }
 
 TEST(StreamingTrajectoryWriter, AppendValidatesShapes) {
@@ -645,7 +645,7 @@ TEST(StreamingTrajectoryWriter, MultipleRequestsSentWhenChunksLarge) {
 
   // Take a step with three columns with really large random tensors. These do
   // not compress well which means that the ChunkData will be really large.
-  internal::TensorSpec spec = {"0", tensorflow::DT_INT32, {8, 1024, 1024}};
+  internal::TensorSpec spec = {"0", DataType::Int32, {8, 1024, 1024}};
   StepRef first;
   REVERB_ASSERT_OK(writer.Append(Step({
                                      MakeRandomTensor(spec),
@@ -728,7 +728,7 @@ TEST(StreamingTrajectoryWriter, CreateItemValidatesTrajectoryDtype) {
       std::string(status.message()),
       HasSubstr(absl::StrCat("Error in column 0: Column references tensors "
                              "with different dtypes: ",
-                             Int32Str(), " (index 0) != float (index 1).")));
+                             Int32Str(), " (index 0) != Float32 (index 1).")));
 }
 
 TEST(StreamingTrajectoryWriter, CreateItemValidatesTrajectoryShapes) {
@@ -820,11 +820,11 @@ class StreamingTrajectoryWriterSignatureValidationTest
                 "table",
                 std::vector<internal::TensorSpec>({
                     internal::TensorSpec{
-                        "first_col", tensorflow::DT_INT32, {2}},
+                        "first_col", DataType::Int32, {2}},
                     internal::TensorSpec{
-                        "second_col", tensorflow::DT_FLOAT, {1}},
+                        "second_col", DataType::Float32, {1}},
                     internal::TensorSpec{
-                        "var_length_col", tensorflow::DT_FLOAT, {-1}},
+                        "var_length_col", DataType::Float32, {-1}},
                 }),
             },
         }),
@@ -835,10 +835,10 @@ class StreamingTrajectoryWriterSignatureValidationTest
     // invalid trajectories.
     REVERB_ASSERT_OK(
         writer_->Append(Step({
-                            MakeTensor({"0", tensorflow::DT_INT32, {}}),
-                            MakeTensor({"1", tensorflow::DT_FLOAT, {}}),
-                            MakeTensor({"2", tensorflow::DT_DOUBLE, {}}),
-                            MakeTensor({"3", tensorflow::DT_FLOAT, {2, 2}}),
+                            MakeTensor({"0", DataType::Int32, {}}),
+                            MakeTensor({"1", DataType::Float32, {}}),
+                            MakeTensor({"2", DataType::Float64, {}}),
+                            MakeTensor({"3", DataType::Float32, {2, 2}}),
                         }),
                         &step_));
   }
@@ -909,8 +909,8 @@ TEST_F(StreamingTrajectoryWriterSignatureValidationTest, WrongDtype) {
       StatusIs(absl::StatusCode::kInvalidArgument,
                "Unable to create item in table 'table' since the provided "
                "trajectory is inconsistent with the table signature. The "
-               "table expects column 1 to be a float [1] tensor but got a "
-               "double [1] tensor."));
+               "table expects column 1 to be a Float32 [1] tensor but got a "
+               "Float64 [1] tensor."));
 }
 
 TEST_F(StreamingTrajectoryWriterSignatureValidationTest, WrongBatchDim) {
@@ -943,8 +943,8 @@ TEST_F(StreamingTrajectoryWriterSignatureValidationTest, WrongElementShape) {
       StatusIs(absl::StatusCode::kInvalidArgument,
                "Unable to create item in table 'table' since the provided "
                "trajectory is inconsistent with the table signature. The "
-               "table expects column 2 to be a float [?] tensor but got a "
-               "float [1,2,2] tensor."));
+               "table expects column 2 to be a Float32 [?] tensor but got a "
+               "Float32 [1,2,2] tensor."));
 }
 
 TEST_F(StreamingTrajectoryWriterSignatureValidationTest,
@@ -961,10 +961,12 @@ TEST_F(StreamingTrajectoryWriterSignatureValidationTest,
           absl::StatusCode::kInvalidArgument,
           absl::StrFormat(
               "\n\nThe table signature is:\n\t"
-              "0: Tensor<name: 'first_col', dtype: %s, shape: [2]>, "
-              "1: Tensor<name: 'second_col', dtype: float, shape: [1]>, "
-              "2: Tensor<name: 'var_length_col', dtype: float, shape: [?]>",
-              Int32Str())));
+              "0: Tensor<name: 'first_col', dtype: %s, shape: %s first_col [2]>, "
+              "1: Tensor<name: 'second_col', dtype: Float32, shape: Float32 "
+              "second_col [1]>, "
+              "2: Tensor<name: 'var_length_col', dtype: Float32, shape: Float32 "
+              "var_length_col [-1]>",
+              Int32Str(), Int32Str())));
 }
 
 TEST_F(StreamingTrajectoryWriterSignatureValidationTest,
@@ -979,10 +981,12 @@ TEST_F(StreamingTrajectoryWriterSignatureValidationTest,
               StatusIs(absl::StatusCode::kInvalidArgument,
                        absl::StrFormat(
                            "\n\nThe provided trajectory signature is:\n\t"
-                           "0: Tensor<name: '0', dtype: %s, shape: [2]>, "
-                           "1: Tensor<name: '1', dtype: float, shape: [1]>, "
-                           "2: Tensor<name: '2', dtype: float, shape: [1,2,2]>",
-                           Int32Str())));
+                           "0: Tensor<name: '0', dtype: %s, shape: %s 0 [2]>, "
+                           "1: Tensor<name: '1', dtype: Float32, shape: "
+                           "Float32 1 [1]>, "
+                           "2: Tensor<name: '2', dtype: Float32, shape: "
+                           "Float32 2 [1,2,2]>",
+                           Int32Str(), Int32Str())));
 }
 
 TEST(StreamingTrajectoryWriter, EndEpisodeResetsEpisodeKeyAndStep) {
