@@ -870,26 +870,6 @@ PYBIND11_MODULE(libpybind, m) {
             MaybeRaiseFromStatus(status);
           },
           py::arg("table"), py::arg("updates"), py::arg("deletes"))
-      // ponytail: PascalCase 别名,对齐 Client 绑定名(见 client.py mixin)。
-      .def(
-          "MutatePriorities",
-          [](InProcessClient* client, const std::string& table,
-             const std::vector<std::pair<uint64_t, double>>& updates,
-             const std::vector<uint64_t>& deletes) {
-            std::vector<KeyWithPriority> update_protos;
-            for (const auto &update : updates) {
-              update_protos.emplace_back();
-              update_protos.back().set_key(update.first);
-              update_protos.back().set_priority(update.second);
-            }
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = client->MutatePriorities(table, update_protos, deletes);
-            }
-            MaybeRaiseFromStatus(status);
-          },
-          py::arg("table"), py::arg("updates"), py::arg("deletes"))
       .def("reset",
            [](InProcessClient* client, const std::string& table) {
              absl::Status status;
@@ -900,31 +880,7 @@ PYBIND11_MODULE(libpybind, m) {
              MaybeRaiseFromStatus(status);
            },
            py::arg("table"))
-      // ponytail: PascalCase 别名,使 InProcessClient 的绑定方法名与 Client
-      // 对齐,供 client.py 的 _ClientMethods mixin 统一转发(不改行为)。
-      .def("Reset",
-           [](InProcessClient* client, const std::string& table) {
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->Reset(table);
-             }
-             MaybeRaiseFromStatus(status);
-           },
-           py::arg("table"))
       .def("checkpoint",
-           [](InProcessClient* client) {
-             std::string path;
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->Checkpoint(&path);
-             }
-             MaybeRaiseFromStatus(status);
-             return path;
-           })
-      // ponytail: PascalCase 别名,对齐 Client 绑定名(见 client.py mixin)。
-      .def("Checkpoint",
            [](InProcessClient* client) {
              std::string path;
              absl::Status status;

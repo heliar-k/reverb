@@ -206,45 +206,7 @@ class Writer:
     self._writer.Close(retry_on_unavailable)
 
 
-class _ClientMethods:
-  """共享转发方法:子类提供 self._client(pybind Client 或 InProcessClient)。
-
-  ponytail: 收敛 Client/LocalClient 重复的 mutate_priorities/reset/
-  checkpoint(三者仅浅转发到 self._client)。两 pybind 类型已对齐 PascalCase
-  绑定名(Client 原生;InProcessClient 在 pybind.cc 加了别名),故转发逻辑一致。
-  server_info 因 Client 有 timeout/signature_cache 差异,不在此共享,仅共享
-  _table_infos_from_proto_strings 解析循环。
-  """
-
-  def mutate_priorities(self,
-                        table: str,
-                        updates: Optional[Dict[int, float]] = None,
-                        deletes: Optional[List[int]] = None):
-    """Updates and/or deletes existing items in a priority table."""
-    if updates is None:
-      updates = {}
-    if deletes is None:
-      deletes = []
-    self._client.MutatePriorities(table, list(updates.items()), deletes)
-
-  def reset(self, table: str):
-    """Clears all items of the table and resets its RateLimiter."""
-    self._client.Reset(table)
-
-  def checkpoint(self) -> str:
-    """Triggers a checkpoint to be created and returns its path."""
-    return self._client.Checkpoint()
-
-  def _table_infos_from_proto_strings(
-      self, info_proto_strings) -> Dict[str, reverb_types.TableInfo]:
-    table_infos = {}
-    for proto_string in info_proto_strings:
-      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
-      table_infos[table_info.name] = table_info
-    return table_infos
-
-
-class Client(_ClientMethods):
+class Client:
   """Client for interacting with a Reverb ReverbService from Python.
 
   Note: This client should primarily be used when inserting data or prototyping
@@ -484,6 +446,38 @@ class Client(_ClientMethods):
       else:
         yield replay_sample.ReplaySample(info, unflatten(data))
 
+  def mutate_priorities(self,
+                        table: str,
+                        updates: Optional[Dict[int, float]] = None,
+                        deletes: Optional[List[int]] = None):
+    """Updates and/or deletes existing items in a priority table.
+
+    NOTE: Whenever possible, prefer to use `TFClient.update_priorities`
+    instead to avoid leaving the graph.
+
+    Actions are executed in the same order as the arguments are specified.
+
+    Args:
+      table: Name of the priority table to update.
+      updates: Mapping from priority item key to new priority value. If a key
+        cannot be found then it is ignored.
+      deletes: List of keys for priority items to delete. If a key cannot be
+        found then it is ignored.
+    """
+    if updates is None:
+      updates = {}
+    if deletes is None:
+      deletes = []
+    self._client.MutatePriorities(table, list(updates.items()), deletes)
+
+  def reset(self, table: str):
+    """Clears all items of the table and resets its RateLimiter.
+
+    Args:
+      table: Name of the priority table to reset.
+    """
+    self._client.Reset(table)
+
   def server_info(self,
                   timeout: Optional[int] = None
                  ) -> Dict[str, reverb_types.TableInfo]:
@@ -509,7 +503,10 @@ class Client(_ClientMethods):
             f'{timeout}s')
       raise
 
-    table_infos = self._table_infos_from_proto_strings(info_proto_strings)
+    table_infos = {}
+    for proto_string in info_proto_strings:
+      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
+      table_infos[table_info.name] = table_info
 
     # Populate the signature cache if this is the first time server_info is
     # (successfully) called.
@@ -520,6 +517,14 @@ class Client(_ClientMethods):
       }
 
     return table_infos
+
+  def checkpoint(self) -> str:
+    """Triggers a checkpoint to be created.
+
+    Returns:
+      Absolute path to the saved checkpoint.
+    """
+    return self._client.Checkpoint()
 
   def trajectory_writer(self,
                         num_keep_alive_refs: int,
@@ -596,7 +601,7 @@ class Client(_ClientMethods):
     return self._signature_cache[table]
 
 
-class LocalClient(_ClientMethods):
+class LocalClient:
   """Python wrapper around the C++ `InProcessClient` for embedded mode.
 
   Provides a numpy-friendly API mirroring the historical `Client`: writers are
@@ -697,5 +702,26 @@ class LocalClient(_ClientMethods):
       data = flat[len(info):]
       yield replay_sample.ReplaySample(info=info, data=data)
 
+  def mutate_priorities(self,
+                        table: str,
+                        updates: Optional[Dict[int, float]] = None,
+                        deletes: Optional[List[int]] = None):
+    if updates is None:
+      updates = {}
+    if deletes is None:
+      deletes = []
+    self._client.mutate_priorities(table, list(updates.items()), deletes)
+
+  def reset(self, table: str):
+    self._client.reset(table)
+
   def server_info(self) -> Dict[str, reverb_types.TableInfo]:
-    return self._table_infos_from_proto_strings(self._client.server_info())
+    proto_strings = self._client.server_info()
+    table_infos = {}
+    for proto_string in proto_strings:
+      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
+      table_infos[table_info.name] = table_info
+    return table_infos
+
+  def checkpoint(self) -> str:
+    return self._client.checkpoint()
