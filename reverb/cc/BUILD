@@ -384,8 +384,8 @@ cc_library(
 )
 
 # ponytail: 原生 cc_library,进程内 Client(零 gRPC)。本地路径直接调 :table /
-# :trajectory_writer / :sampler 的本地构造函数。NewStructuredWriter 未实现
-# (StructuredWriter.cc 仍依赖 TF,本仓编译不过),故不依赖 :structured_writer。
+# :trajectory_writer / :sampler 的本地构造函数。NewStructuredWriter 镜像
+# Client::NewStructuredWriter,内部调 NewTrajectoryWriter 绑定单一 table。
 cc_library(
     name = "in_process_client",
     srcs = ["in_process_client.cc"],
@@ -394,8 +394,10 @@ cc_library(
     visibility = ["//reverb:__subpackages__"],
     deps = [
         ":chunk_store",
+        ":patterns_cc_proto",
         ":sampler",
         ":schema_cc_proto",
+        ":structured_writer",
         ":table",
         ":trajectory_writer",
         "//reverb/cc/checkpointing:interface",
@@ -404,6 +406,7 @@ cc_library(
         "//reverb/cc/platform:status_macros",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
     ],
@@ -769,26 +772,38 @@ reverb_cc_test(
     ],
 )
 
-reverb_cc_test(
+cc_test(
     name = "structured_writer_test",
     srcs = ["structured_writer_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: :structured_writer -> :trajectory_writer -> :tensor_proxy
+    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :chunker_test)。
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
     deps = [
         ":chunker",
         ":patterns_cc_proto",
         ":structured_writer",
         ":trajectory_writer",
+        "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
         "//reverb/cc/platform:status_matchers",
         "//reverb/cc/support:signature",
-        "//reverb/cc/testing:proto_test_util",
-        "//reverb/cc/testing:tensor_testutil",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps(),
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ],
 )
 
-reverb_cc_library(
+cc_library(
     name = "structured_writer",
     srcs = ["structured_writer.cc"],
     hdrs = ["structured_writer.h"],
@@ -797,14 +812,15 @@ reverb_cc_library(
         ":chunker",
         ":patterns_cc_proto",
         ":trajectory_writer",
-        "//reverb/cc/platform:hash_map",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
+        "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
-    ] + reverb_tf_deps(),
+    ],
 )
+

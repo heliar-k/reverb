@@ -24,8 +24,8 @@
 #include "absl/types/optional.h"
 #include "reverb/cc/chunker.h"
 #include "reverb/cc/patterns.pb.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "tensorflow/core/framework/tensor.h"
 
 namespace deepmind::reverb {
 
@@ -36,7 +36,7 @@ class StructuredWriter {
 
   // Calls `Append` on wrapped `ColumnWriter` and inserts trajectories of all
   // configs with fulfilled conditions.
-  absl::Status Append(std::vector<absl::optional<tensorflow::Tensor>> data);
+  absl::Status Append(std::vector<absl::optional<TensorBuffer>> data);
 
   // Calls `AppendPartial` on wrapped `ColumnWriter` and inserts trajectories of
   // all configs with fulfilled conditions.
@@ -44,8 +44,7 @@ class StructuredWriter {
   // Note that patterns are never applied more than once at the same step. The
   // behaviour of calling  `Append` once with the full data is thus identical
   // to calling `AppendPartial` multiple times with partial data.
-  absl::Status AppendPartial(
-      std::vector<absl::optional<tensorflow::Tensor>> data);
+  absl::Status AppendPartial(std::vector<absl::optional<TensorBuffer>> data);
 
   // Calls `EndEpisode` on wrapped `ColumnWriter`.
   absl::Status EndEpisode(bool clear_buffers,
@@ -61,7 +60,7 @@ class StructuredWriter {
  private:
   // Forwards `data` to wrapped `ColumnWriter` then calls `ApplyConfig`.
   absl::Status AppendInternal(
-      std::vector<absl::optional<tensorflow::Tensor>> data, bool finalize_step);
+      std::vector<absl::optional<TensorBuffer>> data, bool finalize_step);
 
   // For each element of `configs_and_states_`, checks if ALL conditions are met
   // and if so, applies the config and inserts the item into the target table.

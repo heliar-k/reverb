@@ -32,10 +32,8 @@
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "tensorflow/core/framework/register_types.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/framework/types.h"
 
 namespace deepmind::reverb {
 namespace {
@@ -76,6 +74,7 @@ CellRef::EpisodeInfo GetEpisodeInfo(
 
   REVERB_CHECK(false)
       << "This should never happen. Please contact the Reverb team.";
+  return {};
 }
 
 bool CheckCondition(
@@ -109,36 +108,52 @@ bool CheckCondition(
               absl::StrFormat("Column %d not yet populated.", idx));
         }
 
-        tensorflow::Tensor tensor;
+        TensorBuffer tensor;
         REVERB_RETURN_IF_ERROR(ref->GetData(&tensor));
 
         if (tensor.NumElements() != 1) {
           return absl::FailedPreconditionError(absl::StrFormat(
               "Config specified data condition on column %d which does not "
-              "contain scalar tensors (got %s).",
-              idx, tensor.DebugString()));
+              "contain scalar tensors (got shape with %lld elements).",
+              idx, static_cast<long long>(tensor.NumElements())));
         }
 
-        switch (tensor.dtype()) {
-#define SELECT_INT(T)                        \
-  case tensorflow::DataTypeToEnum<T>::value: \
-    return static_cast<int>(tensor.flat<T>().data()[0]);
-          TF_CALL_INTEGRAL_TYPES(SELECT_INT);
-#undef SELECT_INT
-
-          case tensorflow::DT_BOOL:
-            return tensor.flat<bool>().data()[0] ? 1 : 0;
-
-          default:
-            return absl::FailedPreconditionError(absl::StrFormat(
-                "Config specified data condition on column %d has invalid data "
-                "type %s.",
-                idx, tensorflow::DataType_Name(tensor.dtype())));
-        }
+        // Only integer and bool scalars are supported as condition sources.
+        // ponytail: 直接读 bytes,不走 TF DataTypeToEnum 宏。
+        auto read_scalar_int = [&]() -> absl::StatusOr<int> {
+          const char* data = tensor.bytes().data();
+          switch (tensor.dtype()) {
+            case DataType::Int8:
+              return static_cast<int>(*reinterpret_cast<const int8_t*>(data));
+            case DataType::Int16:
+              return static_cast<int>(*reinterpret_cast<const int16_t*>(data));
+            case DataType::Int32:
+              return static_cast<int>(*reinterpret_cast<const int32_t*>(data));
+            case DataType::Int64:
+              return static_cast<int>(*reinterpret_cast<const int64_t*>(data));
+            case DataType::Uint8:
+              return static_cast<int>(*reinterpret_cast<const uint8_t*>(data));
+            case DataType::Uint16:
+              return static_cast<int>(*reinterpret_cast<const uint16_t*>(data));
+            case DataType::Uint32:
+              return static_cast<int>(*reinterpret_cast<const uint32_t*>(data));
+            case DataType::Uint64:
+              return static_cast<int>(*reinterpret_cast<const uint64_t*>(data));
+            case DataType::Bool:
+              return *reinterpret_cast<const bool*>(data) ? 1 : 0;
+            default:
+              return absl::FailedPreconditionError(absl::StrFormat(
+                  "Config specified data condition on column %d has invalid "
+                  "data type %s.",
+                  idx, DataTypeName(tensor.dtype())));
+          }
+        }();
+        return read_scalar_int;
       }
 
       case Condition::LEFT_NOT_SET:
         REVERB_CHECK(false) << "This should never happen";
+        return 0;
     }
   }();
 
@@ -159,6 +174,7 @@ bool CheckCondition(
              (*left % condition.mod_eq().mod() == condition.mod_eq().eq());
     case Condition::CMP_NOT_SET:
       REVERB_CHECK(false) << "This should never happen";
+      return false;
   }
 }
 
@@ -172,38 +188,39 @@ absl::StatusOr<double> ComputeTDError(TrajectoryColumn& column, double weight) {
   double max_error = std::numeric_limits<double>::lowest();
   double total_error = 0;
   for (const auto& ref : column.refs()) {
-    tensorflow::Tensor tensor;
+    TensorBuffer tensor;
     REVERB_RETURN_IF_ERROR(ref.lock()->GetData(&tensor));
 
-    if (tensor.dtype() != tensorflow::DT_DOUBLE &&
-        tensor.dtype() != tensorflow::DT_FLOAT &&
-        tensor.dtype() != tensorflow::DT_INT32 &&
-        tensor.dtype() != tensorflow::DT_INT64) {
+    if (tensor.dtype() != DataType::Float64 &&
+        tensor.dtype() != DataType::Float32 &&
+        tensor.dtype() != DataType::Int32 &&
+        tensor.dtype() != DataType::Int64) {
       return absl::InvalidArgumentError(absl::StrFormat(
-          "TD Error expects a double/float/int tensor and it is %d",
-          tensor.dtype()));
+          "TD Error expects a double/float/int tensor and it is %s",
+          DataTypeName(tensor.dtype())));
     }
     if (tensor.NumElements() != 1)
       return absl::InvalidArgumentError("TD Error expects a scalar tensor");
     double abs_error = 0.0;
+    const char* data = tensor.bytes().data();
     switch (tensor.dtype()) {
-      case tensorflow::DT_DOUBLE:
-        abs_error = std::abs(tensor.flat<double>().data()[0]);
+      case DataType::Float64:
+        abs_error = std::abs(*reinterpret_cast<const double*>(data));
         break;
-      case tensorflow::DT_FLOAT:
-        abs_error = std::abs(tensor.flat<float>().data()[0]);
+      case DataType::Float32:
+        abs_error = std::abs(*reinterpret_cast<const float*>(data));
         break;
-      case tensorflow::DT_INT32:
-        abs_error = std::abs(tensor.flat<int32_t>().data()[0]);
+      case DataType::Int32:
+        abs_error = std::abs(*reinterpret_cast<const int32_t*>(data));
         break;
-      case tensorflow::DT_INT64:
-        abs_error = std::abs(tensor.flat<int64_t>().data()[0]);
+      case DataType::Int64:
+        abs_error = std::abs(*reinterpret_cast<const int64_t*>(data));
         break;
       default:
         REVERB_CHECK(false)
             << "TDError expects a tensor of type double, float or int and it "
                "got "
-            << tensor.dtype() << ".";
+            << DataTypeName(tensor.dtype()) << ".";
     }
     max_error = std::max(abs_error, max_error);
     total_error += abs_error;
@@ -428,17 +445,17 @@ StructuredWriter::StructuredWriter(std::unique_ptr<ColumnWriter> writer,
 }
 
 absl::Status StructuredWriter::Append(
-    std::vector<std::optional<tensorflow::Tensor>> data) {
+    std::vector<std::optional<TensorBuffer>> data) {
   return AppendInternal(std::move(data), true);
 }
 
 absl::Status StructuredWriter::AppendPartial(
-    std::vector<std::optional<tensorflow::Tensor>> data) {
+    std::vector<std::optional<TensorBuffer>> data) {
   return AppendInternal(std::move(data), false);
 }
 
 absl::Status StructuredWriter::AppendInternal(
-    std::vector<std::optional<tensorflow::Tensor>> data, bool finalize_step) {
+    std::vector<std::optional<TensorBuffer>> data, bool finalize_step) {
   // There is no point in appending data to the writer that will never be used
   // so we filter out all the unused columns from the data. This will save us
   // all the work that would otherwise go into chunking and compressing the

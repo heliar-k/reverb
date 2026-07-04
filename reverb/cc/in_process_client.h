@@ -22,10 +22,13 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "reverb/cc/checkpointing/interface.h"
+#include "reverb/cc/chunker.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/trajectory_writer.h"
 
@@ -50,6 +53,17 @@ class InProcessClient {
   absl::Status NewTrajectoryWriter(const std::string& table,
                                    const TrajectoryWriter::Options& options,
                                    std::unique_ptr<TrajectoryWriter>* writer);
+
+  // 校验 `configs` 并创建 `StructuredWriter`。内部按 `Client::NewStructuredWriter`
+  // 的逻辑算 max_num_keep_alive_refs、补 buffer_length 条件、构造
+  // `AutoTunedChunkerOptions`,然后调 `NewTrajectoryWriter`。
+  //
+  // 本地路径限制:所有 config 的 item 最终都写入同一个 `table`(本地
+  // TrajectoryWriter 绑定单一 table,`CreateItem` 的 table 名参数仅用于
+  // signature 校验)。若需多表写入,请为每个 table 单独创建 StructuredWriter。
+  absl::Status NewStructuredWriter(const std::string& table,
+                                   std::vector<StructuredWriterConfig> configs,
+                                   std::unique_ptr<StructuredWriter>* writer);
 
   // 通过本地构造函数创建 `Sampler`,直接从 `table` 采样。
   // 不做 signature 校验(dtypes_and_shapes = nullopt),与

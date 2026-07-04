@@ -14,17 +14,20 @@
 
 #include "reverb/cc/in_process_client.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/trajectory_writer.h"
 
@@ -59,6 +62,57 @@ absl::Status InProcessClient::NewTrajectoryWriter(
   // InsertOrAssignAsync 到该 table。options.flat_signature_map 由调用方按需
   // 填充(进程内直连无服务端,默认 nullopt 即跳过 signature 校验)。
   *writer = std::make_unique<TrajectoryWriter>(std::move(table_ptr), options);
+  return absl::OkStatus();
+}
+
+absl::Status InProcessClient::NewStructuredWriter(
+    const std::string& table, std::vector<StructuredWriterConfig> configs,
+    std::unique_ptr<StructuredWriter>* writer) {
+  if (configs.empty()) {
+    return absl::InvalidArgumentError("At least one config must be provided.");
+  }
+
+  // 镜像 Client::NewStructuredWriter:算全局 max_num_keep_alive_refs,
+  // 为缺 buffer_length 条件的 config 补上,避免 pattern 在数据不足时被应用。
+  int max_num_keep_alive_refs = 0;
+  for (int i = 0; i < configs.size(); i++) {
+    int num_keep_alive_refs = 0;
+    for (const auto& node : configs[i].flat()) {
+      num_keep_alive_refs = std::max(
+          num_keep_alive_refs, std::abs(std::min(node.start(), node.stop())));
+    }
+    max_num_keep_alive_refs =
+        std::max(max_num_keep_alive_refs, num_keep_alive_refs);
+
+    if (std::none_of(configs[i].conditions().begin(),
+                     configs[i].conditions().end(), [&](const auto& c) {
+                       return c.buffer_length() &&
+                              c.ge() >= num_keep_alive_refs;
+                     })) {
+      auto* cond = configs[i].add_conditions();
+      cond->set_buffer_length(true);
+      cond->set_ge(num_keep_alive_refs);
+    }
+
+    if (auto status = ValidateStructuredWriterConfig(configs[i]);
+        !status.ok()) {
+      return absl::Status(
+          status.code(),
+          absl::StrFormat("Invalid configuration at position %d: %s", i,
+                          status.message()));
+    }
+  }
+
+  TrajectoryWriter::Options options = {
+      .chunker_options =
+          std::make_shared<AutoTunedChunkerOptions>(max_num_keep_alive_refs),
+  };
+  std::unique_ptr<TrajectoryWriter> trajectory_writer;
+  REVERB_RETURN_IF_ERROR(
+      NewTrajectoryWriter(table, options, &trajectory_writer));
+
+  *writer = std::make_unique<StructuredWriter>(std::move(trajectory_writer),
+                                               std::move(configs));
   return absl::OkStatus();
 }
 

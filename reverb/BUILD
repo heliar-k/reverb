@@ -158,15 +158,16 @@ reverb_pybind_extension(
     module_name = "libpybind",
     pytype_srcs = ["pybind.pyi"],
     visibility = [":__subpackages__"],
-    # ponytail: 去 reverb_tf_deps() + :client/:writer/:structured_writer/
-    # :conversions(均仍依赖 TF,编译不过)。改用 :in_process_client +
-    # :tensor_proxy(numpy C-API)。gRPC Client/Writer/StructuredWriter 待
-    # 对应 .cc 去 TF 后再恢复绑定。
+    # ponytail: 去 reverb_tf_deps() + :client/:writer/:conversions
+    # (均仍依赖 TF,编译不过)。改用 :in_process_client +
+    # :structured_writer + :tensor_proxy(numpy C-API)。gRPC Client/Writer
+    # 待对应 .cc 去 TF 后再恢复绑定。
     deps = [
         "//reverb/cc:chunker",
         "//reverb/cc:in_process_client",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
+        "//reverb/cc:structured_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",
         "//reverb/cc/checkpointing:interface",

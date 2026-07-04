@@ -15,8 +15,10 @@
 #include "reverb/cc/structured_writer.h"
 
 #include <algorithm>
+#include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,39 +26,96 @@
 #include "gtest/gtest.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/strings/match.h"
 #include "absl/types/optional.h"
 #include "reverb/cc/chunker.h"
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/support/signature.h"
-#include "reverb/cc/testing/proto_test_util.h"
-#include "reverb/cc/testing/tensor_testutil.h"
+#include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/trajectory_writer.h"
-#include "tensorflow/core/framework/tensor_shape.h"
-#include "tensorflow/core/framework/tensor_util.h"
-#include "tensorflow/core/framework/types.pb.h"
-#include "tensorflow/core/platform/types.h"
+#include "google/protobuf/text_format.h"
 
 namespace deepmind::reverb {
 namespace {
 
-using ::tensorflow::Tensor;
+using reverb::DataType;
+using reverb::TensorBuffer;
+using reverb::TensorSpec;
 
 MATCHER_P2(StatusIs, code, message, "") {
   return arg.code() == code && absl::StrContains(arg.message(), message);
 }
 
 inline StructuredWriterConfig MakeConfig(const std::string& text_proto) {
-  return testing::ParseTextProtoOrDie<StructuredWriterConfig>(text_proto);
+  StructuredWriterConfig proto;
+  REVERB_CHECK(google::protobuf::TextFormat::ParseFromString(text_proto, &proto))
+      << "Failed to parse: " << text_proto;
+  return proto;
 }
 
-inline int Get(const Tensor& tensor, int index) {
-  return tensor.flat<int32_t>().data()[index];
+// Build an int32 TensorBuffer from raw int32 values. Always produces a
+// rank-1 buffer of shape [N] (matching the original TF test's
+// `Tensor(DT_INT32, {N})` for the vector overload).
+inline TensorBuffer MakeTensor(std::vector<int32_t> values) {
+  TensorSpec spec{DataType::Int32,
+                  {static_cast<int64_t>(values.size())}};
+  std::string bytes;
+  bytes.resize(values.size() * sizeof(int32_t));
+  std::memcpy(&bytes[0], values.data(), bytes.size());
+  return TensorBuffer(spec, bytes);
 }
 
-inline void Set(Tensor& tensor, int index, int32_t value) {
-  tensor.flat<int32_t>().data()[index] = value;
+inline TensorBuffer MakeTensor(int32_t value) {
+  // Scalar (shape {}), matching the original `Tensor(DT_INT32, {})` overload.
+  std::string bytes;
+  bytes.resize(sizeof(int32_t));
+  std::memcpy(&bytes[0], &value, sizeof(int32_t));
+  return TensorBuffer(TensorSpec{DataType::Int32, {}}, bytes);
+}
+
+inline int32_t Get(const TensorBuffer& tensor, int index) {
+  return reinterpret_cast<const int32_t*>(tensor.bytes().data())[index];
+}
+
+std::vector<std::optional<TensorBuffer>> MakeStep(
+    std::vector<std::optional<int>> values) {
+  std::vector<std::optional<TensorBuffer>> step;
+  for (int i = 0; i < values.size(); i++) {
+    if (values[i].has_value()) {
+      step.push_back(MakeTensor(static_cast<int32_t>(values[i].value())));
+    } else {
+      step.push_back(std::nullopt);
+    }
+  }
+  return step;
+}
+
+void ExpectTensorEqual(const TensorBuffer& got, const TensorBuffer& want) {
+  ASSERT_EQ(got.dtype(), want.dtype());
+  ASSERT_EQ(got.shape(), want.shape());
+  ASSERT_EQ(got.NumElements(), want.NumElements());
+  for (int i = 0; i < got.NumElements(); i++) {
+    EXPECT_EQ(Get(got, i), Get(want, i));
+  }
+}
+
+void ExpectTrajectoryEqual(const std::vector<TensorBuffer>& got,
+                           const std::vector<TensorBuffer>& want) {
+  ASSERT_EQ(want.size(), got.size()) << "Wrong number of columns";
+  for (int i = 0; i < want.size(); i++) {
+    ExpectTensorEqual(got[i], want[i]);
+  }
+}
+
+void ExpectTrajectoriesEqual(
+    const std::vector<std::vector<TensorBuffer>>& got,
+    const std::vector<std::vector<TensorBuffer>>& want) {
+  ASSERT_EQ(want.size(), got.size()) << "Wrong number of trajectories";
+  for (int i = 0; i < want.size(); i++) {
+    ExpectTrajectoryEqual(got[i], want[i]);
+  }
 }
 
 class FakeWriter : public ColumnWriter {
@@ -64,14 +123,14 @@ class FakeWriter : public ColumnWriter {
   explicit FakeWriter(int num_columns) {
     for (int i = 0; i < num_columns; i++) {
       chunkers_.push_back(std::make_shared<Chunker>(
-          internal::TensorSpec{"", tensorflow::DT_INT32, {}},
+          internal::TensorSpec{"", DataType::Int32, {}},
           std::make_shared<ConstantChunkerOptions>(1, 100)));
     }
     steps_.emplace_back(num_columns, std::nullopt);
   }
 
   absl::Status Append(
-      std::vector<std::optional<Tensor>> data,
+      std::vector<std::optional<TensorBuffer>> data,
       std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) override {
     AppendInternal(std::move(data), refs);
     current_step_.step++;
@@ -80,7 +139,7 @@ class FakeWriter : public ColumnWriter {
   }
 
   absl::Status AppendPartial(
-      std::vector<std::optional<Tensor>> data,
+      std::vector<std::optional<TensorBuffer>> data,
       std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) override {
     AppendInternal(std::move(data), refs);
     return absl::OkStatus();
@@ -89,23 +148,27 @@ class FakeWriter : public ColumnWriter {
   absl::Status CreateItem(
       absl::string_view table, double priority,
       absl::Span<const TrajectoryColumn> trajectory) override {
-    std::vector<Tensor> columns;
+    std::vector<TensorBuffer> columns;
 
     for (const auto& trajectory_column : trajectory) {
       std::vector<std::shared_ptr<CellRef>> refs;
       REVERB_CHECK(trajectory_column.LockReferences(&refs));
 
-      tensorflow::TensorShape shape;
+      std::vector<int64_t> shape;
       if (!trajectory_column.squeezed()) {
-        shape.InsertDim(0, refs.size());
+        shape.push_back(refs.size());
       }
-      columns.emplace_back(tensorflow::DT_INT32, shape);
-
+      // Single-row columns are stored as scalars (shape {}) to match the
+      // behaviour of `MakeTensor(int)` in the test expectations.
+      std::string bytes;
+      bytes.resize(refs.size() * sizeof(int32_t));
+      auto* dst = reinterpret_cast<int32_t*>(&bytes[0]);
       for (int i = 0; i < refs.size(); i++) {
-        Tensor tensor;
+        TensorBuffer tensor;
         REVERB_CHECK_OK(refs[i]->GetData(&tensor));
-        Set(columns.back(), i, Get(tensor, 0));
+        dst[i] = Get(tensor, 0);
       }
+      columns.emplace_back(TensorSpec{DataType::Int32, shape}, bytes);
     }
 
     trajectories_.push_back(std::move(columns));
@@ -132,16 +195,16 @@ class FakeWriter : public ColumnWriter {
     return absl::OkStatus();
   }
 
-  const std::vector<std::vector<Tensor>>& trajectories() const {
+  const std::vector<std::vector<TensorBuffer>>& trajectories() const {
     return trajectories_;
   }
 
   const std::vector<double>& priorities() const { return priorities_; }
 
-  std::vector<std::vector<std::optional<Tensor>>> steps() const {
+  std::vector<std::vector<std::optional<TensorBuffer>>> steps() const {
     if (std::all_of(steps_.back().begin(), steps_.back().end(),
                     [](const auto& c) { return c == std::nullopt; })) {
-      return std::vector<std::vector<std::optional<Tensor>>>(
+      return std::vector<std::vector<std::optional<TensorBuffer>>>(
           steps_.begin(), steps_.begin() + steps_.size() - 1);
     }
     return steps_;
@@ -149,7 +212,7 @@ class FakeWriter : public ColumnWriter {
 
  private:
   void AppendInternal(
-      std::vector<std::optional<Tensor>> data,
+      std::vector<std::optional<TensorBuffer>> data,
       std::vector<std::optional<std::weak_ptr<CellRef>>>* refs) {
     REVERB_CHECK_LE(data.size(), chunkers_.size());
 
@@ -168,48 +231,9 @@ class FakeWriter : public ColumnWriter {
   std::vector<std::shared_ptr<Chunker>> chunkers_;
   CellRef::EpisodeInfo current_step_ = {0, 0};
   std::vector<double> priorities_;
-  std::vector<std::vector<Tensor>> trajectories_;
-  std::vector<std::vector<std::optional<Tensor>>> steps_;
+  std::vector<std::vector<TensorBuffer>> trajectories_;
+  std::vector<std::vector<std::optional<TensorBuffer>>> steps_;
 };
-
-Tensor MakeTensor(std::vector<int> values) {
-  Tensor tensor(tensorflow::DT_INT32, {static_cast<int>(values.size())});
-  for (int i = 0; i < values.size(); i++) {
-    Set(tensor, i, values[i]);
-  }
-  return tensor;
-}
-
-Tensor MakeTensor(int value) { return Tensor(static_cast<int32_t>(value)); }
-
-std::vector<std::optional<Tensor>> MakeStep(
-    std::vector<std::optional<int>> values) {
-  std::vector<std::optional<Tensor>> step;
-  for (int i = 0; i < values.size(); i++) {
-    if (values[i].has_value()) {
-      step.push_back(MakeTensor(values[i].value()));
-    } else {
-      step.push_back(std::nullopt);
-    }
-  }
-  return step;
-}
-
-void ExpectTrajectoryEqual(const std::vector<Tensor>& got,
-                           const std::vector<Tensor>& want) {
-  ASSERT_EQ(want.size(), got.size()) << "Wrong number of columns";
-  for (int i = 0; i < want.size(); i++) {
-    test::ExpectTensorEqual<int32_t>(got[i], want[i]);
-  }
-}
-
-void ExpectTrajectoriesEqual(const std::vector<std::vector<Tensor>>& got,
-                             const std::vector<std::vector<Tensor>>& want) {
-  ASSERT_EQ(want.size(), got.size()) << "Wrong number of trajectories";
-  for (int i = 0; i < want.size(); i++) {
-    ExpectTrajectoryEqual(want[i], got[i]);
-  }
-}
 
 TEST(ValidateStructuredWriterConfig, Valid_NoStart) {
   REVERB_EXPECT_OK(ValidateStructuredWriterConfig(MakeConfig(
@@ -742,7 +766,7 @@ TEST(StructuredWriter, StepIsOpen) {
   EXPECT_FALSE(writer.step_is_open());
 }
 
-using ParamT = std::pair<std::string, std::vector<std::vector<Tensor>>>;
+using ParamT = std::pair<std::string, std::vector<std::vector<TensorBuffer>>>;
 
 class StructuredWriterTest : public ::testing::TestWithParam<ParamT> {};
 
@@ -824,9 +848,9 @@ INSTANTIATE_TEST_SUITE_P(
                             flat { flat_source_index: 2 start: -3 stop: -2 }
                           )pb",
                           {
-                              {MakeTensor(std::vector<int>{30})},
-                              {MakeTensor(std::vector<int>{31})},
-                              {MakeTensor(std::vector<int>{32})},
+                              {MakeTensor(std::vector<int32_t>{30})},
+                              {MakeTensor(std::vector<int32_t>{31})},
+                              {MakeTensor(std::vector<int32_t>{32})},
                           }),
                       ParamT(
                           R"pb(
@@ -864,11 +888,11 @@ INSTANTIATE_TEST_SUITE_P(
               flat { flat_source_index: 1 start: -1 stop: 0 }
             )pb",
             {
-                {MakeTensor(10), MakeTensor(std::vector<int>{20})},
-                {MakeTensor(11), MakeTensor(std::vector<int>{21})},
-                {MakeTensor(12), MakeTensor(std::vector<int>{22})},
-                {MakeTensor(13), MakeTensor(std::vector<int>{23})},
-                {MakeTensor(14), MakeTensor(std::vector<int>{24})},
+                {MakeTensor(10), MakeTensor(std::vector<int32_t>{20})},
+                {MakeTensor(11), MakeTensor(std::vector<int32_t>{21})},
+                {MakeTensor(12), MakeTensor(std::vector<int32_t>{22})},
+                {MakeTensor(13), MakeTensor(std::vector<int32_t>{23})},
+                {MakeTensor(14), MakeTensor(std::vector<int32_t>{24})},
             }),
         ParamT(
             R"pb(
@@ -1019,7 +1043,7 @@ TEST_P(StructuredWriterTest, AppliesPatternAndComputesTDError) {
   FakeWriter* fake_writer_ptr = fake_writer.get();
 
   auto config = MakeConfig(R"pb(flat { flat_source_index: 1 start: -2 })pb");
-  std::vector<std::vector<Tensor>> expected_trajectories = {
+  std::vector<std::vector<TensorBuffer>> expected_trajectories = {
       {MakeTensor({20, 21})},
       {MakeTensor({21, 22})},
       {MakeTensor({22, 23})},

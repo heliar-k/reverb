@@ -46,6 +46,7 @@
 #include "reverb/cc/selectors/uniform.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/table_extensions/interface.h"
 #include "reverb/cc/trajectory_writer.h"
@@ -551,9 +552,63 @@ PYBIND11_MODULE(libpybind, m) {
 
   // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
   // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`/
-  // `StructuredWriter` bindings were removed because their C++ implementations
-  // still depend on TensorFlow; restore them once client.cc/writer.cc/
-  // structured_writer.cc are de-TF'd.
+  // `StructuredWriter` bindings: wraps a `TrajectoryWriter` and applies
+  // `StructuredWriterConfig` patterns. Created via `InProcessClient`.
+  py::class_<StructuredWriter, std::shared_ptr<StructuredWriter>>(
+      m, "StructuredWriter")
+      .def(
+          "Append",
+          [](StructuredWriter* writer,
+             std::vector<std::optional<TensorBuffer>> data) {
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = writer->Append(std::move(data));
+            }
+            MaybeRaiseFromStatus(status);
+          })
+      .def(
+          "AppendPartial",
+          [](StructuredWriter* writer,
+             std::vector<std::optional<TensorBuffer>> data) {
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status = writer->AppendPartial(std::move(data));
+            }
+            MaybeRaiseFromStatus(status);
+          })
+      .def("Flush",
+           [](StructuredWriter* writer, int ignore_last_num_items,
+              int timeout_ms) {
+             absl::Status status;
+             auto timeout = timeout_ms > 0 ? absl::Milliseconds(timeout_ms)
+                                           : absl::InfiniteDuration();
+             {
+               py::gil_scoped_release g;
+               status = writer->Flush(ignore_last_num_items, timeout);
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def("EndEpisode",
+           [](StructuredWriter* writer, bool clear_buffers,
+              std::optional<int> timeout_ms) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = writer->EndEpisode(
+                   clear_buffers, timeout_ms.has_value()
+                                      ? absl::Milliseconds(timeout_ms.value())
+                                      : absl::InfiniteDuration());
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def_property_readonly("step_is_open", &StructuredWriter::step_is_open);
+
+  // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
+  // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`
+  // bindings were removed because their C++ implementations still depend on
+  // TensorFlow; restore them once client.cc/writer.cc are de-TF'd.
   py::class_<InProcessClient, std::shared_ptr<InProcessClient>>(
       m, "InProcessClient")
       .def(py::init<std::vector<std::shared_ptr<Table>>,
@@ -577,6 +632,22 @@ PYBIND11_MODULE(libpybind, m) {
             return writer.release();
           },
           py::arg("table"), py::arg("chunker_options"))
+      .def(
+          "new_structured_writer",
+          [](InProcessClient* client, const std::string& table,
+             std::vector<StructuredWriterConfig> configs)
+              -> StructuredWriter* {
+            std::unique_ptr<StructuredWriter> writer;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status =
+                  client->NewStructuredWriter(table, std::move(configs), &writer);
+            }
+            MaybeRaiseFromStatus(status);
+            return writer.release();
+          },
+          py::arg("table"), py::arg("configs"))
       .def(
           "new_sampler",
           [](InProcessClient* client, const std::string& table,
