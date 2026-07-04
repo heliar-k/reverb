@@ -736,10 +736,26 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
               data_cv_.Signal();
             });
 
+    // Move the item from `write_queue_` to `in_flight_items_` BEFORE calling
+    // `InsertOrAssignAsync`. The table worker runs inserts on its own thread
+    // holding only `worker_mu_`, not `mu_`, so the completion callback can
+    // fire before `InsertOrAssignAsync` returns. If the item were registered
+    // in `in_flight_items_` only after the call (as the original code did),
+    // the callback's `erase` would miss and the item would leak, while
+    // `local_can_insert_more_` set by the callback would then be clobbered
+    // to `false` below, deadlocking the backpressure wait. Registering first
+    // guarantees the callback's `erase` always hits.
+    {
+      absl::MutexLock l(&mu_);
+      in_flight_items_[key] = std::move(write_queue_.front());
+      write_queue_.pop_front();
+    }
+
     absl::Status s = table_->InsertOrAssignAsync(
         std::move(table_item), &can_insert_more, item_and_refs->insert_callback);
     if (!s.ok()) {
       absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
       stream_ok_ = false;
       stream_status_ = s;
       unrecoverable_status_ = s;
@@ -747,13 +763,23 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
       return s;
     }
 
-    // Move the item from `write_queue_` to `in_flight_items_` so `FlushLocked`
-    // keeps waiting for confirmation until the callback erases it.
+    // Apply backpressure: if the table's insert queue is full, wait for an
+    // outstanding insert to complete before pulling another item. The
+    // callback may already have fired (setting `local_can_insert_more_ =
+    // true`) by the time we reacquire `mu_`; in that case skip the wait. We
+    // preserve the callback's signal by only clearing the flag when we
+    // actually intend to block.
+    if (!can_insert_more) {
+      absl::MutexLock l(&mu_);
+      if (!local_can_insert_more_) {
+        local_can_insert_more_ = false;
+        while (!local_can_insert_more_ && !closed_ && stream_ok_) {
+          data_cv_.Wait(&mu_);
+        }
+      }
+    }
     {
       absl::MutexLock l(&mu_);
-      in_flight_items_[key] = std::move(write_queue_.front());
-      write_queue_.pop_front();
-
       if (in_flight_items_.size() + write_queue_.size() >=
           kPendingItemsWarningThreshold) {
         REVERB_LOG_EVERY_N(REVERB_WARNING, 10) << absl::StrFormat(
@@ -761,15 +787,6 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
             "to call Flush? %d items are waiting to be inserted and %d items "
             "have been queued but haven't been confirmed yet.",
             write_queue_.size(), in_flight_items_.size());
-      }
-
-      // Apply backpressure: if the table's insert queue is full, wait for an
-      // outstanding insert to complete before pulling another item.
-      if (!can_insert_more) {
-        local_can_insert_more_ = false;
-        while (!local_can_insert_more_ && !closed_ && stream_ok_) {
-          data_cv_.Wait(&mu_);
-        }
       }
     }
   }
