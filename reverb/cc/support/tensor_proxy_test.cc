@@ -137,6 +137,36 @@ TEST(TensorBuffer, CopyReshaped) {
   EXPECT_EQ(reshaped.bytes(), buf.bytes());
 }
 
+// 复现标量列 shape 语义:0-d 标量经 InsertBatchDim(应保持 0-d)→
+// N 个堆叠 Concat 成 [N] → SubSlice 取行应回 0-d。TF 期标量跨步堆叠为 [N]。
+TEST(TensorBuffer, ScalarColumnShapeSemantics) {
+  py::module np = py::module::import("numpy");
+  // 3 个 0-d 标量,模拟跨 3 个时间步 append 同一标量列。
+  // 走真实路径:Python int -> FromNdArray(asarray) -> 0-d。
+  std::vector<TensorBuffer> batched;
+  for (int i = 0; i < 3; ++i) {
+    py::object arr = np.attr("asarray")(py::int_(i));
+    auto buf = TensorBuffer::FromNdArray(arr).value();
+    ASSERT_EQ(buf.shape(), std::vector<int64_t>({})) << "0-d 标量";
+    // InsertBatchDim 对标量不应插入 batch 维(TF 语义:标量保持 0-d)。
+    batched.push_back(buf.InsertBatchDim());
+    EXPECT_EQ(batched.back().shape(), std::vector<int64_t>({}))
+        << "标量 InsertBatchDim 应保持 0-d";
+  }
+  // Concat 把 N 个 0-d 堆叠成 [N]。
+  auto merged = TensorBuffer::Concat(batched).value();
+  EXPECT_EQ(merged.shape(), std::vector<int64_t>({3}))
+      << "N 个 0-d 标量 Concat 应为 [N]";
+  // SubSlice 取一行应回到 0-d 标量。
+  auto row = merged.SubSlice(1);
+  EXPECT_EQ(row.shape(), std::vector<int64_t>({}))
+      << "[N] SubSlice 取行应回 0-d";
+  py::object out = row.ToNdArray();
+  PyArrayObject* a = reinterpret_cast<PyArrayObject*>(out.ptr());
+  EXPECT_EQ(PyArray_NDIM(a), 0) << "ToNdArray 应为 0-d";
+  EXPECT_EQ(ReadScalar<int64_t>(out, 0), 1);
+}
+
 TEST(TensorBuffer, ZeroDimFromScalar) {
   // numpy 把标量 coerce 成 0-d array,TensorBuffer 应接受。
   py::module np = py::module::import("numpy");

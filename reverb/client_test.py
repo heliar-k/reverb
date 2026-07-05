@@ -178,11 +178,6 @@ class ClientTest(absltest.TestCase):
     writer.create_item(TABLE_NAME, 1, 1.0)
     writer.close(retry_on_unavailable=False)
 
-  # ponytail: C++ de-TF 后标量列(0-d numpy)被当作 shape [1],跨时间步堆叠
-  # 成 [N,1] 而非 [N];append_sequence 对标量元素报拼接 shape 不匹配。
-  # 本用例的 want 基于 TF 期标量保持标量的语义,与 numpy-only C++ 不一致。
-  # 降级为 skip 保留用例;恢复路径:统一标量列 shape 约定后改回断言。
-  @absltest.skip('标量列 shape 语义 de-TF 差异:[N,1] vs [N]')
   def test_writer(self):
     with self.client.writer(2) as writer:
       writer.append([0])
@@ -303,9 +298,6 @@ class ClientTest(absltest.TestCase):
     self.assertTrue(info.remover_options.fifo)
     self.assertIsNone(info.signature)
 
-  # ponytail: 见 test_writer 注释。标量列('a')跨 3 步采样为 [3,1] 而非 [3]。
-  # 降级 skip 保留用例;恢复路径:统一标量列 shape 约定后改回 [3] 断言。
-  @absltest.skip('标量列 shape 语义 de-TF 差异:[3,1] vs [3]')
   def test_sample_trajectory_with_signature(self):
     # ponytail: 该表 signature 原为 QUEUE_SIGNATURE(tf.TensorSpec dict),
     # unpack_as_table_signature=True 会按结构拆包成 dict。TF 移除后
@@ -341,8 +333,6 @@ class ClientTest(absltest.TestCase):
     self.assertIsInstance(sample.info.table_size, int)
     self.assertIsInstance(sample.info.priority, float)
 
-  # ponytail: 见 test_writer 注释。标量列('a')跨 3 步采样为 [3,1] 而非 [3]。
-  @absltest.skip('标量列 shape 语义 de-TF 差异:[3,1] vs [3]')
   def test_sample_trajectory_without_signature(self):
     with self.client.trajectory_writer(3) as writer:
       for _ in range(3):
@@ -374,8 +364,6 @@ class ClientTest(absltest.TestCase):
     self.assertIsInstance(sample.info.table_size, int)
     self.assertIsInstance(sample.info.priority, float)
 
-  # ponytail: 见 test_writer 注释。标量列('a')跨 3 步采样为 [3,1] 而非 [3]。
-  @absltest.skip('标量列 shape 语义 de-TF 差异:[3,1] vs [3]')
   def test_sample_trajectory_as_flat_data(self):
     with self.client.trajectory_writer(3) as writer:
       for _ in range(3):
@@ -423,8 +411,6 @@ class ClientTest(absltest.TestCase):
     self.assertIsInstance(sample.info.table_size, int)
     self.assertIsInstance(sample.info.priority, float)
 
-  # ponytail: 见 test_writer 注释。writer.append([i, ...]) 中标量 i 跨步为 [3,1]。
-  @absltest.skip('标量列 shape 语义 de-TF 差异:[3,1] vs [3]')
   def test_sample_trajectory_written_with_legacy_writer(self):
     with self.client.writer(3) as writer:
       for i in range(3):

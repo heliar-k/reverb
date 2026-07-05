@@ -155,15 +155,23 @@ int64_t TensorBuffer::TotalBytes() const {
 
 absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray) {
   ImportNumpyOnce();
-  // 强制 C-contiguous + 拷贝(不依赖 pybind11 的 py::array)。
-  // 用 numpy.ascontiguousarray(pure Python 调用,不触发 pybind11 npy_api)。
+  // 保留输入维度:np.asarray 不提升 Python 标量(0-d 保持 0-d),
+  // 而 np.ascontiguousarray 会把标量提升为 [1]——那是标量列 shape
+  // 退化为 [N,1] 的根因。仅在非 0-d 且非 C-contiguous 时转连续。
+  // ponytail: 纯 Python 调用,绕过 pybind11 npy_api(见文件顶部注释)。
   py::module np = py::module::import("numpy");
-  py::object as_obj = np.attr("ascontiguousarray")(ndarray);
-  PyArrayObject* contig = reinterpret_cast<PyArrayObject*>(as_obj.ptr());
-  if (!PyArray_Check(contig)) {
+  py::object as_obj = np.attr("asarray")(ndarray);
+  PyArrayObject* arr = reinterpret_cast<PyArrayObject*>(as_obj.ptr());
+  if (!PyArray_Check(arr)) {
     return absl::InvalidArgumentError(
         "FromNdArray: input is not a numpy array");
   }
+  // 0-d 必然 C-contiguous;非 0-d 不连续时升为 C-contiguous(拷贝)。
+  if (PyArray_NDIM(arr) > 0 && !PyArray_ISCARRAY_RO(arr)) {
+    as_obj = np.attr("ascontiguousarray")(as_obj);
+    arr = reinterpret_cast<PyArrayObject*>(as_obj.ptr());
+  }
+  PyArrayObject* contig = arr;
   py::object holder = std::move(as_obj);  // 持有生命周期
 
   int type_num = PyArray_TYPE(contig);
@@ -224,10 +232,12 @@ py::object TensorBuffer::ToNdArray() const {
   }
 
   std::vector<npy_intp> dims(spec_.shape.begin(), spec_.shape.end());
-  PyArrayObject* out = reinterpret_cast<PyArrayObject*>(
-      PyArray_New(&PyArray_Type, static_cast<int>(dims.size()),
-                  dims.empty() ? nullptr : dims.data(), npy_type,
-                  nullptr, nullptr, 0, NPY_ARRAY_C_CONTIGUOUS, nullptr));
+  // ponytail: PyArray_SimpleNew 创建 C-contiguous 数组(strides 由 numpy 按
+  // C-order 计算)。原先用 PyArray_New + NPY_ARRAY_C_CONTIGUOUS 在 ndim>=2 时
+  // 误产 F-order strides(4,8,16),导致 2D+ 列采样数据交错。
+  PyArrayObject* out = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(
+      static_cast<int>(dims.size()),
+      dims.empty() ? nullptr : dims.data(), npy_type));
   if (!out) {
     PyErr_Clear();
     // 回退:返回 None(不应发生在数值类型)。
@@ -243,7 +253,12 @@ py::object TensorBuffer::ToNdArray() const {
 
 TensorBuffer TensorBuffer::InsertBatchDim() const {
   TensorSpec spec = spec_;
-  spec.shape.insert(spec.shape.begin(), 1);
+  // ponytail: 标量(0-d)不插 batch 维——TF 期标量跨 N 步堆叠为 [N]
+  // 而非 [N,1]。非标量照常插 [1,...]。这把标量路径与 [1] 路径分流,
+  // 避免采样产出 [N,1]。
+  if (!spec.shape.empty()) {
+    spec.shape.insert(spec.shape.begin(), 1);
+  }
   return TensorBuffer(std::move(spec), bytes_);
 }
 
@@ -288,8 +303,22 @@ absl::StatusOr<TensorBuffer> TensorBuffer::Concat(
   spec.dtype = dt;
   spec.shape = buffers[0].shape();
   if (spec.shape.empty()) {
-    return absl::InvalidArgumentError(
-        "Concat: 0-d tensor cannot concat on dim 0");
+    // 0-d 标量堆叠:N 个 {} 拼成 [N](TF 期标量跨步语义)。
+    // ponytail: 每个标量 1 个元素,顺序拼接即 [N]。String 同理。
+    spec.shape = {static_cast<int64_t>(buffers.size())};
+    std::string bytes;
+    if (dt == DataType::String) {
+      for (const auto& b : buffers) bytes.append(b.bytes());
+    } else {
+      int itemsize = DataTypeItemsize(dt);
+      bytes.resize(buffers.size() * itemsize);
+      char* dst = bytes.data();
+      for (const auto& b : buffers) {
+        std::memcpy(dst, b.bytes().data(), itemsize);
+        dst += itemsize;
+      }
+    }
+    return TensorBuffer(std::move(spec), std::move(bytes));
   }
   spec.shape[0] = 0;
   for (const auto& b : buffers) spec.shape[0] += b.shape()[0];

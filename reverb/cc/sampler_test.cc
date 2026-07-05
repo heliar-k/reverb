@@ -351,6 +351,31 @@ TEST(SampleTest, IsComposedOfTimesteps) {
   EXPECT_FALSE(non_timestep_sample.is_composed_of_timesteps());
 }
 
+TEST(SampleTest, AsTrajectoryConcatsMultiChunkNonScalar) {
+  // Two single-step chunks of [1,2,2] uint64 each (InsertBatchDim layout),
+  // concatenated along dim 0 -> [2,2,2]. Verifies multi-chunk Concat
+  // preserves row-major layout (no interleave) for 2-D columns.
+  auto make_step = [](int v) {
+    std::vector<uint64_t> values(4, v);
+    std::string bytes(values.size() * sizeof(uint64_t), '\0');
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    return TensorBuffer(TensorSpec{DataType::Uint64, {1, 2, 2}},
+                        std::move(bytes));
+  };
+  Sample sample(
+      /*info=*/std::make_shared<SampleInfo>(),
+      /*column_chunks=*/{{make_step(0), make_step(1)}},
+      /*squeeze_columns=*/{false});
+  std::vector<TensorBuffer> data;
+  REVERB_ASSERT_OK(sample.AsTrajectory(&data));
+  ASSERT_THAT(data, SizeIs(1));
+  ASSERT_EQ(data[0].shape(), std::vector<int64_t>({2, 2, 2}));
+  // Expected: step0 (4 zeros) then step1 (4 ones), row-major contiguous.
+  std::vector<uint64_t> got(data[0].NumElements());
+  std::memcpy(got.data(), data[0].bytes().data(), data[0].bytes().size());
+  EXPECT_EQ(got, std::vector<uint64_t>({0, 0, 0, 0, 1, 1, 1, 1}));
+}
+
 TEST(GrpcSamplerTest, SendsFirstRequest) {
   auto stub = MakeGoodStub({MakeResponse(1)});
   Sampler sampler(stub, "table", {1, 1, 1});

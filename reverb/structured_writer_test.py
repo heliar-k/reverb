@@ -247,10 +247,7 @@ class StructuredWriterTest(parameterized.TestCase):
       },
   )
   def test_trajectory_patterns(self, pattern, num_steps, want):
-    # ponytail: pattern 含标量列(REF_STEP['a'] 为 0-d)跨多步采样为 [N,1]
-    # 而非 TF 期的 [N];want 基于旧语义。3 个参数均受影响,降级 skip 保留用例。
-    # 恢复路径:统一标量列 shape 约定后改回断言。
-    self.skipTest('标量列 shape 语义 de-TF 差异:[N,1] vs [N]')
+    # 标量列(REF_STEP['a'] 为 0-d)跨多步采样现保持 [N] 语义(对齐 TF)。
     config = structured_writer.create_config(
         pattern=pattern, table=TABLES[0], conditions=[])
 
@@ -363,11 +360,8 @@ class StructuredWriterTest(parameterized.TestCase):
   )
   def test_data_condition(
       self, step_spec, pattern_fn, condition_fn, steps, want):
-    # ponytail: step_spec 为 STEP_SPEC 时,'a' 是 0-d numpy 标量,跨多步切片
-    # ([-2:]) 采样为 [N,1] 而非 TF 期的 [N];want 基于旧语义。降级 skip 该
-    # 参数分支保留用例。bool_eq/unused_column 用 Python int(非 numpy)不受影响。
-    if step_spec is STEP_SPEC:
-      self.skipTest('标量列 shape 语义 de-TF 差异:[N,1] vs [N]')
+    # 标量列('a' 为 0-d)跨多步切片现保持 [N] 语义(对齐 TF)。
+    # STEP_SPEC 与 None step_spec 两条路径均走通。
     config = structured_writer.create_config(
         pattern=structured_writer.pattern_from_transform(step_spec, pattern_fn),
         table=TABLES[0],
@@ -452,9 +446,9 @@ class StructuredWriterTest(parameterized.TestCase):
 
     with self.assertRaisesWithLiteralMatch(
         ValueError,
-        # ponytail: C++ de-TF 后空 shape 报为 [1] 而非 []。
+        # 标量列('d'[1]=Python int 1)现推断为 0-d ([]),对齐 TF 语义。
         "Tensor of incompatible shape provided for column 3 "
-        "(path=('b', 'd', 1)). Got [2,2] which is incompatible with [1]."):
+        "(path=('b', 'd', 1)). Got [2,2] which is incompatible with []."):
       writer.append({
           'a': 2,
           'b': {

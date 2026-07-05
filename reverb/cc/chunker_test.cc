@@ -35,6 +35,7 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/support/trajectory_util.h"
 
 namespace deepmind {
 namespace reverb {
@@ -440,6 +441,51 @@ TEST(Chunker, ChunkHasBatchDim) {
       "dim: 1 dim: 1", &expected));
   EXPECT_THAT(ref.lock()->GetChunk()->get()->data().tensors(0).shape(),
               EqualsProto(expected));
+}
+
+TEST(Chunker, FlushMultiStepNonScalarLayoutIsRowMajor) {
+  // 2 steps of [2,2] int32. Flushed chunk must be [2,2,2] row-major:
+  // step0 bytes then step1 bytes (NOT interleaved).
+  internal::TensorSpec spec = {"0", DataType::Int32, {2, 2}};
+  auto chunker = MakeChunker(spec, /*max_chunk_length=*/2,
+                            /*num_keep_alive_refs=*/2);
+  auto step0 = MakeConstantBuffer<int32_t>(DataType::Int32, {2, 2}, 0);
+  auto step1 = MakeConstantBuffer<int32_t>(DataType::Int32, {2, 2}, 1);
+  std::weak_ptr<CellRef> r0, r1;
+  REVERB_ASSERT_OK(chunker->Append(step0, {1, 0}, &r0));
+  REVERB_ASSERT_OK(chunker->Append(step1, {1, 1}, &r1));
+  ASSERT_TRUE(r0.lock()->IsReady());
+
+  // Unpack the full column and verify byte layout: [0,0,0,0, 1,1,1,1].
+  TensorBuffer column;
+  REVERB_ASSERT_OK(
+      internal::UnpackChunkColumn(*r0.lock()->GetChunk()->get(), 0, &column));
+  ASSERT_EQ(column.shape(), std::vector<int64_t>({2, 2, 2}));
+  std::vector<int32_t> ints(column.NumElements());
+  std::memcpy(ints.data(), column.bytes().data(), column.bytes().size());
+  // Row-major: step0 (4 zeros) then step1 (4 ones).
+  EXPECT_EQ(ints, std::vector<int32_t>({0, 0, 0, 0, 1, 1, 1, 1}));
+}
+
+TEST(Chunker, AutoTunedFlushMultiStepNonScalarLayoutIsRowMajor) {
+  // AutoTunedChunkerOptions starts max_chunk_length=1, so each step auto-flushes
+  // its own [1,2,2] chunk. Verify the per-step chunk has correct row-major
+  // bytes (step value replicated), not interleaved.
+  internal::TensorSpec spec = {"0", DataType::Int32, {2, 2}};
+  auto chunker = std::make_shared<Chunker>(
+      spec, std::make_shared<AutoTunedChunkerOptions>(
+                /*num_keep_alive_refs=*/4, /*throughput_weight=*/1.0));
+  auto step0 = MakeConstantBuffer<int32_t>(DataType::Int32, {2, 2}, 0);
+  std::weak_ptr<CellRef> r0;
+  REVERB_ASSERT_OK(chunker->Append(step0, {1, 0}, &r0));
+  ASSERT_TRUE(r0.lock()->IsReady());
+  TensorBuffer column;
+  REVERB_ASSERT_OK(
+      internal::UnpackChunkColumn(*r0.lock()->GetChunk()->get(), 0, &column));
+  ASSERT_EQ(column.shape(), std::vector<int64_t>({1, 2, 2}));
+  std::vector<int32_t> ints(column.NumElements());
+  std::memcpy(ints.data(), column.bytes().data(), column.bytes().size());
+  EXPECT_EQ(ints, std::vector<int32_t>({0, 0, 0, 0}));
 }
 
 TEST(Chunker, DeletesRefsWhenMageAgeExceeded) {
