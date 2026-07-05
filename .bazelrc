@@ -35,6 +35,15 @@ common --repo_env USE_HERMETIC_CC_TOOLCHAIN=1
 test --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1"
 test --test_output=errors
 
+# Coverage: 用 scripts/coverage.sh 而非 `bazel coverage`。原因:hermetic cc
+# toolchain (@rules_ml_toolchain) 在 coverage 模式下缺失 startup_libs 输入,
+# 导致 `bazel coverage` 报 "missing input file" 错误。脚本改用手动 clang
+# source-based coverage(-fprofile-instr-generate/-fcoverage-mapping)+
+# llvm-profdata/llvm-cov(复用 bazel external 里的 llvm18 工具)绕开。
+common:coverage --experimental_use_llvm_covmap
+common:coverage --copt=-fprofile-instr-generate
+common:coverage --copt=-fcoverage-mapping
+
 common -c opt
 common --cxxopt="-std=c++17"
 common --host_cxxopt="-std=c++17"
