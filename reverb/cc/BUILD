@@ -537,6 +537,49 @@ cc_test(
 )
 
 cc_test(
+    name = "trajectory_writer_grpc_test",
+    srcs = ["trajectory_writer_grpc_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    # ponytail: gRPC reactor-path tests for TrajectoryWriter. Uses a custom
+    # FakeAsyncStub whose async()->InsertStream hands out a FakeReactorStream
+    # (a ClientCallbackReaderWriter subclass) instead of the synchronous
+    # MockClientReaderWriter used by writer_test/streaming_trajectory_writer_test,
+    # because TrajectoryWriter drives the stream via the callback reactor API.
+    # :trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy C-API),
+    # needs libpython to resolve Py* symbols (same as :trajectory_writer_test).
+    linkopts = [
+        "-L/usr/lib/x86_64-linux-gnu",
+        "-lpython3.10",
+        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+    ],
+    deps = [
+        ":chunker",
+        ":reverb_service_cc_grpc_proto",
+        ":reverb_service_cc_proto",
+        ":schema_cc_proto",
+        ":trajectory_writer",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/support:grpc_util",
+        "//reverb/cc/support:queue",
+        "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
+        "//reverb/cc/support:trajectory_util",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
+        "@com_github_grpc_grpc//:grpc++_test",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:protobuf",
+    ] + reverb_grpc_deps(),
+)
+
+cc_test(
     name = "reverb_service_impl_test",
     srcs = ["reverb_service_impl_test.cc"],
     copts = ["-Wno-sign-compare"],
