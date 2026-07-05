@@ -3,6 +3,7 @@
 load(
     "//reverb/cc/platform/default:build_rules.bzl",
     "reverb_cc_library",
+    "reverb_cc_test",
     "reverb_grpc_deps",
     "reverb_tf_deps",
 )
@@ -181,6 +182,20 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
+    ],
+)
+
+reverb_cc_test(
+    name = "checkpointing_utils_test",
+    srcs = ["checkpointing_utils_test.cc"],
+    deps = [
+        ":checkpointing_utils",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/selectors:heap",
+        "//reverb/cc/selectors:lifo",
+        "//reverb/cc/selectors:prioritized",
+        "//reverb/cc/selectors:uniform",
     ],
 )
 
