@@ -318,6 +318,35 @@ reverb_cc_library(
     ] + reverb_grpc_deps(),
 )
 
+# ponytail: 原生 reverb_cc_test,去 TF,改用 TensorBuffer(numpy)。reverb_cc_test 宏已
+# 统一注入 libpython linkopts(tensor_proxy 经 pybind11/numpy C-API 需链接 Py* 符号)。
+reverb_cc_test(
+    name = "writer_test",
+    srcs = ["writer_test.cc"],
+    deps = [
+        ":client",
+        ":writer",
+        ":reverb_service_cc_grpc_proto",
+        ":reverb_service_cc_proto",
+        ":schema_cc_proto",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/support:grpc_util",
+        "//reverb/cc/support:queue",
+        "//reverb/cc/support:signature",
+        "//reverb/cc/support:tensor_proxy",
+        "//reverb/cc/support:trajectory_util",
+        "//reverb/cc/support:uint128",
+        "//reverb/cc/testing:proto_test_util",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
+    ] + reverb_grpc_deps(),
+)
+
 cc_library(
     name = "trajectory_writer",
     srcs = ["trajectory_writer.cc"],

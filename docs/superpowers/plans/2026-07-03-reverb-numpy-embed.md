@@ -1654,3 +1654,40 @@ Client ──gRPC──▶ Server ──▶ Table
 - 22 个 Python 测试 skip(infer_signature 整类、标量列 shape 语义)——待统一约定后恢复
 - String dtype 简化为 object 数组——待严格 string 回放需求时补
 - bzlmod 迁移未做(用 WORKSPACE 原生 http_archive 替代,MODULE.bazel 仍空)——后续现代化方向
+
+---
+
+# 测试覆盖率核查报告(实测,2026-07-04)
+
+> 用 clang source-based coverage(`-fprofile-instr-generate -fcoverage-mapping`)+ `llvm-profdata`/`llvm-cov` 实测。C++ 测试 33 套 + Python 测试 2 套(`in_process_test`/`grpc_roundtrip_test`)的 profraw 合并后导出。`.h`/`.proto` 生成代码不计(内联归 `.cc`,proto 无逻辑)。
+
+## 改造文件行覆盖率
+
+| 任务 | 模块 | 文件 | 覆盖行/总 | 覆盖率 | 状态 |
+|------|------|------|-----------|--------|------|
+| Task1 | proto fork | reverb_tensor.proto | — | — | ➖ 生成代码不计 |
+| Task2 | TensorBuffer | tensor_proxy.cc | 208/286 | 72.7% | ✅ |
+| Task3 | length-delimited IO | length_delimited_io.cc | 36/50 | 72.0% | ✅ |
+| Task4 | SimpleCheckpointer | simple_checkpointer.cc | 249/347 | 71.8% | ✅ |
+| Task5 | signature | signature.cc | 161/228 | 70.6% | ✅ |
+| Task6 | compression+util | tensor_compression.cc | 84/107 | 78.5% | ✅ |
+| Task6 | compression+util | trajectory_util.cc | 127/153 | 83.0% | ✅ |
+| Task7 | chunker | chunker.cc | 378/445 | 84.9% | ✅ |
+| Task8 | table | table.cc | 740/902 | 82.0% | ✅ |
+| Task9 | sampler | sampler.cc | 493/591 | 83.4% | ✅ |
+| Task10/13 | TrajectoryWriter | trajectory_writer.cc | 369/728 | 50.7% | ⚠️ gRPC stream 路径未跑 |
+| Task11 | InProcessClient | in_process_client.cc | 76/113 | 67.3% | ✅ |
+| Task12 | conversions | conversions.cc | — | — | ➖ 文件已删,pybind 直用 TensorBuffer |
+| Task14 | server | server.cc | 43/69 | 62.3% | ✅ |
+| Task14 | ckpt_utils | checkpointing_utils.cc | 8/17 | 47.1% | ⚠️ |
+| P3 | StructuredWriter | structured_writer.cc | 359/461 | 77.9% | ✅ |
+| P4 | gRPC client | client.cc | 147/292 | 50.3% | ⚠️ |
+| P4 | gRPC writer | writer.cc | 266/492 | 54.1% | ⚠️ writer_test.cc 已停编,仅 Python grpc_test 覆盖 |
+| P4 | gRPC streaming | streaming_trajectory_writer.cc | 219/239 | 91.6% | ✅ |
+| **合计** | | | **3963/5520** | **71.8%** | |
+
+## 结论
+
+- **核心改造(内嵌路径)**覆盖扎实:TensorBuffer/chunker/table/sampler/signature/checkpointer/StructuredWriter 全部 70%+,InProcessClient 67%。
+- **gRPC 路径**覆盖偏低:writer.cc 54%、client.cc 50%、trajectory_writer.cc 51%。根因是 `writer_test.cc`(21 个 TEST,测 writer.cc 的 stream 重试/关闭/分块等)在去 TF 后已停编(含 TF 引用未改造),仅靠 `grpc_roundtrip_test.py` 3 个用例覆盖,深度不足。
+- **缺口**:writer.cc 的 21 个 C++ 单测是最大覆盖空洞。恢复 `writer_test.cc` 到 TensorBuffer(仿 streaming_trajectory_writer_test 的改法)可把 writer.cc 覆盖率从 54% 拉到 80%+。
