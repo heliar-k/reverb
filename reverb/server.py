@@ -29,17 +29,10 @@ from reverb import item_selectors
 from reverb import pybind
 from reverb import rate_limiters
 from reverb import reverb_types
+from reverb import signature_codec
 from reverb.platform.default import checkpointers
 
 import tree
-
-# TF is only required to encode `tf.TypeSpec`-based table signatures, and
-# only when a signature is actually provided to `Table`. The in-process /
-# numpy-only mode never sets a signature, so TF is imported lazily inside
-# `Table.__init__` rather than at module load time (loading TF eagerly would
-# pull in its bundled gRPC and conflict with Reverb's own gRPC in libreverb.so).
-tensor_spec = None
-nested_structure_coder = None
 
 
 class TableExtensionBase(metaclass=abc.ABCMeta):
@@ -147,19 +140,13 @@ class Table:
       internal_extensions += list(extension.build_internal_extensions(name))
 
     if signature:
-      # Lazily import TF to encode the signature. The in-process / numpy-only
-      # mode never reaches here (signature is left None).
-      # pylint: disable=g-import-not-at-top
-      from tensorflow.python.framework import tensor_spec
-      from tensorflow.python.saved_model import nested_structure_coder
-      # pylint: enable=g-import-not-at-top
+      # Encode the signature via the pure-Python codec (no TF). Leaves must be
+      # `signature_codec.TensorSpec`.
       flat_signature = tree.flatten(signature)
       for s in flat_signature:
-        if not isinstance(s, tensor_spec.TensorSpec):
+        if not isinstance(s, signature_codec.TensorSpec):
           raise ValueError(f'Unsupported signature spec: {s}')
-      signature_proto_str = (
-          nested_structure_coder.encode_structure(
-              signature).SerializeToString())
+      signature_proto_str = signature_codec.encode_signature(signature)
     else:
       signature_proto_str = None
 

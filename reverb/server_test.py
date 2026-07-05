@@ -22,10 +22,12 @@ import time
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import numpy as np
 from reverb import item_selectors
 from reverb import pybind
 from reverb import rate_limiters
 from reverb import server
+from reverb import signature_codec
 
 TABLE_NAME = 'table'
 
@@ -156,23 +158,11 @@ class TableTest(parameterized.TestCase):
     self._check_selector_proto(sampler, table_info.sampler_options)
     self._check_selector_proto(remover, table_info.remover_options)
 
-  # ponytail: signature 构造原用 tf.TensorSpec;TF 已移除后 numpy-only 模式
-  # 不支持构造 table signature(server.py 仅在 TF 可用时编码)。该用例深度
-  # 依赖 TF.TensorSpec 语义,降级为 skip 以保留用例(不删)。
-  # 恢复路径:重新引入 TF 或实现纯 Python SignatureSpec 后取消 skip。
-  @absltest.skip('signature 构造需 TF.TensorSpec,numpy-only 模式不支持')
-  @parameterized.named_parameters(
-      (
-          'scalar',
-          None,
-      ),
-      (
-          'image',
-          None,
-      ),
-      ('nested', None),
-  )
-  def test_table_info_signature(self, signature):
+  def test_table_info_signature(self):
+    signature = {
+        'a': signature_codec.TensorSpec([3, 3], np.float32, 'a'),
+        'b': signature_codec.TensorSpec([None, 2], np.int64, 'b'),
+    }
     table = server.Table(
         name='table',
         sampler=item_selectors.Fifo(),

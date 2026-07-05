@@ -26,6 +26,7 @@ from typing import Any, Callable, NewType, Optional, Sequence
 from reverb import errors
 from reverb import pybind
 from reverb import reverb_types
+from reverb import signature_codec
 import tree
 
 from reverb.cc import patterns_pb2
@@ -36,8 +37,8 @@ from third_party.reverb_tensor import reverb_tensor_pb2
 # (仅 Python unpack_pattern 在测试中用于重建结构),且项目已换成对齐 numpy 的
 # 自定义 SignatureProto。故用纯 Python 实现 encode/decode_structure,覆盖
 # Reverb 实际用到的 dict/list/tuple 容器 + None 叶子(tree.map_structure(
-# lambda _: None, pattern) 产生)。infer_signature 仍返回 tf.TensorSpec,
-# 仅在 TF 可用时可用,保留惰性 import。
+# lambda _: None, pattern) 产生)。infer_signature 改用
+# signature_codec.TensorSpec(numpy dtype/shape),不再惰性 import TF。
 # 升级路径:若需 BoundedTensorSpec/NamedTuple,扩展下面两个函数。
 
 
@@ -383,12 +384,9 @@ def infer_signature(configs: Sequence[Config],
 
   flat_step_spec = tree.flatten(step_spec)
 
-  # infer_signature 返回 tf.TensorSpec,需 TF。numpy-only 模式下不可用;
-  # 调用方(测试)应在无 TF 时 skip。
-  # pylint: disable=g-import-not-at-top
-  from tensorflow.python.framework import tensor_shape
-  from tensorflow.python.framework import tensor_spec
-  # pylint: enable=g-import-not-at-top
+  # Uses the pure-Python `signature_codec.TensorSpec` (no TF). `step_spec`
+  # leaves are numpy arrays, so `.dtype` / `.shape` are native numpy attrs.
+  TensorSpec = signature_codec.TensorSpec
 
   def _validate_and_convert_to_spec(path, *nodes):
     # Check that all nodes share the same dtype.
@@ -406,25 +404,25 @@ def infer_signature(configs: Sequence[Config],
         length = math.ceil((node.stop - node.start) / (node.step or 1))
         shape = [length, *shape]
 
-      shapes.append(tensor_shape.TensorShape(shape))
+      shapes.append(shape)
 
     # Check that all shapes are either completely identical or at least
     # identical in all dimensions but the first.
-    if (any(shape.rank != shapes[0].rank for shape in shapes) or
-        (shapes[0].rank > 1 and
+    if (any(len(shape) != len(shapes[0]) for shape in shapes) or
+        (len(shapes[0]) > 1 and
          any(shape[1:] != shapes[0][1:] for shape in shapes))):
       raise ValueError(
           f'Configs produce trajectories with incompatible shapes at {path}. '
           f'Got {shapes}.')
 
     # Merge the shapes into a single shape. If the first dimension varies then
-    # we set the leading dimension as undefined.
+    # we set the leading dimension as unknown (None).
     if all(shape == shapes[0] for shape in shapes):
       merged_shape = shapes[0]
     else:
       merged_shape = [None, *shapes[0][1:]]
 
-    return tensor_spec.TensorSpec(
+    return TensorSpec(
         shape=merged_shape,
         dtype=dtypes[0],
         name='/'.join(str(x) for x in path))

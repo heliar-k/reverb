@@ -18,12 +18,6 @@ from typing import Any, NamedTuple, Sequence, Union
 
 import numpy as np
 
-# TF is only needed for the `tf_dtypes`/`tf_shapes` helpers, which are unused
-# in the in-process / numpy-only mode. To avoid loading TF (and its bundled
-# gRPC, which conflicts with Reverb's own gRPC) at import time, TF is imported
-# lazily inside those helpers. Type hints use `Any` for the tensor type.
-_TensorType = Any
-
 
 class SampleInfo(NamedTuple):
   """Extra details about the sampled item.
@@ -40,26 +34,11 @@ class SampleInfo(NamedTuple):
     times_sampled: Number of times this item has been sampled (including this
       time).
   """
-  key: Union[np.ndarray, _TensorType, int]
-  probability: Union[np.ndarray, _TensorType, float]
-  table_size: Union[np.ndarray, _TensorType, int]
-  priority: Union[np.ndarray, _TensorType, float]
-  times_sampled: Union[np.ndarray, _TensorType, int]
-
-  @classmethod
-  def tf_dtypes(cls):
-    """Dtypes for (key, probability, table_size, priority, times_sampled)."""
-    # pylint: disable=g-import-not-at-top
-    import tensorflow.compat.v1 as tf
-    # pylint: enable=g-import-not-at-top
-    return cls(tf.uint64, tf.double, tf.int64, tf.double, tf.int32)
-
-  @classmethod
-  def tf_shapes(cls):
-    # pylint: disable=g-import-not-at-top
-    import tensorflow.compat.v1 as tf
-    # pylint: enable=g-import-not-at-top
-    return cls(*[tf.TensorShape([]) for _ in cls.tf_dtypes()])
+  key: Union[np.ndarray, Any, int]
+  probability: Union[np.ndarray, Any, float]
+  table_size: Union[np.ndarray, Any, int]
+  priority: Union[np.ndarray, Any, float]
+  times_sampled: Union[np.ndarray, Any, int]
 
   @classmethod
   def zeros(cls):

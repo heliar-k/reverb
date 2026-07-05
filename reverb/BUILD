@@ -74,6 +74,7 @@ reverb_pytype_library(
         ":pybind",
         ":rate_limiters",
         ":reverb_types",
+        ":signature_codec",
         "//reverb/platform/default:checkpointers",
     ],
 )
@@ -196,11 +197,21 @@ reverb_pybind_extension(
 )
 
 reverb_pytype_library(
+    name = "signature_codec",
+    srcs = ["signature_codec.py"],
+    strict_deps = True,
+    deps = [
+        "//third_party/reverb_tensor:reverb_tensor_py_pb2",
+    ],
+)
+
+reverb_pytype_library(
     name = "reverb_types",
     srcs = ["reverb_types.py"],
     strict_deps = True,
     deps = [
         ":pybind",
+        ":signature_codec",
         "//reverb/cc:schema_py_pb2",
     ],
 )
@@ -212,6 +223,7 @@ reverb_pytype_strict_library(
         ":errors",
         ":pybind",
         ":reverb_types",
+        ":signature_codec",
         "//reverb/cc:patterns_py_pb2",
         "//third_party/reverb_tensor:reverb_tensor_py_pb2",
     ],
@@ -270,6 +282,7 @@ reverb_py_test(
         ":pybind",
         ":rate_limiters",
         ":server",
+        ":signature_codec",
     ],
 )
 
@@ -291,6 +304,7 @@ reverb_py_test(
     deps = [
         ":client",
         ":server",
+        ":signature_codec",
         ":structured_writer",
     ],
 )

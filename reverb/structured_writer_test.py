@@ -22,21 +22,11 @@ from reverb import server as server_lib
 from reverb import structured_writer
 import tree
 
-# ponytail: 原依赖 tf.TensorSpec 用于 infer_signature 断言;TF 已移除。
-# 提供一个最小 shim 让 TestInferSignature 的参数化在类定义时能构造
-# (该类整体 skip,shim 实例不会被实质断言)。不引入 TF。
+# ponytail: infer_signature 现返回 signature_codec.TensorSpec(numpy
+# dtype/shape),不再依赖 TF。直接用真实 TensorSpec 做断言。
+from reverb import signature_codec
 
-
-class _TensorSpecShim:
-  """最小 TensorSpec 占位,仅满足参数构造;不参与断言(类已 skip)。"""
-
-  def __init__(self, shape, dtype, name=None):
-    self.shape = shape
-    self.dtype = dtype
-    self.name = name
-
-
-TensorSpec = _TensorSpecShim
+TensorSpec = signature_codec.TensorSpec
 
 Condition = structured_writer.Condition
 
@@ -519,11 +509,8 @@ class StructuredWriterTest(parameterized.TestCase):
     self.assertSequenceEqual(priorities, expected_priorities)
 
 
-# ponytail: infer_signature 返回 tf.TensorSpec,深度依赖 TF 语义;
-# numpy-only 模式下 structured_writer.infer_signature 会 import TF 失败。
-# 降级为整类 skip 以保留 8 个用例(不删)。
-# 恢复路径:重新引入 TF 或为 infer_signature 实现纯 numpy spec 后取消 skip。
-@absltest.skip('infer_signature 需 TF.TensorSpec,numpy-only 模式不支持')
+# ponytail: infer_signature 现返回 signature_codec.TensorSpec(numpy
+# dtype/shape),不再需 TF。已取消整类 skip。
 class TestInferSignature(parameterized.TestCase):
 
   @parameterized.parameters(
@@ -702,6 +689,23 @@ class TestInferSignature(parameterized.TestCase):
         ValueError, r'Configs produce trajectories with incompatible shapes at '
         r'\(\'x\',\)\. Got .*'):
       structured_writer.infer_signature(configs, step_spec)
+
+
+class TestSignatureCodecRoundTrip(absltest.TestCase):
+  """Round-trip self-check for reverb.signature_codec."""
+
+  def test_roundtrip_nested(self):
+    spec = {
+        'a': TensorSpec([3, 3], np.float32, 'a'),
+        'b': {
+            'c': TensorSpec([], np.int32, 'b/c'),
+            'd': [TensorSpec([None, 2], np.int64, 'b/d/0'),
+                  TensorSpec([6], np.uint8, 'b/d/1')],
+        },
+        'e': (TensorSpec([1], np.bool_), TensorSpec([], np.float64)),
+    }
+    self.assertEqual(spec, signature_codec.decode_signature(
+        signature_codec.encode_signature(spec)))
 
 
 if __name__ == '__main__':
