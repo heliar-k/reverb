@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Reverb rate limiters."""
+"""Exhaustive tests for Reverb rate limiters."""
+
+import sys
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -128,6 +130,29 @@ class TestSampleToInsertRatio(parameterized.TestCase):
     else:
       rate_limiters.SampleToInsertRatio(samples_per_insert, 10, 100)
 
+  def test_single_number_error_buffer_expands_to_range(self):
+    # error_buffer=number -> range centered on spi*min_size.
+    rl = rate_limiters.SampleToInsertRatio(0.5, 10, 1.1)
+    self.assertAlmostEqual(rl._samples_per_insert, 0.5)
+    self.assertEqual(rl._min_size_to_sample, 10)
+    self.assertAlmostEqual(rl._min_diff, 0.5 * 10 - 1.1)
+    self.assertAlmostEqual(rl._max_diff, 0.5 * 10 + 1.1)
+
+  def test_explicit_range_used_verbatim(self):
+    rl = rate_limiters.SampleToInsertRatio(1.0, 10, (7, 12))
+    self.assertEqual(rl._min_diff, 7)
+    self.assertEqual(rl._max_diff, 12)
+
+  def test_int_error_buffer_treated_as_single_number(self):
+    # int is an instance of int (not float); the code checks int|float.
+    rl = rate_limiters.SampleToInsertRatio(1.0, 10, 5)
+    self.assertAlmostEqual(rl._min_diff, 10 * 1.0 - 5)
+    self.assertAlmostEqual(rl._max_diff, 10 * 1.0 + 5)
+
+  def test_internal_limiter_constructed(self):
+    rl = rate_limiters.SampleToInsertRatio(1.0, 10, 5)
+    self.assertIsNotNone(rl.internal_limiter)
+
 
 class TestMinSize(parameterized.TestCase):
 
@@ -135,6 +160,7 @@ class TestMinSize(parameterized.TestCase):
       (-1, True),
       (0, True),
       (1, False),
+      (100, False),
   )
   def test_raises_if_min_size_lt_1(self, min_size_to_sample, want_error):
     if want_error:
@@ -142,6 +168,69 @@ class TestMinSize(parameterized.TestCase):
         rate_limiters.MinSize(min_size_to_sample)
     else:
       rate_limiters.MinSize(min_size_to_sample)
+
+  def test_min_size_config(self):
+    rl = rate_limiters.MinSize(5)
+    self.assertEqual(rl._min_size_to_sample, 5)
+    self.assertAlmostEqual(rl._samples_per_insert, 1.0)
+    self.assertEqual(rl._min_diff, -sys.float_info.max)
+    self.assertEqual(rl._max_diff, sys.float_info.max)
+
+
+class TestQueue(parameterized.TestCase):
+
+  @parameterized.parameters(
+      (1, False),
+      (10, False),
+      (1000, False),
+  )
+  def test_constructs(self, size, _):
+    rate_limiters.Queue(size)
+
+  def test_config(self):
+    rl = rate_limiters.Queue(7)
+    self.assertEqual(rl._min_size_to_sample, 1)
+    self.assertAlmostEqual(rl._samples_per_insert, 1.0)
+    self.assertEqual(rl._min_diff, 0.0)
+    self.assertEqual(rl._max_diff, 7)
+
+
+class TestStack(parameterized.TestCase):
+
+  @parameterized.parameters(
+      (1, False),
+      (10, False),
+      (1000, False),
+  )
+  def test_constructs(self, size, _):
+    rate_limiters.Stack(size)
+
+  def test_config(self):
+    rl = rate_limiters.Stack(7)
+    self.assertEqual(rl._min_size_to_sample, 1)
+    self.assertAlmostEqual(rl._samples_per_insert, 1.0)
+    self.assertEqual(rl._min_diff, 0.0)
+    self.assertEqual(rl._max_diff, 7)
+
+
+class TestRateLimiterBase(absltest.TestCase):
+
+  def test_repr_delegates_to_internal(self):
+    rl = rate_limiters.MinSize(3)
+    self.assertEqual(repr(rl), repr(rl.internal_limiter))
+
+  def test_internal_limiter_is_pybind(self):
+    from reverb import pybind  # local import to avoid module-level cycle
+    rl = rate_limiters.MinSize(3)
+    self.assertIsInstance(rl.internal_limiter, pybind.RateLimiter)
+
+  def test_subclasses(self):
+    self.assertIsInstance(rate_limiters.MinSize(1), rate_limiters.RateLimiter)
+    self.assertIsInstance(rate_limiters.Queue(1), rate_limiters.RateLimiter)
+    self.assertIsInstance(rate_limiters.Stack(1), rate_limiters.RateLimiter)
+    self.assertIsInstance(
+        rate_limiters.SampleToInsertRatio(1.0, 10, 5),
+        rate_limiters.RateLimiter)
 
 
 if __name__ == '__main__':

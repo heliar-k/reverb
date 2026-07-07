@@ -1,11 +1,10 @@
 load(
     "//reverb/cc/platform:build_rules.bzl",
-    "reverb_py_test",
     "reverb_pytype_strict_library",
 )
 
 package(
-    default_visibility = [":__subpackages__"],
+    default_visibility = ["//reverb:__subpackages__"],
 )
 
 licenses(["notice"])
@@ -18,11 +17,4 @@ reverb_pytype_strict_library(
     ],
 )
 
-reverb_py_test(
-    name = "checkpointers_lib_test",
-    srcs = ["checkpointers_lib_test.py"],
-    deps = [
-        ":checkpointers_lib",
-        "//reverb:pybind",
-    ],
-)
+# ponytail: checkpointers_lib_test 已迁移至 //reverb/tests:checkpointers_test。

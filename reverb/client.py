@@ -170,7 +170,8 @@ class Writer:
         in the buffer.
     """
     if num_timesteps < 1:
-      raise ValueError('num_timesteps (%d) must be a positive integer')
+      raise ValueError(
+          f'num_timesteps ({num_timesteps}) must be a positive integer')
     self._writer.CreateItem(table, num_timesteps, priority)
 
   def flush(self):
@@ -612,6 +613,7 @@ class LocalClient:
 
   def __init__(self, internal_client: 'pybind.InProcessClient'):
     self._client = internal_client
+    self._signature_cache = {}
 
   def __repr__(self):
     return 'LocalClient (in-process, numpy)'
@@ -669,17 +671,48 @@ class LocalClient:
     return self._client.new_sampler(
         table, num_samples, buffer_size, timeout_ms_arg)
 
+  def _get_signature_for_table(self, table: str):
+    if not self._signature_cache:
+      self.server_info()  # Populates the cache.
+    if table not in self._signature_cache:
+      raise ValueError(
+          f'Could not find table "{table}". The following tables exists: '
+          f'{", ".join(self._signature_cache.keys())}.')
+    return self._signature_cache[table]
+
   def sample(self, table: str, num_samples: int = 1,
+             *, emit_timesteps: bool = True,
+             unpack_as_table_signature: bool = False,
              timeout_ms: Optional[int] = None):
     """Yields `ReplaySample` objects sampled from `table`.
 
     Args:
       table: Name of the table to sample from.
       num_samples: Number of samples to yield.
+      emit_timesteps: If True then trajectories are returned as a list of
+        `ReplaySample`, each representing a single step within the trajectory.
+        If False, a single `ReplaySample` per sampled item is yielded.
+      unpack_as_table_signature: If True then the sampled data is unpacked
+        according to the structure of the table signature. If the table has no
+        signature then flat data (a list of column arrays) is returned.
       timeout_ms: Rate-limiter timeout in milliseconds per sample. `None` waits
         forever. A positive value raises `reverb.errors.DeadlineExceededError`
         if the table's rate limiter blocks longer than `timeout_ms`.
+
+    Yields:
+      If `emit_timesteps` is True: lists of `ReplaySample` (one per step).
+      If False: a single `ReplaySample` per sampled item.
     """
+    if unpack_as_table_signature:
+      signature = self._get_signature_for_table(table)
+    else:
+      signature = None
+
+    if signature:
+      unflatten = lambda x: tree.unflatten_as(signature, x)
+    else:
+      unflatten = lambda x: x
+
     sampler = self.new_sampler(table, num_samples, timeout_ms=timeout_ms)
     for _ in range(num_samples):
       try:
@@ -700,7 +733,20 @@ class LocalClient:
           times_sampled=int(flat[4]),
       )
       data = flat[len(info):]
-      yield replay_sample.ReplaySample(info=info, data=data)
+
+      if emit_timesteps:
+        if len(set([len(col) for col in data])) != 1:
+          raise ValueError(
+              'Can\'t split non timestep trajectory into timesteps.')
+        timesteps = []
+        for i in range(data[0].shape[0]):
+          timestep = replay_sample.ReplaySample(
+              info=info,
+              data=unflatten([np.asarray(col[i], col.dtype) for col in data]))
+          timesteps.append(timestep)
+        yield timesteps
+      else:
+        yield replay_sample.ReplaySample(info, unflatten(data))
 
   def mutate_priorities(self,
                         table: str,
@@ -721,6 +767,11 @@ class LocalClient:
     for proto_string in proto_strings:
       table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
       table_infos[table_info.name] = table_info
+    if not self._signature_cache:
+      self._signature_cache = {
+          table: info.signature
+          for table, info in table_infos.items()
+      }
     return table_infos
 
   def checkpoint(self) -> str:

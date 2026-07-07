@@ -2,7 +2,6 @@ load(
     "//reverb/cc/platform:build_rules.bzl",
     "reverb_cc_proto_library",
     "reverb_py_proto_library",
-    "reverb_py_test",
     "reverb_pytype_strict_binary",
     "reverb_pytype_strict_library",
 )
@@ -39,18 +38,6 @@ reverb_pytype_strict_library(
     ],
 )
 
-reverb_py_test(
-    name = "server_from_proto_test",
-    srcs = ["server_from_proto_test.py"],
-    enable_dashboard = False,
-    deps = [
-        ":server_from_proto",
-        "//reverb",
-        "//reverb/cc:schema_py_pb2",
-        "//reverb/cc/checkpointing:checkpoint_py_pb2",
-    ],
-)
-
 reverb_pytype_strict_binary(
     name = "server_main",
     srcs = ["server_main.py"],
@@ -64,3 +51,5 @@ reverb_pytype_strict_binary(
         "//reverb/platform/default:server_main_command_line_args",
     ],
 )
+
+# ponytail: server_from_proto_test 已迁移至 //reverb/tests:server_from_proto_test。

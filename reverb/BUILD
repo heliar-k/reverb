@@ -3,12 +3,10 @@
 load(
     "//reverb/cc/platform:build_rules.bzl",
     "reverb_cc_shared_library",
-    "reverb_py_test",
     "reverb_pybind_deps",
     "reverb_pybind_extension",
     "reverb_pytype_library",
     "reverb_pytype_strict_library",
-    "reverb_tf_deps",
 )
 
 package(
@@ -245,96 +243,9 @@ reverb_pytype_library(
     ],
 )
 
-reverb_py_test(
-    name = "rate_limiters_test",
-    srcs = ["rate_limiters_test.py"],
-    deps = [
-        ":rate_limiters",
-    ],
-)
-
-reverb_py_test(
-    name = "trajectory_writer_test",
-    srcs = ["trajectory_writer_test.py"],
-    deps = [
-        ":client",
-        ":errors",
-        ":pybind",
-        ":server",
-        ":trajectory_writer",
-    ],
-)
-
-reverb_py_test(
-    name = "replay_sample_test",
-    srcs = ["replay_sample_test.py"],
-    deps = [
-        ":pybind",
-        ":replay_sample",
-    ],
-)
-
-reverb_py_test(
-    name = "server_test",
-    srcs = ["server_test.py"],
-    deps = [
-        ":item_selectors",
-        ":pybind",
-        ":rate_limiters",
-        ":server",
-        ":signature_codec",
-    ],
-)
-
-reverb_py_test(
-    name = "client_test",
-    srcs = ["client_test.py"],
-    deps = [
-        ":client",
-        ":errors",
-        ":item_selectors",
-        ":rate_limiters",
-        ":server",
-    ],
-)
-
-reverb_py_test(
-    name = "structured_writer_test",
-    srcs = ["structured_writer_test.py"],
-    deps = [
-        ":client",
-        ":server",
-        ":signature_codec",
-        ":structured_writer",
-    ],
-)
-
-# ponytail: 普通 py_test(非 reverb_py_test)以避免隐式拉入 @pypi//tf_nightly
-# 到运行时 import 路径。内嵌 numpy 模式不需要 TF;:reverb 仍作 build 依赖,
-# 但 __init__.py 会 try/except 跳过 ensure_tf_install。
-py_test(
-    name = "in_process_test",
-    srcs = ["in_process_test.py"],
-    main = "in_process_test.py",
-    python_version = "PY3",
-    deps = [
-        ":reverb",
-        "@pypi//numpy",
-    ],
-)
-
-# ponytail: P4 — gRPC 模式(numpy-only)端到端冒烟。Server(in_process=False) +
-# Client(gRPC),走 InsertStream/Writer 路径。无 TF 签名。
-py_test(
-    name = "grpc_roundtrip_test",
-    srcs = ["grpc_roundtrip_test.py"],
-    main = "grpc_roundtrip_test.py",
-    python_version = "PY3",
-    deps = [
-        ":reverb",
-        "@pypi//numpy",
-        "@pypi//portpicker",
-    ],
-)
+# ponytail: Python 测试已迁移至 //reverb/tests(见 reverb/tests/BUILD)。
+# 原 reverb_py_test/py_test 目标(rate_limiters_test / trajectory_writer_test /
+# replay_sample_test / server_test / client_test / structured_writer_test /
+# in_process_test / grpc_roundtrip_test)与此处的 *_test.py 源文件一并移走。
 
 

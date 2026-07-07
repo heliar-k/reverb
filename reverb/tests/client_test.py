@@ -493,5 +493,174 @@ class ClientTest(absltest.TestCase):
       self.client.trajectory_writer(-1)
 
 
+# ponytail: 边界覆盖补充——Client/Writer/LocalClient 导出方法的穷尽分支。
+class ClientBoundaryTest(ClientTest):
+  """Reuses ClientTest's setUpClass server/client fixtures."""
+
+  def test_structured_writer_empty_configs_raises(self):
+    with self.assertRaises(ValueError):
+      self.client.structured_writer([])
+
+  def test_server_address_property(self):
+    self.assertEqual(self.client.server_address,
+                     f'localhost:{self.server.port}')
+
+  def test_client_repr(self):
+    r = repr(self.client)
+    self.assertIn('Client', r)
+    self.assertIn('localhost', r)
+
+  def test_pickle_round_trip_address(self):
+    import pickle
+    loaded = pickle.loads(pickle.dumps(self.client))
+    self.assertEqual(loaded.server_address, self.client.server_address)
+
+  def test_checkpoint_returns_path(self):
+    path = self.client.checkpoint()
+    self.assertIsInstance(path, str)
+    self.assertTrue(path)
+
+  def test_writer_repr(self):
+    w = self.client.writer(2)
+    r = repr(w)
+    self.assertIn('closed', r)
+    w.close()
+
+
+class WriterBoundaryTest(absltest.TestCase):
+  """Writer lifecycle / validation edges not covered by ClientTest."""
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls._server = server.Server(
+        tables=[
+            server.Table(
+                name=TABLE_NAME,
+                sampler=item_selectors.Fifo(),
+                remover=item_selectors.Fifo(),
+                max_size=100,
+                rate_limiter=rate_limiters.MinSize(1)),
+        ])
+    cls.client = cls._server.localhost_client()
+
+  @classmethod
+  def tearDownClass(cls):
+    cls._server.stop()
+    super().tearDownClass()
+
+  def test_close_twice_raises(self):
+    w = self.client.writer(2)
+    w.close()
+    with self.assertRaises(ValueError):
+      w.close()
+
+  def test_create_item_zero_timesteps_raises(self):
+    w = self.client.writer(2)
+    with self.assertRaises(ValueError):
+      w.create_item(TABLE_NAME, 0, 1.0)
+    w.close()
+
+  def test_create_item_negative_timesteps_raises(self):
+    w = self.client.writer(2)
+    with self.assertRaises(ValueError):
+      w.create_item(TABLE_NAME, -1, 1.0)
+    w.close()
+
+  def test_context_manager_closes(self):
+    with self.client.writer(2) as w:
+      w.append([1])
+    # Reusing a closed writer via the context manager protocol raises.
+    with self.assertRaises(ValueError):
+      with w:
+        pass
+
+  def test_flush_is_idempotent(self):
+    w = self.client.writer(2)
+    w.flush()
+    w.flush()
+    w.close()
+
+  def test_append_sequence(self):
+    with self.client.writer(3) as w:
+      w.append_sequence([np.array([1, 2, 3])])
+      w.create_item(TABLE_NAME, 2, 1.0)
+
+
+class LocalClientBoundaryTest(absltest.TestCase):
+  """LocalClient (in-process numpy mode) specific edges."""
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls._server = server.Server(
+        tables=[
+            server.Table(
+                name=TABLE_NAME,
+                sampler=item_selectors.Fifo(),
+                remover=item_selectors.Fifo(),
+                max_size=100,
+                rate_limiter=rate_limiters.MinSize(1)),
+        ],
+        in_process=True)
+    cls.client = cls._server.in_process_client
+
+  @classmethod
+  def tearDownClass(cls):
+    super().tearDownClass()
+
+  def test_repr(self):
+    self.assertIn('LocalClient', repr(self.client))
+
+  def test_trajectory_writer_invalid_refs_raises(self):
+    with self.assertRaises(ValueError):
+      self.client.trajectory_writer(table=TABLE_NAME, num_keep_alive_refs=0)
+
+  def test_trajectory_writer_negative_refs_raises(self):
+    with self.assertRaises(ValueError):
+      self.client.trajectory_writer(table=TABLE_NAME, num_keep_alive_refs=-1)
+
+  def test_trajectory_writer_max_chunk_length(self):
+    w = self.client.trajectory_writer(
+        table=TABLE_NAME, num_keep_alive_refs=2, max_chunk_length=1)
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+    w.end_episode()
+
+  def test_new_sampler_timeout_raises(self):
+    # MinSize(5) but no items: sampling must block and raise DeadlineExceeded.
+    srv = server.Server(
+        tables=[
+            server.Table(
+                name='blocked',
+                sampler=item_selectors.Fifo(),
+                remover=item_selectors.Fifo(),
+                max_size=10,
+                rate_limiter=rate_limiters.MinSize(5)),
+        ],
+        in_process=True)
+    c = srv.in_process_client
+    with self.assertRaises(errors.DeadlineExceededError):
+      list(c.sample('blocked', num_samples=1, timeout_ms=200))
+
+  def test_mutate_priorities_no_args_is_noop(self):
+    # No updates/deletes -> should not raise.
+    self.client.mutate_priorities(TABLE_NAME)
+
+  def test_reset_unknown_table(self):
+    # reset on an unknown table surfaces a C++ error; assert it raises.
+    with self.assertRaises(Exception):
+      self.client.reset('nonexistent_table')
+
+  def test_server_info(self):
+    info = self.client.server_info()
+    self.assertIn(TABLE_NAME, info)
+    self.assertEqual(info[TABLE_NAME].max_size, 100)
+
+  def test_checkpoint(self):
+    path = self.client.checkpoint()
+    self.assertIsInstance(path, str)
+    self.assertTrue(path)
+
+
 if __name__ == '__main__':
   absltest.main()

@@ -15,7 +15,8 @@
 # ==============================================================================
 #
 # Executes Reverb Python tests using the installed Reverb package.
-
+#
+# Tests live in reverb/tests/ (migrated from the historical per-module locations).
 # Usage (expects Reverb to be installed):
 #   bash run_python_tests.sh
 set +x
@@ -25,7 +26,7 @@ py_test() {
 
   echo "===========Running Python tests============"
 
-  for test_file in `find reverb/ -name '*_test.py' -print`
+  for test_file in `find reverb/tests/ -name '*_test.py' -print`
   do
     echo "####=======Testing ${test_file}=======####"
     python3 "${test_file}"
