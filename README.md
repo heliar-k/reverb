@@ -140,9 +140,8 @@ with client.trajectory_writer(table='my_table', num_keep_alive_refs=10) as w:
     w.flush()
 
 # 采样
-# emit_timesteps=False 让每个采样的 item 返回单个 ReplaySample；
-# 默认 True 会把 trajectory 拆成逐 timestep 的 list。
-for sample in client.sample('my_table', num_samples=4, emit_timesteps=False):
+# LocalClient.sample 默认 emit_timesteps=False，每个 item 返回单个 ReplaySample。
+for sample in client.sample('my_table', num_samples=4):
     print(sample.data[0])  # numpy array
 ```
 

@@ -22,7 +22,7 @@ reverb_py_test(
     ],
 )
 
-# ponytail: 临时——验证 examples/*.ipynb 代码单元格可在纯 numpy 内嵌模式下跑通。
+# Runs examples/*.ipynb code cells in a pure-numpy embedded mode as a regression guard.
 reverb_py_test(
     name = "examples_notebook_test",
     srcs = ["examples_notebook_test.py"],

@@ -1,8 +1,8 @@
-"""Validates that the example notebooks' code runs end-to-end (numpy, no TF).
+"""Regression test: runs the example notebooks' code cells end-to-end.
 
 Extracts code cells from examples/demo.ipynb and examples/frame_stacking.ipynb
-and executes them in order. Temporary; can be deleted once the notebooks are
-confirmed.
+and executes them in order (numpy-only, no TF) to guard against regressions
+in the example code paths.
 """
 
 import json
@@ -19,7 +19,8 @@ _EXAMPLES_DIR = os.path.join(
 
 
 def _code_cells(nb_path, skip_install=True):
-  nb = json.load(open(nb_path))
+  with open(nb_path) as f:
+    nb = json.load(f)
   cells = []
   for c in nb['cells']:
     if c['cell_type'] != 'code':

@@ -7,3 +7,10 @@
 
 # AI agent working notes
 /docs/superpowers/
+/task_plan.md
+/findings.md
+/progress.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc

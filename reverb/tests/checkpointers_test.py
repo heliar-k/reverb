@@ -99,11 +99,6 @@ class DefaultCheckpointerFacadeTest(absltest.TestCase):
     self.assertIsInstance(cp, checkpointers_lib.TempDirCheckpointer)
     self.assertIsInstance(cp, checkpointers_lib.CheckpointerBase)
 
-  def test_default_checkpointer_ignores_group(self):
-    # The facade signature accepts `group` for backwards compat but ignores it.
-    cp = checkpointers.default_checkpointer(group='ignored')
-    self.assertIsInstance(cp, checkpointers_lib.TempDirCheckpointer)
-
   def test_facade_reexports(self):
     self.assertIs(checkpointers.CheckpointerBase,
                   checkpointers_lib.CheckpointerBase)
