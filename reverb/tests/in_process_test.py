@@ -35,8 +35,14 @@ from reverb.platform.default import checkpointers
 
 
 def _make_server(table_name='t', max_size=10, min_size=1,
-                 sampler=None, remover=None, max_times_sampled=0):
-  """Builds a single-table in-process server with the given strategies."""
+                 sampler=None, remover=None, max_times_sampled=1):
+  """Builds a single-table in-process server with the given strategies.
+
+  `max_times_sampled` defaults to 1 to mirror `Table.queue`: an item is removed
+  after one draw, so sampling N items returns N distinct items. Tests that need
+  over-sampling (drawing more items than were inserted) must pass
+  `max_times_sampled=0` explicitly.
+  """
   return reverb.Server(
       tables=[
           reverb.Table(
@@ -120,9 +126,11 @@ class InProcessWriteSampleTest(absltest.TestCase):
 class InProcessSelectorTest(absltest.TestCase):
 
   def test_uniform_replay(self):
+    # Over-samples (5 inserted, 20 drawn) so items must be reusable.
     server = _make_server(
         table_name='u', max_size=50, min_size=1,
-        sampler=reverb.selectors.Uniform())
+        sampler=reverb.selectors.Uniform(),
+        max_times_sampled=0)
     client = server.in_process_client
 
     values = [float(i) for i in range(5)]
@@ -152,9 +160,11 @@ class InProcessSelectorTest(absltest.TestCase):
     self.assertEqual(order, [3.0, 2.0, 1.0, 0.0])
 
   def test_prioritized_replay(self):
+    # Over-samples (2 inserted, 100 drawn) so items must be reusable.
     server = _make_server(
         table_name='p', max_size=20, min_size=1,
-        sampler=reverb.selectors.Prioritized(1.0))
+        sampler=reverb.selectors.Prioritized(1.0),
+        max_times_sampled=0)
     client = server.in_process_client
 
     _insert_one(client, 'p', np.array([0.0], dtype=np.float32), priority=0.1)
@@ -202,9 +212,13 @@ class InProcessDtypesTest(absltest.TestCase):
 class InProcessRateLimiterTest(absltest.TestCase):
 
   def test_rate_limiter_min_size(self):
+    # MinSize(5) blocks sampling while the table holds < 5 items. With
+    # max_times_sampled=1 each draw deletes an item, so drawing 5 would drain
+    # the table below the limit mid-way and deadlock; keep items reusable.
     server = _make_server(
         table_name='r', max_size=20, min_size=5,
-        sampler=reverb.selectors.Fifo())
+        sampler=reverb.selectors.Fifo(),
+        max_times_sampled=0)
     client = server.in_process_client
 
     for i in range(5):
