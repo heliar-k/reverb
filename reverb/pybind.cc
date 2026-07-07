@@ -805,6 +805,80 @@ PYBIND11_MODULE(libpybind, m) {
   // InProcessClient: zero-gRPC client that holds Tables directly. Used by the
   // Python `Server(in_process=True)` path. The gRPC-backed `Client`/`Writer`
   // bindings are defined above.
+  // ponytail: PascalCase aliases mirror the gRPC `Client` naming so that
+  // `reverb/client.py` can share one code path between `Client` and
+  // `LocalClient`. Both names are bound to the same callable; no behavior diff.
+  auto new_sampler_fn =
+      [](InProcessClient* client, const std::string& table,
+         int64_t max_samples, size_t buffer_size,
+         int64_t rate_limiter_timeout_ms) -> Sampler* {
+        Sampler::Options options;
+        options.max_samples = max_samples;
+        options.max_in_flight_samples_per_worker = buffer_size;
+        options.rate_limiter_timeout =
+            Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
+        std::unique_ptr<Sampler> sampler;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->NewSampler(table, options, &sampler);
+        }
+        MaybeRaiseFromStatus(status);
+        return sampler.release();
+      };
+  auto mutate_priorities_fn =
+      [](InProcessClient* client, const std::string& table,
+         const std::vector<std::pair<uint64_t, double>>& updates,
+         const std::vector<uint64_t>& deletes) {
+        std::vector<KeyWithPriority> update_protos;
+        for (const auto &update : updates) {
+          update_protos.emplace_back();
+          update_protos.back().set_key(update.first);
+          update_protos.back().set_priority(update.second);
+        }
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->MutatePriorities(table, update_protos, deletes);
+        }
+        MaybeRaiseFromStatus(status);
+      };
+  auto reset_fn = [](InProcessClient* client, const std::string& table) {
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->Reset(table);
+    }
+    MaybeRaiseFromStatus(status);
+  };
+  auto checkpoint_fn = [](InProcessClient* client) {
+    std::string path;
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->Checkpoint(&path);
+    }
+    MaybeRaiseFromStatus(status);
+    return path;
+  };
+  auto server_info_fn = [](InProcessClient* client) {
+    std::vector<TableInfo> table_info;
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->ServerInfo(&table_info);
+    }
+    MaybeRaiseFromStatus(status);
+
+    // Return a list of serialized TableInfo proto bytes strings.
+    std::vector<py::bytes> serialized_table_info;
+    serialized_table_info.reserve(table_info.size());
+    for (const auto &info : table_info) {
+      serialized_table_info.push_back(py::bytes(info.SerializeAsString()));
+    }
+    return serialized_table_info;
+  };
+
   py::class_<InProcessClient, std::shared_ptr<InProcessClient>>(
       m, "InProcessClient")
       .def(py::init<std::vector<std::shared_ptr<Table>>,
@@ -831,8 +905,20 @@ PYBIND11_MODULE(libpybind, m) {
       .def(
           "new_structured_writer",
           [](InProcessClient* client, const std::string& table,
-             std::vector<StructuredWriterConfig> configs)
+             std::vector<std::string> serialized_configs)
               -> StructuredWriter* {
+            std::vector<StructuredWriterConfig> configs;
+            for (const auto &serialised_config : serialized_configs) {
+              configs.emplace_back();
+              if (!configs.back().ParseFromString(
+                      std::string(serialised_config))) {
+                MaybeRaiseFromStatus(absl::InvalidArgumentError(absl::StrCat(
+                    "Unable to deserialize StructuredWriterConfig from "
+                    "serialized proto bytes: '",
+                    std::string(serialised_config), "'")));
+                return nullptr;
+              }
+            }
             std::unique_ptr<StructuredWriter> writer;
             absl::Status status;
             {
@@ -844,69 +930,24 @@ PYBIND11_MODULE(libpybind, m) {
             return writer.release();
           },
           py::arg("table"), py::arg("configs"))
-      .def(
-          "new_sampler",
-          [](InProcessClient* client, const std::string& table,
-             int64_t max_samples, size_t buffer_size,
-             int64_t rate_limiter_timeout_ms) -> Sampler* {
-            Sampler::Options options;
-            options.max_samples = max_samples;
-            options.max_in_flight_samples_per_worker = buffer_size;
-            options.rate_limiter_timeout =
-                Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
-            std::unique_ptr<Sampler> sampler;
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = client->NewSampler(table, options, &sampler);
-            }
-            MaybeRaiseFromStatus(status);
-            return sampler.release();
-          },
-          py::arg("table"), py::arg("max_samples") = 1,
-          py::arg("buffer_size") = 1,
-          // -1 (or any negative) means wait forever (InfiniteDuration).
-          py::arg("rate_limiter_timeout_ms") = -1)
-      .def(
-          "mutate_priorities",
-          [](InProcessClient* client, const std::string& table,
-             const std::vector<std::pair<uint64_t, double>>& updates,
-             const std::vector<uint64_t>& deletes) {
-            std::vector<KeyWithPriority> update_protos;
-            for (const auto &update : updates) {
-              update_protos.emplace_back();
-              update_protos.back().set_key(update.first);
-              update_protos.back().set_priority(update.second);
-            }
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = client->MutatePriorities(table, update_protos, deletes);
-            }
-            MaybeRaiseFromStatus(status);
-          },
-          py::arg("table"), py::arg("updates"), py::arg("deletes"))
-      .def("reset",
-           [](InProcessClient* client, const std::string& table) {
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->Reset(table);
-             }
-             MaybeRaiseFromStatus(status);
-           },
-           py::arg("table"))
-      .def("checkpoint",
-           [](InProcessClient* client) {
-             std::string path;
-             absl::Status status;
-             {
-               py::gil_scoped_release g;
-               status = client->Checkpoint(&path);
-             }
-             MaybeRaiseFromStatus(status);
-             return path;
-           })
+      .def("new_sampler", new_sampler_fn,
+           py::arg("table"), py::arg("max_samples") = 1,
+           py::arg("buffer_size") = 1,
+           // -1 (or any negative) means wait forever (InfiniteDuration).
+           py::arg("rate_limiter_timeout_ms") = -1)
+      .def("NewSampler", new_sampler_fn,
+           py::arg("table"), py::arg("max_samples") = 1,
+           py::arg("buffer_size") = 1,
+           // -1 (or any negative) means wait forever (InfiniteDuration).
+           py::arg("rate_limiter_timeout_ms") = -1)
+      .def("mutate_priorities", mutate_priorities_fn,
+           py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("MutatePriorities", mutate_priorities_fn,
+           py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("reset", reset_fn, py::arg("table"))
+      .def("Reset", reset_fn, py::arg("table"))
+      .def("checkpoint", checkpoint_fn)
+      .def("Checkpoint", checkpoint_fn)
       .def("load_latest",
            [](InProcessClient* client) {
              absl::Status status;
@@ -926,26 +967,8 @@ PYBIND11_MODULE(libpybind, m) {
              MaybeRaiseFromStatus(status);
            },
            py::arg("path"))
-      .def(
-          "server_info",
-          [](InProcessClient* client) {
-            std::vector<TableInfo> table_info;
-            absl::Status status;
-            {
-              py::gil_scoped_release g;
-              status = client->ServerInfo(&table_info);
-            }
-            MaybeRaiseFromStatus(status);
-
-            // Return a list of serialized TableInfo proto bytes strings.
-            std::vector<py::bytes> serialized_table_info;
-            serialized_table_info.reserve(table_info.size());
-            for (const auto &info : table_info) {
-              serialized_table_info.push_back(
-                  py::bytes(info.SerializeAsString()));
-            }
-            return serialized_table_info;
-          });
+      .def("server_info", server_info_fn)
+      .def("ServerInfo", server_info_fn);
 }  // NOLINT(readability/fn_size)
 
 }  // namespace

@@ -16,8 +16,8 @@
 
 `Client` is used to connect and interact with a Reverb server. The client
 exposes direct methods for both inserting (i.e `insert`) and sampling (i.e
-`sample`) but users should prefer to use `TrajectoryWriter` and
-`TrajectoryDataset` directly whenever possible.
+`sample`) but users should prefer to use `TrajectoryWriter` directly whenever
+possible.
 """
 
 import logging
@@ -178,10 +178,6 @@ class Writer:
     """Flushes the stream to the ReverbService.
 
     This method sends any pending items from the local buffer to the service.
-
-    Raises:
-      tf.errors.OpError: If there is trouble packing or sending the data, e.g.
-        if shapes are inconsistent or if there was data loss.
     """
     self._writer.Flush()
 
@@ -198,8 +194,6 @@ class Writer:
 
     Raises:
       ValueError: If `close` has already been called once.
-      tf.errors.OpError: If there is trouble packing or sending the data, e.g.
-        if shapes are inconsistent or if there was data loss.
     """
     if self._closed:
       raise ValueError('close() has already been called on Writer.')
@@ -207,12 +201,240 @@ class Writer:
     self._writer.Close(retry_on_unavailable)
 
 
-class Client:
+class _BaseClient:
+  """Shared logic between gRPC `Client` and in-process `LocalClient`.
+
+  Both clients implement the same `sample`/`mutate_priorities`/`reset`/
+  `server_info`/`checkpoint`/`_get_signature_for_table` semantics; only the
+  underlying C++ call signatures differ (gRPC `ServerInfo(timeout)` vs.
+  in-process `server_info()`, and gRPC `NewSampler` has no rate-limiter
+  timeout). Those differences are captured in two hooks implemented by each
+  subclass: `_fetch_server_info_proto` and `_new_sampler`.
+  """
+
+  def __init__(self):
+    # Subclasses assign `self._client` and `self._server_address` (gRPC only).
+    self._signature_cache: Dict[str, Any] = {}
+
+  # Default for `sample(emit_timesteps=...)` when the caller omits the arg.
+  # gRPC `Client` keeps the historical True (back-compat); the in-process
+  # `LocalClient` defaults to False since embedded callers almost always want
+  # whole trajectories, not timestep-split lists.
+  _default_emit_timesteps: bool = True
+
+  def _fetch_server_info_proto(self, timeout: Optional[int]):
+    """Fetches serialized TableInfo proto strings from the C++ client.
+
+    Subclasses implement the C++ call difference (gRPC passes a timeout,
+    in-process ignores it). Returns a sequence of `bytes`.
+    """
+    raise NotImplementedError
+
+  def _new_sampler(self, table: str, num_samples: int, buffer_size: int,
+                   timeout_ms: Optional[int]):
+    """Constructs a C++ `Sampler`.
+
+    The gRPC `NewSampler` does not take a rate-limiter timeout; the in-process
+    `NewSampler` does. Subclasses pass `timeout_ms` through or ignore it.
+    """
+    raise NotImplementedError
+
+  def _get_signature_for_table(self, table: str):
+    if not self._signature_cache:
+      self.server_info()  # Populates the cache.
+
+    if table not in self._signature_cache:
+      raise ValueError(
+          f'Could not find table "{table}". The following tables exists: '
+          f'{", ".join(self._signature_cache.keys())}.')
+
+    return self._signature_cache[table]
+
+  def server_info(
+      self,
+      timeout: Optional[int] = None
+  ) -> Dict[str, reverb_types.TableInfo]:
+    """Get table metadata information.
+
+    Args:
+      timeout: Timeout in seconds to wait for server response. By default no
+        deadline is set and call will block indefinetely until server responds.
+        Ignored by the in-process `LocalClient` (which has no C++ timeout).
+
+    Returns:
+      A dictionary mapping table names to their associated `TableInfo`
+      instances, which contain metadata about the table.
+
+    Raises:
+      errors.DeadlineExceededError: If timeout provided and exceeded.
+    """
+    info_proto_strings = self._fetch_server_info_proto(timeout)
+
+    table_infos = {}
+    for proto_string in info_proto_strings:
+      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
+      table_infos[table_info.name] = table_info
+
+    # Refresh the signature cache on every call so that table replacements
+    # (e.g. Table.replace) are reflected. Mirrors the C++ Client::ServerInfo
+    # "Forces an update of internal signature caches" semantics.
+    self._signature_cache = {
+        table: info.signature
+        for table, info in table_infos.items()
+    }
+
+    return table_infos
+
+  def mutate_priorities(self,
+                        table: str,
+                        updates: Optional[Dict[int, float]] = None,
+                        deletes: Optional[List[int]] = None):
+    """Updates and/or deletes existing items in a priority table.
+
+    NOTE: Prefer `TrajectoryWriter` for bulk priority management.
+
+    Actions are executed in the same order as the arguments are specified.
+
+    Args:
+      table: Name of the priority table to update.
+      updates: Mapping from priority item key to new priority value. If a key
+        cannot be found then it is ignored.
+      deletes: List of keys for priority items to delete. If a key cannot be
+        found then it is ignored.
+    """
+    if updates is None:
+      updates = {}
+    if deletes is None:
+      deletes = []
+    self._client.MutatePriorities(table, list(updates.items()), deletes)
+
+  def reset(self, table: str):
+    """Clears all items of the table and resets its RateLimiter.
+
+    Args:
+      table: Name of the priority table to reset.
+    """
+    self._client.Reset(table)
+
+  def checkpoint(self) -> str:
+    """Triggers a checkpoint to be created.
+
+    Returns:
+      Absolute path to the saved checkpoint.
+    """
+    return self._client.Checkpoint()
+
+  def sample(
+      self,
+      table: str,
+      num_samples: int = 1,
+      *,
+      emit_timesteps: Optional[bool] = None,
+      unpack_as_table_signature: bool = False,
+      timeout_ms: Optional[int] = None,
+  ) -> Generator[Union[List[replay_sample.ReplaySample],
+                       replay_sample.ReplaySample], None, None]:
+    """Samples `num_samples` items from table `table` of the Server.
+
+    NOTE: This method is not optimized for high-throughput training; prefer
+    `TrajectoryWriter` for bulk inserts.
+
+    Note: If data was written using `insert` (e.g when inserting complete
+    trajectories) then the returned "sequence" will be a list of length 1
+    containing the trajectory as a single item.
+
+    If `num_samples` is greater than the number of items in `table`, (or
+    a rate limiter is used to control sampling), then the returned generator
+    will block when an item past the sampling limit is requested.  It will
+    unblock when sufficient additional items have been added to `table`.
+
+    Args:
+      table: Name of the priority table to sample from.
+      num_samples: (default to 1) The number of samples to fetch.
+      emit_timesteps: If True then trajectories are returned as a list of
+        `ReplaySample`, each representing a single step within the trajectory.
+        If False, a single `ReplaySample` per sampled item is yielded. If
+        `None` (default), falls back to the client's
+        `_default_emit_timesteps` (`True` for the gRPC `Client`, `False` for
+        the in-process `LocalClient`).
+      unpack_as_table_signature: If True then the sampled data is unpacked
+        according to the structure of the table signature. If the table does
+        not have a signature then flat data is returned.
+      timeout_ms: Per-sample rate-limiter timeout in milliseconds. `None` waits
+        forever. A positive value raises `reverb.errors.DeadlineExceededError`
+        if the table's rate limiter blocks longer than `timeout_ms`. Ignored by
+        the gRPC `Client` (whose C++ `NewSampler` has no timeout parameter).
+
+    Yields:
+      If `emit_timesteps` is `True`:
+
+        Lists of timesteps (lists of instances of `ReplaySample`).
+        If data was inserted into the table via `insert`, then each element
+        of the generator is a length 1 list containing a `ReplaySample`.
+        If data was inserted via a writer, then each element is a list whose
+        length is the sampled trajectory's length.
+
+      If emit_timesteps is False:
+
+        An instance of `ReplaySample` where the data is unpacked according to
+        the signature of the table. If the table does not have any signature
+        then the data is flat, i.e each element is a leaf node of the full
+        trajectory.
+
+    Raises:
+      ValueError: If `emit_timestep` is True but the trajectory cannot be
+        decomposed into timesteps.
+    """
+    if emit_timesteps is None:
+      emit_timesteps = self._default_emit_timesteps
+
+    buffer_size = 1
+
+    if unpack_as_table_signature:
+      signature = self._get_signature_for_table(table)
+    else:
+      signature = None
+
+    if signature:
+      unflatten = lambda x: tree.unflatten_as(signature, x)
+    else:
+      unflatten = lambda x: x
+
+    sampler = self._new_sampler(table, num_samples, buffer_size, timeout_ms)
+
+    for _ in range(num_samples):
+      sample = sampler.GetNextTrajectory()
+
+      info = replay_sample.SampleInfo(
+          key=int(sample[0]),
+          probability=float(sample[1]),
+          table_size=int(sample[2]),
+          priority=float(sample[3]),
+          times_sampled=int(sample[4]))
+      data = sample[len(info):]
+
+      if emit_timesteps:
+        if len(set([len(col) for col in data])) != 1:
+          raise ValueError(
+              'Can\'t split non timestep trajectory into timesteps.')
+
+        timesteps = []
+        for i in range(data[0].shape[0]):
+          timestep = replay_sample.ReplaySample(
+              info=info,
+              data=unflatten([np.asarray(col[i], col.dtype) for col in data]))
+          timesteps.append(timestep)
+
+        yield timesteps
+      else:
+        yield replay_sample.ReplaySample(info, unflatten(data))
+
+
+class Client(_BaseClient):
   """Client for interacting with a Reverb ReverbService from Python.
 
   Note: This client should primarily be used when inserting data or prototyping
   at very small scale.
-  Whenever possible, prefer to use TFClient (see ./tf_client.py).
   """
 
   def __init__(self, server_address: str):
@@ -221,9 +443,9 @@ class Client:
     Args:
       server_address: Address to the Reverb ReverbService.
     """
+    super().__init__()
     self._server_address = server_address
     self._client = pybind.Client(server_address)
-    self._signature_cache = {}
 
   def __reduce__(self):
     return self.__class__, (self._server_address,)
@@ -241,8 +463,8 @@ class Client:
     Note: The data is only stored once even if samples are inserted into
     multiple priority tables.
 
-    Note: When possible, prefer to use the in graph version (see ./tf_client.py)
-    to avoid stepping through Python.
+    Note: Prefer `TrajectoryWriter` for streaming inserts to avoid stepping
+    through Python per item.
 
     Args:
       data: A (possible nested) structure to insert.
@@ -341,191 +563,15 @@ class Client:
         self._client.NewWriter(chunk_length, max_sequence_length, delta_encoded,
                                max_in_flight_items))
 
-  def sample(
-      self,
-      table: str,
-      num_samples: int = 1,
-      *,
-      emit_timesteps: bool = True,
-      unpack_as_table_signature: bool = False,
-  ) -> Generator[Union[List[replay_sample.ReplaySample],
-                       replay_sample.ReplaySample], None, None]:
-    """Samples `num_samples` items from table `table` of the Server.
+  def _fetch_server_info_proto(self, timeout: Optional[int]):
+    # gRPC `ServerInfo` takes a timeout in seconds (0 == wait forever).
+    return self._client.ServerInfo(timeout or 0)
 
-    NOTE: This method should NOT be used for real training. TrajectoryDataset
-    and TimestepDataset should always be preferred over this method.
-
-    Note: If data was written using `insert` (e.g when inserting complete
-    trajectories) then the returned "sequence" will be a list of length 1
-    containing the trajectory as a single item.
-
-    If `num_samples` is greater than the number of items in `table`, (or
-    a rate limiter is used to control sampling), then the returned generator
-    will block when an item past the sampling limit is requested.  It will
-    unblock when sufficient additional items have been added to `table`.
-
-    Example:
-
-    ```python
-
-    server = Server(..., tables=[queue("queue", ...)])
-    client = Client(...)
-
-    # Don't insert anything into "queue"
-    generator = client.sample("queue")
-    generator.next()  # Blocks until another thread/process writes to queue.
-
-    ```
-
-    Args:
-      table: Name of the priority table to sample from.
-      num_samples: (default to 1) The number of samples to fetch.
-      emit_timesteps: If True then trajectories are returned as a list of
-        `ReplaySample`, each representing a single step within the trajectory.
-      unpack_as_table_signature: If True then the sampled data is unpacked
-        according to the structure of the table signature. If the table does
-        not have a signature then flat data is returned.
-
-    Yields:
-      If `emit_timesteps` is `True`:
-
-        Lists of timesteps (lists of instances of `ReplaySample`).
-        If data was inserted into the table via `insert`, then each element
-        of the generator is a length 1 list containing a `ReplaySample`.
-        If data was inserted via a writer, then each element is a list whose
-        length is the sampled trajectory's length.
-
-      If emit_timesteps is False:
-
-        An instance of `ReplaySample` where the data is unpacked according to
-        the signature of the table. If the table does not have any signature
-        then the data is flat, i.e each element is a leaf node of the full
-        trajectory.
-
-    Raises:
-      ValueError: If `emit_timestep` is True but the trajectory cannot be
-        decomposed into timesteps.
-    """
-    buffer_size = 1
-
-    if unpack_as_table_signature:
-      signature = self._get_signature_for_table(table)
-    else:
-      signature = None
-
-    if signature:
-      unflatten = lambda x: tree.unflatten_as(signature, x)
-    else:
-      unflatten = lambda x: x
-
-    sampler = self._client.NewSampler(table, num_samples, buffer_size)
-
-    for _ in range(num_samples):
-      sample = sampler.GetNextTrajectory()
-
-      info = replay_sample.SampleInfo(
-          key=int(sample[0]),
-          probability=float(sample[1]),
-          table_size=int(sample[2]),
-          priority=float(sample[3]),
-          times_sampled=int(sample[4]))
-      data = sample[len(info):]
-
-      if emit_timesteps:
-        if len(set([len(col) for col in data])) != 1:
-          raise ValueError(
-              'Can\'t split non timestep trajectory into timesteps.')
-
-        timesteps = []
-        for i in range(data[0].shape[0]):
-          timestep = replay_sample.ReplaySample(
-              info=info,
-              data=unflatten([np.asarray(col[i], col.dtype) for col in data]))
-          timesteps.append(timestep)
-
-        yield timesteps
-      else:
-        yield replay_sample.ReplaySample(info, unflatten(data))
-
-  def mutate_priorities(self,
-                        table: str,
-                        updates: Optional[Dict[int, float]] = None,
-                        deletes: Optional[List[int]] = None):
-    """Updates and/or deletes existing items in a priority table.
-
-    NOTE: Whenever possible, prefer to use `TFClient.update_priorities`
-    instead to avoid leaving the graph.
-
-    Actions are executed in the same order as the arguments are specified.
-
-    Args:
-      table: Name of the priority table to update.
-      updates: Mapping from priority item key to new priority value. If a key
-        cannot be found then it is ignored.
-      deletes: List of keys for priority items to delete. If a key cannot be
-        found then it is ignored.
-    """
-    if updates is None:
-      updates = {}
-    if deletes is None:
-      deletes = []
-    self._client.MutatePriorities(table, list(updates.items()), deletes)
-
-  def reset(self, table: str):
-    """Clears all items of the table and resets its RateLimiter.
-
-    Args:
-      table: Name of the priority table to reset.
-    """
-    self._client.Reset(table)
-
-  def server_info(self,
-                  timeout: Optional[int] = None
-                 ) -> Dict[str, reverb_types.TableInfo]:
-    """Get table metadata information.
-
-    Args:
-      timeout: Timeout in seconds to wait for server response. By default no
-        deadline is set and call will block indefinetely until server responds.
-
-    Returns:
-      A dictionary mapping table names to their associated `TableInfo`
-      instances, which contain metadata about the table.
-
-    Raises:
-      errors.DeadlineExceededError: If timeout provided and exceeded.
-    """
-    try:
-      info_proto_strings = self._client.ServerInfo(timeout or 0)
-    except RuntimeError as e:
-      if 'Deadline Exceeded' in str(e) and timeout is not None:
-        raise errors.DeadlineExceededError(
-            f'ServerInfo call did not complete within provided timeout of '
-            f'{timeout}s')
-      raise
-
-    table_infos = {}
-    for proto_string in info_proto_strings:
-      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
-      table_infos[table_info.name] = table_info
-
-    # Populate the signature cache if this is the first time server_info is
-    # (successfully) called.
-    if not self._signature_cache:
-      self._signature_cache = {
-          table: info.signature
-          for table, info in table_infos.items()
-      }
-
-    return table_infos
-
-  def checkpoint(self) -> str:
-    """Triggers a checkpoint to be created.
-
-    Returns:
-      Absolute path to the saved checkpoint.
-    """
-    return self._client.Checkpoint()
+  def _new_sampler(self, table: str, num_samples: int, buffer_size: int,
+                   timeout_ms: Optional[int]):
+    # gRPC `NewSampler` has no rate-limiter timeout parameter; `timeout_ms`
+    # is accepted for parity with `LocalClient` but ignored here.
+    return self._client.NewSampler(table, num_samples, buffer_size)
 
   def trajectory_writer(self,
                         num_keep_alive_refs: int,
@@ -590,19 +636,8 @@ class Client:
     from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
     return structured_writer_lib.StructuredWriter(cpp_writer)
 
-  def _get_signature_for_table(self, table: str):
-    if not self._signature_cache:
-      self.server_info()  # Populates the cache.
 
-    if table not in self._signature_cache:
-      raise ValueError(
-          f'Could not find table "{table}". The following tables exists: '
-          f'{", ".join(self._signature_cache.keys())}.')
-
-    return self._signature_cache[table]
-
-
-class LocalClient:
+class LocalClient(_BaseClient):
   """Python wrapper around the C++ `InProcessClient` for embedded mode.
 
   Provides a numpy-friendly API mirroring the historical `Client`: writers are
@@ -611,9 +646,14 @@ class LocalClient:
   is required.
   """
 
+  # Embedded callers almost always want whole trajectories, not
+  # timestep-split lists, so default `sample(emit_timesteps=...)` to False.
+  # (The gRPC `Client` keeps True for backwards compatibility.)
+  _default_emit_timesteps = False
+
   def __init__(self, internal_client: 'pybind.InProcessClient'):
+    super().__init__()
     self._client = internal_client
-    self._signature_cache = {}
 
   def __repr__(self):
     return 'LocalClient (in-process, numpy)'
@@ -653,6 +693,37 @@ class LocalClient:
     from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
     return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
+  def structured_writer(self, table: str, configs):
+    """Constructs a `StructuredWriter` bound to `table` in local mode.
+
+    Unlike the gRPC `Client.structured_writer` (where each config names its
+    target table), the local in-process writer is bound to a single `table`.
+    The `table` field of each config is therefore ignored by the C++ path;
+    callers should still populate it for parity with the gRPC API.
+
+    Args:
+      table: Name of the table that items created by this writer are inserted
+        into.
+      configs: Configurations describing how the writer should transform the
+        sequence of steps into table insertions.
+
+    Returns:
+      A `StructuredWriter` context manager.
+
+    Raises:
+      ValueError: If `configs` is empty.
+    """
+    if not configs:
+      raise ValueError('At least one config must be provided.')
+    # Serialize configs to bytes; the C++ `InProcessClient.new_structured_writer`
+    # (like `Client.NewStructuredWriter`) takes `vector<string>` and re-parses
+    # them internally, so the Python proto objects are never handed to C++
+    # directly.
+    serialized_configs = [config.SerializeToString() for config in configs]
+    cpp_writer = self._client.new_structured_writer(table, serialized_configs)
+    from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
+    return structured_writer_lib.StructuredWriter(cpp_writer)
+
   def new_sampler(self, table: str, num_samples: int = 1, buffer_size: int = 1,
                    timeout_ms: Optional[int] = None):
     """Constructs a `Sampler` over `table` in local mode.
@@ -671,108 +742,16 @@ class LocalClient:
     return self._client.new_sampler(
         table, num_samples, buffer_size, timeout_ms_arg)
 
-  def _get_signature_for_table(self, table: str):
-    if not self._signature_cache:
-      self.server_info()  # Populates the cache.
-    if table not in self._signature_cache:
-      raise ValueError(
-          f'Could not find table "{table}". The following tables exists: '
-          f'{", ".join(self._signature_cache.keys())}.')
-    return self._signature_cache[table]
+  def _fetch_server_info_proto(self, timeout: Optional[int]):
+    # In-process `ServerInfo` has no C++ timeout; `timeout` is accepted for
+    # parity with the gRPC `Client` hook but ignored here. Uses the PascalCase
+    # alias added in pybind.cc to exercise the unified naming.
+    return self._client.ServerInfo()
 
-  def sample(self, table: str, num_samples: int = 1,
-             *, emit_timesteps: bool = True,
-             unpack_as_table_signature: bool = False,
-             timeout_ms: Optional[int] = None):
-    """Yields `ReplaySample` objects sampled from `table`.
-
-    Args:
-      table: Name of the table to sample from.
-      num_samples: Number of samples to yield.
-      emit_timesteps: If True then trajectories are returned as a list of
-        `ReplaySample`, each representing a single step within the trajectory.
-        If False, a single `ReplaySample` per sampled item is yielded.
-      unpack_as_table_signature: If True then the sampled data is unpacked
-        according to the structure of the table signature. If the table has no
-        signature then flat data (a list of column arrays) is returned.
-      timeout_ms: Rate-limiter timeout in milliseconds per sample. `None` waits
-        forever. A positive value raises `reverb.errors.DeadlineExceededError`
-        if the table's rate limiter blocks longer than `timeout_ms`.
-
-    Yields:
-      If `emit_timesteps` is True: lists of `ReplaySample` (one per step).
-      If False: a single `ReplaySample` per sampled item.
-    """
-    if unpack_as_table_signature:
-      signature = self._get_signature_for_table(table)
-    else:
-      signature = None
-
-    if signature:
-      unflatten = lambda x: tree.unflatten_as(signature, x)
-    else:
-      unflatten = lambda x: x
-
-    sampler = self.new_sampler(table, num_samples, timeout_ms=timeout_ms)
-    for _ in range(num_samples):
-      try:
-        flat = sampler.GetNextTrajectory()
-      except RuntimeError as e:
-        # The C++ layer returns absl::DeadlineExceededError, which pybind maps
-        # to RuntimeError (no DeadlineExceeded mapping in MaybeRaiseFromStatus).
-        # Mirror the server_info() conversion below.
-        if 'Deadline Exceeded' in str(e) or 'Timeout exceeded' in str(e):
-          raise errors.DeadlineExceededError(
-              f'Rate limiter blocked longer than timeout_ms={timeout_ms}ms')
-        raise
-      info = replay_sample.SampleInfo(
-          key=int(flat[0]),
-          probability=float(flat[1]),
-          table_size=int(flat[2]),
-          priority=float(flat[3]),
-          times_sampled=int(flat[4]),
-      )
-      data = flat[len(info):]
-
-      if emit_timesteps:
-        if len(set([len(col) for col in data])) != 1:
-          raise ValueError(
-              'Can\'t split non timestep trajectory into timesteps.')
-        timesteps = []
-        for i in range(data[0].shape[0]):
-          timestep = replay_sample.ReplaySample(
-              info=info,
-              data=unflatten([np.asarray(col[i], col.dtype) for col in data]))
-          timesteps.append(timestep)
-        yield timesteps
-      else:
-        yield replay_sample.ReplaySample(info, unflatten(data))
-
-  def mutate_priorities(self,
-                        table: str,
-                        updates: Optional[Dict[int, float]] = None,
-                        deletes: Optional[List[int]] = None):
-    if updates is None:
-      updates = {}
-    if deletes is None:
-      deletes = []
-    self._client.mutate_priorities(table, list(updates.items()), deletes)
-
-  def reset(self, table: str):
-    self._client.reset(table)
-
-  def server_info(self) -> Dict[str, reverb_types.TableInfo]:
-    proto_strings = self._client.server_info()
-    table_infos = {}
-    for proto_string in proto_strings:
-      table_info = reverb_types.TableInfo.from_serialized_proto(proto_string)
-      table_infos[table_info.name] = table_info
-    if not self._signature_cache:
-      self._signature_cache = {
-          table: info.signature
-          for table, info in table_infos.items()
-      }
-    return table_infos
-
-  def checkpoint(self) -> str:
-    return self._client.checkpoint()
+  def _new_sampler(self, table: str, num_samples: int, buffer_size: int,
+                   timeout_ms: Optional[int]):
+    # -1 is the C++ sentinel for InfiniteDuration (see sampler.h). Uses the
+    # PascalCase alias added in pybind.cc to exercise the unified naming.
+    timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
+    return self._client.NewSampler(
+        table, num_samples, buffer_size, timeout_ms_arg)

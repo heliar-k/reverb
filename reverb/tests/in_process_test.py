@@ -28,7 +28,9 @@ import numpy as np
 
 import reverb
 from reverb import errors
+from reverb import replay_sample
 from reverb import signature_codec
+from reverb import structured_writer
 from reverb.platform.default import checkpointers
 
 
@@ -73,7 +75,7 @@ class InProcessWriteSampleTest(absltest.TestCase):
           table='t', priority=1.0, trajectory={'obs': w.history['obs'][:]})
       w.flush()
 
-    samples = list(client.sample('t', num_samples=1, emit_timesteps=False))
+    samples = list(client.sample('t', num_samples=1))
     self.assertLen(samples, 1)
     np.testing.assert_allclose(
         np.asarray(samples[0].data[0]), [[1.0, 2.0]])
@@ -92,7 +94,7 @@ class InProcessWriteSampleTest(absltest.TestCase):
       )
       w.flush()
 
-    samples = list(client.sample('q', num_samples=1, emit_timesteps=False))
+    samples = list(client.sample('q', num_samples=1))
     np.testing.assert_allclose(
         np.asarray(samples[0].data[0]), [[0.0], [1.0], [2.0]])
 
@@ -128,7 +130,7 @@ class InProcessSelectorTest(absltest.TestCase):
       _insert_one(client, 'u', np.array([v], dtype=np.float32))
 
     seen = set()
-    for sample in client.sample('u', num_samples=20, emit_timesteps=False):
+    for sample in client.sample('u', num_samples=20):
       seen.add(float(np.asarray(sample.data[0]).reshape(-1)[0]))
     self.assertTrue(seen.issubset(set(values)), seen)
     self.assertGreaterEqual(len(seen), 3, seen)
@@ -145,7 +147,7 @@ class InProcessSelectorTest(absltest.TestCase):
 
     order = [
         float(np.asarray(sample.data[0]).reshape(-1)[0])
-        for sample in client.sample('l', num_samples=4, emit_timesteps=False)
+        for sample in client.sample('l', num_samples=4)
     ]
     self.assertEqual(order, [3.0, 2.0, 1.0, 0.0])
 
@@ -159,7 +161,7 @@ class InProcessSelectorTest(absltest.TestCase):
     _insert_one(client, 'p', np.array([1.0], dtype=np.float32), priority=100.0)
 
     counts = {0.0: 0, 1.0: 0}
-    for sample in client.sample('p', num_samples=100, emit_timesteps=False):
+    for sample in client.sample('p', num_samples=100):
       val = float(np.asarray(sample.data[0]).reshape(-1)[0])
       counts[val] += 1
     self.assertGreater(counts[1.0], counts[0.0], counts)
@@ -183,7 +185,7 @@ class InProcessDtypesTest(absltest.TestCase):
     for arr in cases:
       _insert_one(client, 'd', arr)
 
-    samples = list(client.sample('d', num_samples=len(cases), emit_timesteps=False))
+    samples = list(client.sample('d', num_samples=len(cases)))
     self.assertLen(samples, len(cases))
     for arr, sample in zip(cases, samples):
       got = np.asarray(sample.data[0]).reshape(-1)[0]
@@ -208,7 +210,7 @@ class InProcessRateLimiterTest(absltest.TestCase):
     for i in range(5):
       _insert_one(client, 'r', np.array([float(i)], dtype=np.float32))
 
-    samples = list(client.sample('r', num_samples=5, emit_timesteps=False))
+    samples = list(client.sample('r', num_samples=5))
     self.assertLen(samples, 5)
 
   def test_rate_limiter_timeout(self):
@@ -222,7 +224,7 @@ class InProcessRateLimiterTest(absltest.TestCase):
 
     start = time.time()
     with self.assertRaises(errors.DeadlineExceededError):
-      list(client.sample('r', num_samples=1, timeout_ms=500, emit_timesteps=False))
+      list(client.sample('r', num_samples=1, timeout_ms=500))
     elapsed = time.time() - start
     self.assertLess(elapsed, 5.0, f'timeout took too long: {elapsed:.1f}s')
 
@@ -232,8 +234,22 @@ class InProcessRateLimiterTest(absltest.TestCase):
         sampler=reverb.selectors.Fifo())
     client = server.in_process_client
     _insert_one(client, 'n', np.array([42.0], dtype=np.float32))
-    samples = list(client.sample('n', num_samples=1, emit_timesteps=False))
+    samples = list(client.sample('n', num_samples=1))
     self.assertLen(samples, 1)
+
+  def test_raw_sampler_raises_deadline_exceeded(self):
+    # MinSize(5), no items: the raw pybind Sampler.GetNextTrajectory must raise
+    # reverb.errors.DeadlineExceededError directly (not RuntimeError).
+    srv = reverb.Server(
+        tables=[reverb.Table(
+            name='blocked', sampler=reverb.selectors.Fifo(),
+            remover=reverb.selectors.Fifo(), max_size=10,
+            rate_limiter=reverb.rate_limiters.MinSize(5))],
+        in_process=True)
+    c = srv.in_process_client
+    sampler = c.new_sampler('blocked', num_samples=1, timeout_ms=200)
+    with self.assertRaises(errors.DeadlineExceededError):
+      sampler.GetNextTrajectory()
 
 
 class InProcessCheckpointTest(absltest.TestCase):
@@ -270,9 +286,41 @@ class InProcessCheckpointTest(absltest.TestCase):
 
     restored = [
         float(np.asarray(sample.data[0]).reshape(-1)[0])
-        for sample in client_b.sample('c', num_samples=len(values), emit_timesteps=False)
+        for sample in client_b.sample('c', num_samples=len(values))
     ]
     self.assertEqual(restored, values)
+
+  def test_corrupt_checkpoint_raises(self):
+    # A CORRUPT checkpoint must surface as an exception on Server construction,
+    # not be silently swallowed (which would mean silent data loss).
+    root = tempfile.mkdtemp()
+    table = lambda: reverb.Table(
+        name='c', sampler=reverb.selectors.Fifo(),
+        remover=reverb.selectors.Fifo(), max_size=10,
+        max_times_sampled=1, rate_limiter=reverb.rate_limiters.MinSize(1))
+    srv = reverb.Server(tables=[table()], in_process=True,
+                        checkpointer=checkpointers.DefaultCheckpointer(path=root))
+    ckpt_path = srv.in_process_client.checkpoint()
+    srv.stop()
+    # Corrupt the checkpoint: overwrite tables.ckpt with garbage.
+    with open(os.path.join(ckpt_path, 'tables.ckpt'), 'wb') as f:
+      f.write(b'corrupt-garbage-not-a-proto')
+    # Constructing a new server must NOT silently swallow the corruption.
+    with self.assertRaises(Exception):
+      reverb.Server(tables=[table()], in_process=True,
+                    checkpointer=checkpointers.DefaultCheckpointer(path=root))
+
+  def test_first_start_no_checkpoint_is_benign(self):
+    # A FRESH empty checkpointer dir must NOT raise on Server construction.
+    root = tempfile.mkdtemp()  # empty
+    table = lambda: reverb.Table(
+        name='c', sampler=reverb.selectors.Fifo(),
+        remover=reverb.selectors.Fifo(), max_size=10,
+        max_times_sampled=1, rate_limiter=reverb.rate_limiters.MinSize(1))
+    srv = reverb.Server(tables=[table()], in_process=True,
+                        checkpointer=checkpointers.DefaultCheckpointer(path=root))
+    # And the table is empty (no phantom data restored).
+    self.assertEqual(srv.in_process_client.server_info()['c'].current_size, 0)
 
 
 class InProcessSignatureUnpackTest(absltest.TestCase):
@@ -307,7 +355,6 @@ class InProcessSignatureUnpackTest(absltest.TestCase):
 
     # unpack_as_table_signature=True -> data 是 dict
     sample = next(client.sample('t', num_samples=1,
-                                emit_timesteps=False,
                                 unpack_as_table_signature=True))
     self.assertIsInstance(sample.data, dict)
     self.assertEqual(set(sample.data.keys()), {'obs', 'action'})
@@ -336,7 +383,6 @@ class InProcessSignatureUnpackTest(absltest.TestCase):
 
     # unpack_as_table_signature=False -> data 是 flat list
     sample = next(client.sample('t', num_samples=1,
-                                emit_timesteps=False,
                                 unpack_as_table_signature=False))
     self.assertIsInstance(sample.data, list)
     np.testing.assert_array_equal(
@@ -360,7 +406,6 @@ class InProcessSignatureUnpackTest(absltest.TestCase):
       w.flush()
 
     sample = next(client.sample('t', num_samples=1,
-                                emit_timesteps=False,
                                 unpack_as_table_signature=True))
     # signature=None -> flat list
     self.assertIsInstance(sample.data, list)
@@ -377,6 +422,257 @@ class InProcessSignatureUnpackTest(absltest.TestCase):
       next(client.sample('nonexistent', num_samples=1,
                         unpack_as_table_signature=True,
                         timeout_ms=100))
+
+
+class InProcessStructuredWriterTest(absltest.TestCase):
+  """LocalClient.structured_writer end-to-end (in-process / numpy).
+
+  Mirrors the gRPC `StructuredWriterTest` flow but routes through the
+  in-process `LocalClient`, whose writer is bound to a single table.
+  """
+
+  def test_trajectory_pattern(self):
+    # Mirror of gRPC test_trajectory_patterns: a 3-window over a scalar
+    # column yields one trajectory of length 3.
+    server = _make_server(table_name='sw', max_size=50, min_size=1)
+    client = server.in_process_client
+
+    step_spec = {'a': np.zeros([], np.float32)}
+    ref_step = structured_writer.create_reference_step(step_spec)
+    pattern = {'x': ref_step['a'][-3:]}  # last 3 steps of column 'a'
+    config = structured_writer.create_config(pattern=pattern, table='sw')
+
+    writer = client.structured_writer(table='sw', configs=[config])
+    for i in range(3):
+      writer.append(np.asarray(float(i), dtype=np.float32))
+    writer.end_episode()
+
+    samples = list(client.sample('sw', num_samples=1))
+    self.assertLen(samples, 1)
+    np.testing.assert_array_equal(np.asarray(samples[0].data[0]), [0., 1., 2.])
+
+  def test_empty_configs_raises(self):
+    server = _make_server(table_name='sw', max_size=10, min_size=1)
+    client = server.in_process_client
+    with self.assertRaises(ValueError):
+      client.structured_writer(table='sw', configs=[])
+
+
+class InProcessSignatureCacheRefreshTest(absltest.TestCase):
+  """Regression for A4: server_info() must refresh the signature cache.
+
+  Previously the cache was only populated when empty ("if this is the first
+  time"), so once filled it never reflected table replacements. Now every
+  server_info() call re-derives the cache, mirroring the C++
+  Client::ServerInfo "Forces an update of internal signature caches" semantics.
+  """
+
+  def _server_with_signature(self, sig):
+    return reverb.Server(
+        tables=[reverb.Table(
+            name='t', sampler=reverb.selectors.Fifo(),
+            remover=reverb.selectors.Fifo(), max_size=10,
+            max_times_sampled=1,
+            rate_limiter=reverb.rate_limiters.MinSize(1), signature=sig)],
+        in_process=True)
+
+  def test_server_info_refreshes_cache_on_every_call(self):
+    # The cache must track the live server state, not freeze after the first
+    # successful call. We corrupt the cache after the first call and assert
+    # that a second call restores it to the real signature.
+    sig = {'v': signature_codec.TensorSpec([None, 1], np.float32, 'v')}
+    client = self._server_with_signature(sig).in_process_client
+
+    info = client.server_info()
+    self.assertEqual(set(client._signature_cache.keys()), {'t'})
+    cached_before = client._signature_cache['t']
+
+    # Simulate a stale/frozen cache (the bug: non-empty cache was never
+    # overwritten). Clobber it with a bogus value.
+    client._signature_cache = {'t': 'STALE_BOGUS'}
+
+    info2 = client.server_info()
+    # Cache must now reflect the refreshed value, not the clobbered one.
+    self.assertNotEqual(client._signature_cache['t'], 'STALE_BOGUS')
+    self.assertEqual(client._signature_cache['t'], cached_before)
+    self.assertEqual(client._signature_cache['t'], info2['t'].signature)
+
+  def test_cache_matches_returned_signature_after_refresh(self):
+    # The refreshed cache must equal the signature carried by the very
+    # TableInfo that server_info() returns.
+    sig = {'v': signature_codec.TensorSpec([None], np.int32, 'v')}
+    client = self._server_with_signature(sig).in_process_client
+    client.server_info()  # populate
+    # Second call on a now-populated cache must still refresh and stay
+    # consistent with the returned TableInfo.
+    info = client.server_info()
+    self.assertEqual(client._signature_cache['t'], info['t'].signature)
+
+
+def _make_grpc_table(table_name='t', max_size=10, min_size=1,
+                   max_times_sampled=1):
+  return reverb.Table(
+      name=table_name,
+      sampler=reverb.selectors.Fifo(),
+      remover=reverb.selectors.Fifo(),
+      max_size=max_size,
+      max_times_sampled=max_times_sampled,
+      rate_limiter=reverb.rate_limiters.MinSize(min_size),
+  )
+
+
+def _insert_local(client, table, value):
+  with client.trajectory_writer(table=table, num_keep_alive_refs=1) as w:
+    w.append({'v': np.asarray(value)})
+    w.create_item(
+        table=table, priority=1.0,
+        trajectory={'v': w.history['v'][:]})
+    w.flush()
+
+
+class ClientLocalClientParityTest(absltest.TestCase):
+  """Regression guard for the _BaseClient convergence (task A3).
+
+  Asserts that the gRPC `Client` and the in-process `LocalClient` agree on the
+  shared `_BaseClient` surface: `server_info`, `sample`, `mutate_priorities`,
+  `reset`, and `checkpoint`. Each test spins up a fresh (gRPC, local) server
+  pair with the sampler semantics it needs.
+  """
+
+  TABLE = 't'
+
+  def _make_pair(self, max_times_sampled=1):
+    """Returns (grpc_client, grpc_server, local_client, local_server)."""
+    grpc_server = reverb.Server(
+        tables=[_make_grpc_table(self.TABLE,
+                                 max_times_sampled=max_times_sampled)])
+    grpc = grpc_server.localhost_client()
+    local_server = _make_server(max_times_sampled=max_times_sampled)
+    return grpc, grpc_server, local_server.in_process_client, local_server
+
+  def _insert_both(self, grpc, local, value):
+    # gRPC `Client.insert` takes (data, priorities) and stores a flat column.
+    grpc.insert(np.asarray(value), {self.TABLE: 1.0})
+    # LocalClient has no `insert`; mirror it via the trajectory writer.
+    _insert_local(local, self.TABLE, value)
+
+  def test_server_info_parity(self):
+    grpc, grpc_server, local, local_server = self._make_pair()
+    try:
+      self._insert_both(grpc, local, 1)
+      grpc_info = grpc.server_info()
+      local_info = local.server_info()
+      self.assertEqual(set(grpc_info), {self.TABLE})
+      self.assertEqual(set(local_info), {self.TABLE})
+      self.assertEqual(grpc_info[self.TABLE].max_size,
+                       local_info[self.TABLE].max_size)
+      self.assertEqual(grpc_info[self.TABLE].current_size,
+                       local_info[self.TABLE].current_size)
+    finally:
+      grpc_server.stop()
+
+  def _val(self, sample):
+    return float(np.asarray(sample.data[0]).reshape(-1)[0])
+
+  def test_sample_parity_fifo(self):
+    # max_times_sampled=1 => each item sampled once; FIFO returns them in
+    # insertion order, deterministically, on both clients.
+    grpc, grpc_server, local, local_server = self._make_pair(
+        max_times_sampled=1)
+    try:
+      for v in (10, 20, 30):
+        self._insert_both(grpc, local, v)
+
+      grpc_samples = list(grpc.sample(self.TABLE, num_samples=3,
+                                      emit_timesteps=False))
+      local_samples = list(local.sample(self.TABLE, num_samples=3))
+      self.assertLen(grpc_samples, 3)
+      self.assertLen(local_samples, 3)
+      self.assertEqual([self._val(s) for s in grpc_samples],
+                       [self._val(s) for s in local_samples])
+      self.assertEqual([self._val(s) for s in grpc_samples], [10.0, 20.0, 30.0])
+    finally:
+      grpc_server.stop()
+
+  def test_mutate_priorities_parity(self):
+    # Single item + max_times_sampled=0 (unlimited) so the same key can be
+    # sampled before and after the priority mutation on both clients.
+    grpc, grpc_server, local, local_server = self._make_pair(
+        max_times_sampled=0)
+    try:
+      self._insert_both(grpc, local, 1)
+
+      grpc_key = next(grpc.sample(self.TABLE, 1,
+                                  emit_timesteps=False)).info.key
+      local_key = next(local.sample(self.TABLE, 1)).info.key
+
+      # Mutating priorities must not raise on either client and must surface
+      # the new priority on the next sample of the same key.
+      grpc.mutate_priorities(self.TABLE, updates={grpc_key: 42.0})
+      local.mutate_priorities(self.TABLE, updates={local_key: 42.0})
+      grpc_prio = next(grpc.sample(self.TABLE, 1,
+                                   emit_timesteps=False)).info.priority
+      local_prio = next(local.sample(self.TABLE, 1)).info.priority
+      self.assertEqual(grpc_prio, 42.0)
+      self.assertEqual(local_prio, 42.0)
+    finally:
+      grpc_server.stop()
+
+  def test_reset_parity(self):
+    grpc, grpc_server, local, local_server = self._make_pair()
+    try:
+      self._insert_both(grpc, local, 1)
+      self._insert_both(grpc, local, 2)
+      grpc.reset(self.TABLE)
+      local.reset(self.TABLE)
+      self.assertEqual(grpc.server_info()[self.TABLE].current_size, 0)
+      self.assertEqual(local.server_info()[self.TABLE].current_size, 0)
+    finally:
+      grpc_server.stop()
+
+  def test_checkpoint_parity(self):
+    grpc, grpc_server, local, local_server = self._make_pair()
+    try:
+      self._insert_both(grpc, local, 1)
+      grpc_path = grpc.checkpoint()
+      local_path = local.checkpoint()
+      self.assertIsInstance(grpc_path, str)
+      self.assertIsInstance(local_path, str)
+      self.assertTrue(grpc_path)
+      self.assertTrue(local_path)
+    finally:
+      grpc_server.stop()
+
+  def test_sample_emit_timesteps_defaults_differ(self):
+    # Regression for A7: LocalClient.sample defaults emit_timesteps=False
+    # (whole trajectory per item), while gRPC Client.sample defaults True
+    # (timestep-split list) for backwards compatibility. Callers can still
+    # override either.
+    grpc, grpc_server, local, local_server = self._make_pair(
+        max_times_sampled=0)
+    try:
+      self._insert_both(grpc, local, 1)
+
+      # LocalClient default: False -> a single ReplaySample per item.
+      local_default = next(local.sample(self.TABLE, 1))
+      self.assertIsInstance(local_default, replay_sample.ReplaySample)
+
+      # gRPC Client default: True -> a list of per-timestep ReplaySample.
+      grpc_default = next(grpc.sample(self.TABLE, 1))
+      self.assertIsInstance(grpc_default, list)
+      self.assertTrue(
+          all(isinstance(ts, replay_sample.ReplaySample)
+              for ts in grpc_default))
+
+      # Both honor an explicit override to the opposite default.
+      local_as_timesteps = next(
+          local.sample(self.TABLE, 1, emit_timesteps=True))
+      self.assertIsInstance(local_as_timesteps, list)
+      grpc_as_whole = next(
+          grpc.sample(self.TABLE, 1, emit_timesteps=False))
+      self.assertIsInstance(grpc_as_whole, replay_sample.ReplaySample)
+    finally:
+      grpc_server.stop()
 
 
 if __name__ == '__main__':
