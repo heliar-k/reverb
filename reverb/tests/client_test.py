@@ -27,15 +27,19 @@ from reverb import errors
 from reverb import item_selectors
 from reverb import rate_limiters
 from reverb import server
+from reverb import signature_codec
 import tree
 
 TABLE_NAME = 'table'
 NESTED_SIGNATURE_TABLE_NAME = 'nested_signature_table'
 SIMPLE_QUEUE_NAME = 'simple_queue'
-# ponytail: 原 QUEUE_SIGNATURE 用 tf.TensorSpec 构造 table signature;TF 已移除
-# 后 numpy-only 模式不支持构造 signature,全部置 None。保留表名与结构以便
-# 用例名称语义不变,signature 相关断言改为 assertIsNone。
-QUEUE_SIGNATURE = None
+
+# Table signatures use the pure-Python signature_codec.TensorSpec (no TF).
+TABLE_SIGNATURE = signature_codec.TensorSpec([], np.int64, 'table')
+QUEUE_SIGNATURE = {
+    'a': signature_codec.TensorSpec([3], np.int64, 'a'),
+    'b': signature_codec.TensorSpec([3, 2, 2], np.float32, 'b'),
+}
 
 
 class ClientTest(absltest.TestCase):
@@ -50,9 +54,7 @@ class ClientTest(absltest.TestCase):
             remover=item_selectors.Fifo(),
             max_size=1000,
             rate_limiter=rate_limiters.MinSize(3),
-            # ponytail: 原 signature=tf.TensorSpec(dtype=tf.int64, shape=[]);
-            # TF 移除后 numpy-only 不支持构造 signature,置 None。
-            signature=None,
+            signature=TABLE_SIGNATURE,
         ),
         server.Table.queue(
             name=NESTED_SIGNATURE_TABLE_NAME,
@@ -276,8 +278,7 @@ class ClientTest(absltest.TestCase):
     self.assertEqual(table.max_size, 1000)
     self.assertEqual(table.sampler_options.prioritized.priority_exponent, 1)
     self.assertTrue(table.remover_options.fifo)
-    # ponytail: signature 原 == tf.TensorSpec(...);numpy-only 置 None。
-    self.assertIsNone(table.signature)
+    self.assertEqual(table.signature, TABLE_SIGNATURE)
 
     self.assertIn(NESTED_SIGNATURE_TABLE_NAME, server_info)
     queue = server_info[NESTED_SIGNATURE_TABLE_NAME]
@@ -286,8 +287,7 @@ class ClientTest(absltest.TestCase):
     self.assertEqual(queue.max_size, 10)
     self.assertTrue(queue.sampler_options.fifo)
     self.assertTrue(queue.remover_options.fifo)
-    # ponytail: queue.signature 原 == QUEUE_SIGNATURE(tf.TensorSpec dict);置 None。
-    self.assertIsNone(queue.signature)
+    self.assertEqual(queue.signature, QUEUE_SIGNATURE)
 
     self.assertIn(SIMPLE_QUEUE_NAME, server_info)
     info = server_info[SIMPLE_QUEUE_NAME]
@@ -299,11 +299,8 @@ class ClientTest(absltest.TestCase):
     self.assertIsNone(info.signature)
 
   def test_sample_trajectory_with_signature(self):
-    # ponytail: 该表 signature 原为 QUEUE_SIGNATURE(tf.TensorSpec dict),
-    # unpack_as_table_signature=True 会按结构拆包成 dict。TF 移除后
-    # signature=None,unpack 退化为 flat 列表(同 without_signature 路径)。
-    # 降级:断言 flat 行为以保留用例(不删)。
-    # 恢复路径:重新支持 signature 后改回 dict 断言。
+    # The table has a signature; unpack_as_table_signature=True unpacks the
+    # sampled data into the signature's dict structure.
     with self.client.trajectory_writer(3) as writer:
       for _ in range(3):
         writer.append({
@@ -323,8 +320,11 @@ class ClientTest(absltest.TestCase):
                                      emit_timesteps=False,
                                      unpack_as_table_signature=True))
 
-    # signature=None -> flat 数据,每个元素代表整列。
-    want = [np.ones([3], np.int64), np.ones([3, 2, 2], np.float32)]
+    # The data should be unpacked as the structure of the table signature.
+    want = {
+        'a': np.ones([3], np.int64),
+        'b': np.ones([3, 2, 2], np.float32),
+    }
     tree.map_structure(np.testing.assert_array_equal, sample.data, want)
 
     # The info fields should all be scalars (i.e not batched by time).

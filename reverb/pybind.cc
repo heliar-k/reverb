@@ -56,6 +56,20 @@
 
 namespace {
 
+// Lazily fetches and caches reverb.errors.DeadlineExceededError so C++ statuses
+// with kDeadlineExceeded surface as the project's own exception type.
+// Lazy (not module-init): reverb.errors may not be imported when libpybind
+// inits; this is an error path so the import cost is irrelevant.
+// Thread-safe via C++11 magic statics; called with the GIL held.
+PyObject* DeadlineExceededPyExc() {
+  static PyObject* cls = []() -> PyObject* {
+    pybind11::object obj = pybind11::module::import("reverb.errors")
+                               .attr("DeadlineExceededError");
+    return obj.inc_ref().ptr();
+  }();
+  return cls;
+}
+
 // Converts non OK statuses to Python exceptions and throws. Does nothing for
 // OK statuses.
 inline void MaybeRaiseFromStatus(const absl::Status& status) {
@@ -69,6 +83,8 @@ inline void MaybeRaiseFromStatus(const absl::Status& status) {
 
     CODE_TO_PY_EXC(absl::StatusCode::kInvalidArgument, PyExc_ValueError)
     CODE_TO_PY_EXC(absl::StatusCode::kResourceExhausted, PyExc_IndexError)
+    CODE_TO_PY_EXC(absl::StatusCode::kDeadlineExceeded, DeadlineExceededPyExc())
+    CODE_TO_PY_EXC(absl::StatusCode::kNotFound, PyExc_FileNotFoundError)
     CODE_TO_PY_EXC(absl::StatusCode::kUnimplemented, PyExc_NotImplementedError)
     CODE_TO_PY_EXC(absl::StatusCode::kInternal, PyExc_RuntimeError)
 

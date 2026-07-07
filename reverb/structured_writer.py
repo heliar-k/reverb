@@ -18,7 +18,6 @@ TODO(b/204560248): Expand the documentation.
 """
 
 import copy
-import datetime
 import math
 
 from typing import Any, Callable, NewType, Optional, Sequence
@@ -190,15 +189,8 @@ class StructuredWriter:
       raise ValueError(
           f'block_until_num_items must be >= 0, got {block_until_num_items}')
 
-    try:
-      # pybind Flush 取 int timeout_ms(<=0 视为无限等待);None 需转为 0。
-      self._writer.Flush(block_until_num_items, timeout_ms or 0)
-    except RuntimeError as e:
-      if 'Timeout exceeded' in str(e) and timeout_ms is not None:
-        raise errors.DeadlineExceededError(
-            f'Flush call did not complete within provided timeout of '
-            f'{datetime.timedelta(milliseconds=timeout_ms)}')
-      raise
+    # pybind Flush 取 int timeout_ms(<=0 视为无限等待);None 需转为 0。
+    self._writer.Flush(block_until_num_items, timeout_ms or 0)
 
   def end_episode(self,
                   clear_buffers: bool = True,
@@ -222,14 +214,7 @@ class StructuredWriter:
     Raises:
       DeadlineExceededError: If operation did not complete before the timeout.
     """
-    try:
-      self._writer.EndEpisode(clear_buffers, timeout_ms)
-    except RuntimeError as e:
-      if 'Timeout exceeded' in str(e) and timeout_ms is not None:
-        raise errors.DeadlineExceededError(
-            f'End episode call did not complete within provided timeout of '
-            f'{datetime.timedelta(milliseconds=timeout_ms)}')
-      raise
+    self._writer.EndEpisode(clear_buffers, timeout_ms)
 
   @property
   def step_is_open(self) -> bool:

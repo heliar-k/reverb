@@ -39,8 +39,8 @@ constexpr DataTypeMapping kMappings[] = {
     {DataType::Uint32,     NPY_UINT32,     ::reverb::tensor::DT_UINT32,     "Uint32",     4},
     {DataType::Uint64,     NPY_UINT64,     ::reverb::tensor::DT_UINT64,     "Uint64",     8},
     {DataType::Bool,       NPY_BOOL,       ::reverb::tensor::DT_BOOL,       "Bool",       1},
-    {DataType::Complex64,  NPY_COMPLEX64,  ::reverb::tensor::DT_COMPLEX64,  "Complex64",  4},
-    {DataType::Complex128, NPY_COMPLEX128, ::reverb::tensor::DT_COMPLEX128, "Complex128", 8},
+    {DataType::Complex64,  NPY_COMPLEX64,  ::reverb::tensor::DT_COMPLEX64,  "Complex64",  8},
+    {DataType::Complex128, NPY_COMPLEX128, ::reverb::tensor::DT_COMPLEX128, "Complex128", 16},
     {DataType::String,     NPY_OBJECT,     ::reverb::tensor::DT_STRING,     "String",     0},
     {DataType::Invalid,    NPY_NOTYPE,     ::reverb::tensor::DT_INVALID,    "Invalid",    0},
 };

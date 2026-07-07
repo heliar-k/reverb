@@ -1,8 +1,11 @@
+#include <complex>
+
 #include "reverb/cc/support/tensor_proxy.h"
 
 #include <gtest/gtest.h>
 #include "numpy/arrayobject.h"
 #include "pybind11/embed.h"
+#include "pybind11/complex.h"
 #include "pybind11/pybind11.h"
 
 namespace py = pybind11;
@@ -37,6 +40,22 @@ py::object MakeArrayInt(const std::vector<int32_t>& v, const std::string& dt) {
   py::list lst;
   for (int32_t x : v) lst.append(x);
   return np.attr("array")(lst, py::arg("dtype") = dt.c_str());
+}
+
+// 复数数组:把 std::complex 列表喂给 np.array(dtype=...)。依赖 pybind11 的
+// type_caster<std::complex<T>>(pybind11/complex.h)。
+py::object MakeArrayComplex64(const std::vector<std::complex<float>>& v) {
+  py::module np = py::module::import("numpy");
+  py::list lst;
+  for (const auto& z : v) lst.append(py::cast(z));
+  return np.attr("array")(lst, py::arg("dtype") = "complex64");
+}
+
+py::object MakeArrayComplex128(const std::vector<std::complex<double>>& v) {
+  py::module np = py::module::import("numpy");
+  py::list lst;
+  for (const auto& z : v) lst.append(py::cast(z));
+  return np.attr("array")(lst, py::arg("dtype") = "complex128");
 }
 
 // 从 numpy array 对象按 C-order 读一个标量(给定元素字节偏移)。
@@ -173,4 +192,63 @@ TEST(TensorBuffer, ZeroDimFromScalar) {
   py::object arr = np.attr("ascontiguousarray")(py::int_(42));
   auto status = TensorBuffer::FromNdArray(arr);
   EXPECT_TRUE(status.ok());
+}
+
+// RED: complex64 itemsize 当前为 4(np.complex64 = 2×float32 = 8 字节)。
+// TotalBytes 会返回 8(应 16);ToNdArray 的 memcpy 只拷 8 字节,虚部丢失。
+TEST(TensorBuffer, RoundTripComplex64) {
+  py::object arr =
+      MakeArrayComplex64({{1.0f, 2.0f}, {3.0f, 4.0f}});
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  EXPECT_EQ(buf.dtype(), DataType::Complex64);
+  EXPECT_EQ(buf.shape(), std::vector<int64_t>({2}));
+  EXPECT_EQ(buf.NumElements(), 2);
+  // 2 元素 × 8 字节 = 16。当前错返回 8。
+  EXPECT_EQ(buf.TotalBytes(), 16);
+  py::object out = buf.ToNdArray();
+  EXPECT_EQ(ReadScalar<std::complex<float>>(out, 0),
+            std::complex<float>(1.0f, 2.0f));
+  EXPECT_EQ(ReadScalar<std::complex<float>>(out, 1),
+            std::complex<float>(3.0f, 4.0f));
+}
+
+// RED: complex128 itemsize 当前为 8(np.complex128 = 2×float64 = 16 字节)。
+TEST(TensorBuffer, RoundTripComplex128) {
+  py::object arr =
+      MakeArrayComplex128({{1.0, 2.0}, {3.0, 4.0}});
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  EXPECT_EQ(buf.dtype(), DataType::Complex128);
+  // 2 元素 × 16 字节 = 32。当前错返回 16。
+  EXPECT_EQ(buf.TotalBytes(), 32);
+  py::object out = buf.ToNdArray();
+  EXPECT_EQ(ReadScalar<std::complex<double>>(out, 0),
+            std::complex<double>(1.0, 2.0));
+  EXPECT_EQ(ReadScalar<std::complex<double>>(out, 1),
+            std::complex<double>(3.0, 4.0));
+}
+
+// 覆盖 Concat 标量堆叠路径(最危险的 under-allocation 点):
+// 0-d 标量 N 个 Concat 成 [N],bytes.resize(N*itemsize)。itemsize 修复后应
+// 正确容纳全部复数。此为覆盖增补(修复已在),非 red-green。
+TEST(TensorBuffer, ConcatComplex64) {
+  py::module np = py::module::import("numpy");
+  // 2 个 0-d 复数标量,Concat 成 [2]。
+  std::vector<TensorBuffer> buffers;
+  buffers.push_back(
+      TensorBuffer::FromNdArray(np.attr("array")(
+          py::cast(std::complex<float>(1.0f, 2.0f)),
+          py::arg("dtype") = "complex64")).value());
+  buffers.push_back(
+      TensorBuffer::FromNdArray(np.attr("array")(
+          py::cast(std::complex<float>(3.0f, 4.0f)),
+          py::arg("dtype") = "complex64")).value());
+  auto merged = TensorBuffer::Concat(buffers).value();
+  EXPECT_EQ(merged.shape(), std::vector<int64_t>({2}));
+  // 2 元素 × 8 字节 = 16。
+  EXPECT_EQ(merged.TotalBytes(), 16);
+  py::object out = merged.ToNdArray();
+  EXPECT_EQ(ReadScalar<std::complex<float>>(out, 0),
+            std::complex<float>(1.0f, 2.0f));
+  EXPECT_EQ(ReadScalar<std::complex<float>>(out, 1),
+            std::complex<float>(3.0f, 4.0f));
 }

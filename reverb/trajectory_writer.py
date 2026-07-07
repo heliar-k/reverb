@@ -14,7 +14,6 @@
 
 """Implementation of the TrajectoryWriter."""
 
-import datetime
 import itertools
 import re
 
@@ -416,14 +415,7 @@ class TrajectoryWriter:
     if timeout_ms is None:
       timeout_ms = -1
 
-    try:
-      self._writer.Flush(block_until_num_items, timeout_ms)
-    except RuntimeError as e:
-      if 'Timeout exceeded' in str(e) and timeout_ms is not None:
-        raise errors.DeadlineExceededError(
-            f'Flush call did not complete within provided timeout of '
-            f'{datetime.timedelta(milliseconds=timeout_ms)}')
-      raise
+    self._writer.Flush(block_until_num_items, timeout_ms)
 
   def end_episode(self,
                   clear_buffers: bool = True,
@@ -443,14 +435,7 @@ class TrajectoryWriter:
     Raises:
       DeadlineExceededError: If operation did not complete before the timeout.
     """
-    try:
-      self._writer.EndEpisode(clear_buffers, timeout_ms)
-    except RuntimeError as e:
-      if 'Timeout exceeded' in str(e) and timeout_ms is not None:
-        raise errors.DeadlineExceededError(
-            f'End episode call did not complete within provided timeout of '
-            f'{datetime.timedelta(milliseconds=timeout_ms)}')
-      raise
+    self._writer.EndEpisode(clear_buffers, timeout_ms)
 
     if clear_buffers:
       for column in self._column_history:

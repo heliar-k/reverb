@@ -14,8 +14,7 @@
 
 """Python bindings for creating and serving the Reverb ReverbService.
 
-See ./client.py and ./tf_client.py for details of how to interact with the
-service.
+See ./client.py for details of how to interact with the service.
 """
 
 from __future__ import annotations
@@ -117,8 +116,8 @@ class Table:
         it is deleted. Any value < 1 is ignored and means there is no limit.
       extensions: Optional sequence of extensions used to add extra features to
         the table.
-      signature: Optional nested structure containing `tf.TypeSpec` objects,
-        describing the schema of items in this table.
+      signature: Optional nested structure containing `signature_codec.TensorSpec`
+        objects, describing the schema of items in this table.
 
     Raises:
       ValueError: If name is empty.
@@ -259,9 +258,9 @@ class Table:
         it is deleted, or None to re-use existing table's max_times_sampled.
       extensions: Optional sequence of extensions used to add extra features to
         the table, or None to re-use existing table's extensions.
-      signature: Optional nested structure containing `tf.TypeSpec` objects,
-        describing the schema of items in this table, or None to re-use existing
-        table's signature.
+      signature: Optional nested structure containing `signature_codec.TensorSpec`
+        objects, describing the schema of items in this table, or None to
+        re-use existing table's signature.
     Returns:
       Table with the same configuration as the original one (modulo overrides).
     """
@@ -297,8 +296,8 @@ class Server:
   """Reverb replay server.
 
   The Server hosts the gRPC-service deepmind.reverb.ReverbService (see
-  reverb_service.proto). See ./client.py and ./tf_client for details of how to
-  interact with the service.
+  reverb_service.proto). See ./client.py for details of how to interact with
+  the service.
 
   A Server maintains inserted data and one or more PriorityTables. Multiple
   tables can be used to provide different views of the same underlying and since
@@ -355,13 +354,13 @@ class Server:
       internal_client = pybind.InProcessClient(
           [table.internal_table for table in tables],
           checkpointer.internal_checkpointer())
-      # 恢复最新 checkpoint(若有)。首次启动无 checkpoint 是正常的 -> 警告不崩溃。
+      # 恢复最新 checkpoint(若有)。首次启动无 checkpoint(kNotFound)是正常的
+      # -> 警告不崩溃;其它错误(corrupt / disk / permission)必须传播。
       try:
         internal_client.load_latest()
-      except Exception as e:  # pylint: disable=broad-except
-        # NotFound -> RuntimeError(pybind 默认映射),首次启动正常。
+      except FileNotFoundError as e:
         import logging  # pylint: disable=g-import-not-at-top
-        logging.warning('In-process server did not restore a checkpoint: %s', e)
+        logging.warning('No checkpoint to restore (first start): %s', e)
       self._in_process_client = _client.LocalClient(internal_client)
     else:
       if port is None:
