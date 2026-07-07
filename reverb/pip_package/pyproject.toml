@@ -38,13 +38,13 @@ classifiers = [
     'Topic :: Software Development :: Libraries :: Python Modules',
 ]
 keywords = [
-    'tensorflow',
     'deepmind',
     'reinforcement',
     'machine',
     'learning',
     'replay',
     'jax',
+    'numpy',
 ]
 
 [project.urls]

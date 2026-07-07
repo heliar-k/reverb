@@ -30,58 +30,19 @@ do our best to keep things in working order, things may break or segfault.
 The recommended way to install Reverb is with `pip`. We also provide instructions
 to build from source using the same docker images we use for releases.
 
-TensorFlow can be installed separately or as part of the `pip` install.
-Installing TensorFlow as part of the install ensures compatibility.
+> This fork carries **no TensorFlow dependency**: data flows as numpy arrays.
+See the [In-process / numpy-only mode](#内嵌模式纯-numpy无-tensorflow) section
+for the embedded, zero-network-overhead usage. The original `Client`/`Writer`
+gRPC path is also available over a networked `Server(in_process=False)`.
 
 ```shell
-$ pip install dm-reverb[tensorflow]
-
-# Without Tensorflow install and version dependency check.
 $ pip install dm-reverb
-```
-
-### Nightly builds
-
-[![PyPI version](https://badge.fury.io/py/dm-reverb-nightly.svg)](https://badge.fury.io/py/dm-reverb-nightly)
-
-```shell
-$ pip install dm-reverb-nightly[tensorflow]
-
-# Without Tensorflow install and version dependency check.
-$ pip install dm-reverb-nightly
-
 ```
 
 ### Build from source
 
 [This guide](reverb/pip_package/README.md#how-to-develop-and-build-reverb-with-the-docker-containers)
 details how to build Reverb from source.
-
-
-### Reverb Releases
-
-Due to some underlying libraries such as `protoc` and `absl`, Reverb has to be
-paired with a specific version of TensorFlow. If installing Reverb as
-`pip install dm-reverb[tensorflow]` the correct version of Tensorflow will be
-installed. The table below lists the version of TensorFlow that each release of
-Reverb is associated with and some versions of interest:
-
-  * 0.13.0 dropped Python 3.8 support.
-  * 0.11.0 first version to support Python 3.11.
-  * 0.10.0 last version to support Python 3.7.
-
-
-Release | Branch / Tag                                               | TensorFlow Version
-------- | ---------------------------------------------------------- | ------------------
-Nightly | [master](https://github.com/deepmind/reverb)               | tf-nightly
-0.14.0  | [v0.14.0](https://github.com/deepmind/reverb/tree/v0.14.0) | 2.14.0
-0.13.0  | [v0.13.0](https://github.com/deepmind/reverb/tree/v0.13.0) | 2.14.0
-0.12.0  | [v0.12.0](https://github.com/deepmind/reverb/tree/v0.12.0) | 2.13.0
-0.11.0  | [v0.11.0](https://github.com/deepmind/reverb/tree/v0.11.0) | 2.12.0
-0.10.0  | [v0.10.0](https://github.com/deepmind/reverb/tree/v0.10.0) | 2.11.0
-0.9.0  | [v0.9.0](https://github.com/deepmind/reverb/tree/v0.9.0)   | 2.10.0
-0.8.0  | [v0.8.0](https://github.com/deepmind/reverb/tree/v0.8.0)   | 2.9.0
-0.7.x  | [v0.7.0](https://github.com/deepmind/reverb/tree/v0.7.0)   | 2.8.0
 
 ## Quick Start
 
@@ -145,9 +106,10 @@ The items we have added to Reverb can be read by sampling them:
 print(list(client.sample('my_table', num_samples=2)))
 ```
 
-Continue with the
-[Reverb Tutorial](https://github.com/deepmind/reverb/tree/master/examples/demo.ipynb)
-for an interactive tutorial.
+Continue with the [Reverb Tutorial](examples/demo.ipynb) for an interactive,
+numpy-only walkthrough of the embedded (`in_process=True`) path. The gRPC
+`Client`/`Writer` path shown above is also supported over a networked
+`Server(in_process=False)`.
 
 ## 内嵌模式(纯 numpy,无 TensorFlow)
 
@@ -178,13 +140,16 @@ with client.trajectory_writer(table='my_table', num_keep_alive_refs=10) as w:
     w.flush()
 
 # 采样
-for sample in client.sample('my_table', num_samples=4):
+# emit_timesteps=False 让每个采样的 item 返回单个 ReplaySample；
+# 默认 True 会把 trajectory 拆成逐 timestep 的 list。
+for sample in client.sample('my_table', num_samples=4, emit_timesteps=False):
     print(sample.data[0])  # numpy array
 ```
 
 **注意:**
 - 内嵌模式使用 numpy 作为数据载体,不依赖 TensorFlow。
-- 仅支持 `TrajectoryWriter`(本地路径),gRPC `Client`/`Writer` 暂不可用(待清理 TF 依赖)。
+- 内嵌路径支持 `TrajectoryWriter`（进程内直连）；gRPC `Client`/`Writer`/
+  `StructuredWriter` 在 `Server(in_process=False)` 下同样可用。
 - 旧版本(基于 TF)的 checkpoint 不兼容,需重新生成。
 
 ## Detailed overview
@@ -197,9 +162,8 @@ reinforcement learning policies. It is used by algorithms such as
 use, and scalable replay system can be challenging. For good performance Reverb
 is implemented in C++ and to enable distributed usage it provides a gRPC service
 for adding, sampling, and updating the contents of the tables. Python clients
-expose the full functionality of the service in an easy to use fashion.
-Furthermore native TensorFlow ops are available for performant integration with
-TensorFlow and `tf.data`.
+expose the full functionality of the service in an easy to use fashion. Data is
+exchanged as numpy arrays; no TensorFlow integration is required.
 
 Although originally designed for off-policy reinforcement learning, Reverb's
 flexibility makes it just as useful for on-policy reinforcement -- or even
@@ -380,12 +344,11 @@ checkpoint_path = client.checkpoint()
 To restore the `reverb.Server` from a checkpoint:
 
 ```python
-# The checkpointer accepts the path of the root directory in which checkpoints
-# are written. If we pass the root directory of the checkpoints written above
-# then the new server will load the most recent checkpoint written from the old
-# server.
+# `client.checkpoint()` returns the path of the checkpoint directory it wrote.
+# `DefaultCheckpointer` accepts that root directory; on startup it loads the
+# most recent checkpoint beneath it.
 checkpointer = reverb.platform.checkpointers_lib.DefaultCheckpointer(
-  path=checkpoint_path.rsplit('/', 1)[0])
+  path=checkpoint_path)
 
 # The arguments passed to `tables=` must be the same as those used by the
 # `Server` that wrote the checkpoint.
@@ -393,8 +356,10 @@ server = reverb.Server(tables=[...], checkpointer=checkpointer)
 ```
 
 Refer to
-[tfrecord_checkpointer.h](https://github.com/deepmind/reverb/tree/master/reverb/cc/platform/tfrecord_checkpointer.h)
-for details on the implementation of checkpointing in Reverb.
+[simple_checkpointer.h](reverb/cc/platform/default/simple_checkpointer.h)
+for details on the implementation of checkpointing in Reverb (a
+length-delimited protobuf format that replaced the historical TFRecord
+checkpointer).
 
 ## Starting Reverb using `reverb_server` (beta)
 

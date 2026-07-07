@@ -26,9 +26,12 @@ installed on your system:
 
 ## Build wheels with oss_build.sh
 
-> [!NOTE] As of 2025-12-05, Reverb's release build targets TensorFlow 2.21.*. If
-> this version is not yet available on PyPI, the dependency installation will
-> fail, and you will be unable to build release wheels.
+> [!NOTE] This fork runs **without TensorFlow at runtime**: the installed
+> package depends only on numpy (see `reverb/pip_package/requirements.in`).
+> The `oss_build.sh` / wheel-packaging scripts still carry historical
+> TensorFlow version metadata (`reverb_version.bzl`, `--tf-version` args) that
+> has not yet been fully cleaned up, but no TF package is required to import
+> or use Reverb.
 
 You can build Reverb either as the release package `dm_reverb` or the nightly
 package `dm_reverb_nightly`. We provide a shell script `oss_build.sh` that
@@ -45,10 +48,7 @@ The script supports the following flags:
 *   `--python`. The Python version to build the wheel for. You can specify
     multiple Python versions with `--python '3.11 3.12'`.
 *   `--release`. Whether to build the nightly or release package. This
-    determines:
-    -   the name of the wheel (`dm_reverb` or `dm_reverb_nightly`).
-    -   the TensorFlow package and version used in the `[tensorflow]` optional
-        dependency (`tensorflow` or `tf_nightly`).
+    determines the name of the wheel (`dm_reverb` or `dm_reverb_nightly`).
 *   `--python_tests`. Whether to run the Python tests by installing Reverb in a
     virtual environment. Use `--python_tests true` for running the test and
     `--python_tests false` for skipping the tests.
@@ -57,7 +57,7 @@ The script supports the following flags:
 You can then install the wheel with:
 
 ```shell
-python3 -m pip install '<path to .whl file>[tensorflow]'
+python3 -m pip install '<path to .whl file>'
 ```
 
 ## Build with bazel
@@ -99,25 +99,14 @@ bazel run --repo_env=HERMETIC_PYTHON_VERSION=3.12 //reverb/pip_package:requireme
 
 which will update the locked requirements for Python 3.12.
 
-## Notes on TensorFlow dependency
+## Notes on dependencies
 
-Reverb depends on TensorFlow for building the C++ extensions. The wheels are
-*only compatible* with the minor TensorFlow release they are built against. For
-example, a wheel built against tensorflow 2.20.* can not be used with tensorflow
-2.21.*.
+At runtime Reverb depends only on numpy (plus `absl-py`, `dm-tree`,
+`portpicker`, `packaging`); TensorFlow is **not** required. The historical
+packaging scripts still reference TensorFlow version metadata
+(`reverb/pip_package/reverb_version.bzl`, the `--tf-version` argument in
+`reverb_wheel.bzl`) carried over from upstream; cleaning these up is tracked as
+part of the build-system de-TF work and does not affect installed usage.
 
-This also means that dependencies used by Reverb (e.g., abseil-cpp, grpc and
-protobuf) should match those used by TensorFlow.
-
-TensorFlow is pulled in via both the PyPI packages (via
-`reverb/pip_package/requirements_lock*.txt`) and from the GitHub repository (via
-`WORKSPACE`). To build Reverb against a different version of TensorFlow, you
-will need to
-
-1.  Update the tensorflow version in `requirements.in` to the desired version,
-    then update the lock files.
-2.  Update `WORKSPACE` to use a different TensorFlow commit/release. You may
-    also need to fix the Bazel build setup to ensure the build continues to
-    work.
-3.  Update `reverb/pip_package/reverb_version.bzl` to ensure that the TensorFlow
-    version used in the wheel metadata is correct.
+Dependencies such as abseil-cpp, grpc and protobuf are resolved via Bazel
+(`WORKSPACE` / `MODULE.bazel`) at build time.

@@ -22,6 +22,19 @@ reverb_py_test(
     ],
 )
 
+# ponytail: 临时——验证 examples/*.ipynb 代码单元格可在纯 numpy 内嵌模式下跑通。
+reverb_py_test(
+    name = "examples_notebook_test",
+    srcs = ["examples_notebook_test.py"],
+    data = [
+        "//examples:demo.ipynb",
+        "//examples:frame_stacking.ipynb",
+    ],
+    deps = [
+        "//reverb",
+    ],
+)
+
 reverb_py_test(
     name = "errors_test",
     srcs = ["errors_test.py"],
