@@ -453,6 +453,7 @@ cc_test(
         ":chunker",
         ":in_process_client",
         ":schema_cc_proto",
+        ":structured_writer",
         ":table",
         ":trajectory_writer",
         "//reverb/cc/platform:logging",

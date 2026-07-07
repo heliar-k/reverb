@@ -457,6 +457,35 @@ class InProcessStructuredWriterTest(absltest.TestCase):
     with self.assertRaises(ValueError):
       client.structured_writer(table='sw', configs=[])
 
+  def test_single_condition_inserts_matching_steps(self):
+    # Mirror of gRPC test_single_condition with Condition.step_index() <= 2
+    # and a relative scalar slice x[-1]. Each matching step must yield a
+    # one-element trajectory carrying that step's value.
+    #
+    # max_times_sampled=1 mirrors the gRPC Table.queue default; without it
+    # (max_times_sampled=0) the Fifo sampler re-returns the oldest item on
+    # every draw, yielding [0,0,0] by correct sampler behaviour rather than an
+    # engine bug. See structured_writer.cc / in_process_client.cc: the
+    # StructuredWriter inserts three distinct items (values 0,1,2) on both
+    # paths.
+    server = _make_server(table_name='sw', max_size=50, min_size=1,
+                          max_times_sampled=1)
+    client = server.in_process_client
+
+    pattern = structured_writer.pattern_from_transform(
+        step_structure=None, transform=lambda x: x[-1])
+    config = structured_writer.create_config(
+        pattern=pattern, table='sw',
+        conditions=[structured_writer.Condition.step_index() <= 2])
+    writer = client.structured_writer(table='sw', configs=[config])
+    for i in range(5):
+      writer.append(i)
+    writer.end_episode()
+
+    samples = list(client.sample('sw', num_samples=3))
+    got = [int(np.asarray(s.data[0]).reshape(-1)[0]) for s in samples]
+    self.assertEqual(got, [0, 1, 2])
+
 
 class InProcessSignatureCacheRefreshTest(absltest.TestCase):
   """Regression for A4: server_info() must refresh the signature cache.

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -34,6 +35,7 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/selectors/fifo.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/trajectory_writer.h"
 
@@ -278,6 +280,70 @@ TEST(InProcessClientTest, LoadLatestOnEmptyRootReturnsNotFound) {
   InProcessClient client({table}, checkpointer);
   // 空根目录无 checkpoint -> NotFound(首次启动正常)。
   EXPECT_EQ(client.LoadLatest().code(), absl::StatusCode::kNotFound);
+}
+
+// Regression for A9: StructuredWriter in in-process mode with a condition
+// that fires multiple times AND a relative slice (start=-1) must yield one
+// trajectory per matching step, each carrying that step's value.
+//
+// Drives the real TrajectoryWriter(table) in-process path via
+// InProcessClient::NewStructuredWriter (the C++ FakeWriter in
+// structured_writer_test.cc does NOT exercise this path). MakeTable defaults
+// to max_times_sampled=1, so each sampled item is removed after one draw;
+// this matches the gRPC Table.queue semantics used by the gRPC
+// test_single_condition. With max_times_sampled=0 the Fifo sampler would
+// repeatedly return the same (oldest) item, which is correct sampler
+// behaviour, not an engine bug.
+TEST(InProcessClientTest, StructuredWriterConditionWithRelativeSlice) {
+  auto table = MakeTable("sw", /*max_size=*/100);
+  InProcessClient client({table});
+
+  // Pattern: x[-1] -> PatternNode(flat_source_index=0, start=-1, stop unset).
+  StructuredWriterConfig config;
+  auto* node = config.add_flat();
+  node->set_flat_source_index(0);
+  node->set_start(-1);  // relative to most recent step
+  config.set_table("sw");
+  config.mutable_priority()->mutable_constant_fn()->set_value(1.0);
+  // Condition: step_index <= 2  ==  NOT(step_index >= 3), fires on steps 0,1,2.
+  // (The Python Condition encodes <= via inverse ge, see structured_writer.py.)
+  auto* cond = config.add_conditions();
+  cond->set_step_index(true);
+  cond->set_ge(3);
+  cond->set_inverse(true);
+
+  std::unique_ptr<StructuredWriter> writer;
+  REVERB_ASSERT_OK(client.NewStructuredWriter("sw", {config}, &writer));
+
+  for (int i = 0; i < 5; i++) {
+    // Python `writer.append(i)` passes a Python int, which becomes a 0-d
+    // (scalar) ndarray via np.asarray. Mirror that here with a scalar shape.
+    REVERB_ASSERT_OK(writer->Append(
+        Step({MakeConstantBuffer<int32_t>(DataType::Int32, {}, i)})));
+  }
+  REVERB_ASSERT_OK(writer->EndEpisode(/*clear_buffers=*/true));
+
+  // Drain the table: 3 trajectories expected, each a single scalar.
+  Sampler::Options sopts;
+  sopts.max_samples = 3;
+  std::unique_ptr<Sampler> sampler;
+  REVERB_ASSERT_OK(client.NewSampler("sw", sopts, &sampler));
+
+  std::vector<int32_t> values;
+  std::vector<TensorBuffer> data;
+  while (sampler->GetNextTrajectory(&data).ok()) {
+    ASSERT_EQ(data.size(), 1u);
+    // squeezed single-row column -> scalar shape {}
+    const int32_t* p =
+        reinterpret_cast<const int32_t*>(data[0].bytes().data());
+    values.push_back(*p);
+  }
+
+  // gRPC path (Table.queue, max_times_sampled=1) yields {0, 1, 2}. The
+  // in-process engine produces the same three distinct items; the earlier
+  // "[0,0,0]" report was caused by sampling with max_times_sampled=0, not by
+  // an engine defect.
+  EXPECT_THAT(values, ::testing::ElementsAre(0, 1, 2));
 }
 
 }  // namespace
