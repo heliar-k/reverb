@@ -1,0 +1,9 @@
+# Bazel
+/bazel-bin
+/bazel-out
+/bazel-reverb
+/bazel-testlogs
+/MODULE.bazel.lock
+
+# AI agent working notes
+/docs/superpowers/
