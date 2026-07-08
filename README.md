@@ -1,4 +1,5 @@
 # Reverb
+
 ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/dm-reverb)
 [![PyPI version](https://badge.fury.io/py/dm-reverb.svg)](https://badge.fury.io/py/dm-reverb)
 
@@ -10,15 +11,15 @@ LIFO, and priority queues.
 
 ## Table of Contents
 
--   [Installation](#installation)
--   [Quick Start](#quick-start)
--   [Detailed Overview](#detailed-overview)
-    -   [Tables](#tables)
-    -   [Item Selection Strategies](#item-selection-strategies)
-    -   [Rate Limiting](#rate-limiting)
-    -   [Sharding](#sharding)
-    -   [Checkpointing](#checkpointing)
--   [Citation](#citation)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Detailed Overview](#detailed-overview)
+  - [Tables](#tables)
+  - [Item Selection Strategies](#item-selection-strategies)
+  - [Rate Limiting](#rate-limiting)
+  - [Sharding](#sharding)
+  - [Checkpointing](#checkpointing)
+- [Citation](#citation)
 
 ## Installation
 
@@ -36,7 +37,7 @@ for the embedded, zero-network-overhead usage. The original `Client`/`Writer`
 gRPC path is also available over a networked `Server(in_process=False)`.
 
 ```shell
-$ pip install dm-reverb
+pip install dm-reverb
 ```
 
 ### Build from source
@@ -114,6 +115,8 @@ numpy-only walkthrough of the embedded (`in_process=True`) path. The gRPC
 ## 内嵌模式(纯 numpy,无 TensorFlow)
 
 Reverb 支持纯 numpy 的进程内模式,无需 TensorFlow,零网络开销,适合单机训练内嵌使用。
+完整的设计方案(动机、与原版差异、不得不做的变更、使用样例对比)见
+[docs/numpy-embed-design.md](docs/numpy-embed-design.md)。
 
 ```python
 import reverb
@@ -146,6 +149,7 @@ for sample in client.sample('my_table', num_samples=4):
 ```
 
 **注意:**
+
 - 内嵌模式使用 numpy 作为数据载体,不依赖 TensorFlow。
 - 内嵌路径支持 `TrajectoryWriter`（进程内直连）；gRPC `Client`/`Writer`/
   `StructuredWriter` 在 `Server(in_process=False)` 下同样可用。
@@ -193,11 +197,11 @@ to train DQN, and the FIFO data to train a transition model for the environment.
 Items are automatically removed from the Table when one of two conditions are
 met:
 
-1.  Inserting a new item would cause the number of items in the Table to exceed
+1. Inserting a new item would cause the number of items in the Table to exceed
     its maximum capacity. Table's removal strategy is used to determine which
     item to remove.
 
-1.  An item has been sampled more than the maximum number of times permitted by
+1. An item has been sampled more than the maximum number of times permitted by
     the Table's rate limiter. Such item is deleted.
 
 Data elements not referenced anymore by any item are also deleted.
@@ -283,12 +287,12 @@ Examples of algorithms that make use of Queues are
 
 Reverb defines several selectors that can be used for item sampling or removal:
 
--   **Uniform:** Sample uniformly among all items.
--   **Prioritized:** Samples proportional to stored priorities.
--   **FIFO:** Selects the oldest data.
--   **LIFO:** Selects the newest data.
--   **MinHeap:** Selects data with the lowest priority.
--   **MaxHeap:** Selects data with the highest priority.
+- **Uniform:** Sample uniformly among all items.
+- **Prioritized:** Samples proportional to stored priorities.
+- **FIFO:** Selects the oldest data.
+- **LIFO:** Selects the newest data.
+- **MinHeap:** Selects data with the lowest priority.
+- **MaxHeap:** Selects data with the highest priority.
 
 Any of these strategies can be used for sampling or removing items from a
 Table. This gives users the flexibility to create customized Tables that best
@@ -300,13 +304,13 @@ Rate limiters allow users to enforce conditions on when items can be inserted
 and/or sampled from a Table. Here is a list of the rate limiters that are
 currently available in Reverb:
 
--   **MinSize:** Sets a minimum number of items that must be in the Table before
+- **MinSize:** Sets a minimum number of items that must be in the Table before
     anything can be sampled.
--   **SampleToInsertRatio:** Sets that the average ratio of inserts to samples
+- **SampleToInsertRatio:** Sets that the average ratio of inserts to samples
     by blocking insert and/or sample requests. This is useful for controlling
     the number of times each item is sampled before being removed.
--   **Queue:** Items are sampled exactly once before being removed.
--   **Stack:** Items are sampled exactly once before being removed.
+- **Queue:** Items are sampled exactly once before being removed.
+- **Stack:** Items are sampled exactly once before being removed.
 
 ### Sharding
 
@@ -388,7 +392,6 @@ tables: {
 
 The `rate_limiter` config is equivalent to the Python expression `MinSize(1)`,
 see `rate_limiters.py`.
-
 
 ## Citation
 
