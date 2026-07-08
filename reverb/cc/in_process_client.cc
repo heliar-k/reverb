@@ -28,8 +28,10 @@
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/structured_writer.h"
+#include "reverb/cc/support/signature.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/trajectory_writer.h"
+#include "reverb/cc/writer.h"
 
 namespace deepmind {
 namespace reverb {
@@ -49,24 +51,37 @@ std::shared_ptr<Table> InProcessClient::GetTable(absl::string_view name) const {
 }
 
 absl::Status InProcessClient::NewTrajectoryWriter(
-    const std::string& table, const TrajectoryWriter::Options& options,
+    const TrajectoryWriter::Options& options,
     std::unique_ptr<TrajectoryWriter>* writer) {
   REVERB_RETURN_IF_ERROR(options.Validate());
-  auto table_ptr = GetTable(table);
-  if (table_ptr == nullptr) {
-    return absl::NotFoundError(absl::StrCat(
-        "InProcessClient::NewTrajectoryWriter: table '", table,
-        "' not found."));
+  if (tables_.empty()) {
+    return absl::FailedPreconditionError(
+        "InProcessClient::NewTrajectoryWriter: no tables managed by this "
+        "client.");
   }
-  // 本地路径:TrajectoryWriter 构造时绑定单一 table_,所有插入走
-  // InsertOrAssignAsync 到该 table。options.flat_signature_map 由调用方按需
-  // 填充(进程内直连无服务端,默认 nullopt 即跳过 signature 校验)。
-  *writer = std::make_unique<TrajectoryWriter>(std::move(table_ptr), options);
+  // 对齐 gRPC:用各 Table 自带的 signature 填 flat_signature_map,使
+  // ItemAndRefs::Validate 走与 gRPC 同一的校验路径。每张表都必须在 map 中
+  // 占一项(签名 nullopt 表示该表无 signature,Validate 跳过校验);缺项会被
+  // Validate 当作“未知表”拒绝。
+  TrajectoryWriter::Options effective_options = options;
+  internal::FlatSignatureMap signatures;
+  for (const auto& [name, table] : tables_) {
+    internal::DtypesAndShapes& entry = signatures[name];
+    if (table->signature().has_value()) {
+      REVERB_RETURN_IF_ERROR(internal::FlatSignatureFromSignatureProto(
+          table->signature().value(), &entry));
+    }
+    // signature 为 nullopt 时,entry 保持默认 nullopt(跳过校验)。
+  }
+  effective_options.flat_signature_map = std::move(signatures);
+  // 本地路径:writer 持 tables_ 拷贝(shared_ptr 引用计数 +1),按 item.table()
+  // 分发。LoadLatest 原地改写 Table 对象不改 shared_ptr,故 writer 自动看到恢复态。
+  *writer = std::make_unique<TrajectoryWriter>(tables_, effective_options);
   return absl::OkStatus();
 }
 
 absl::Status InProcessClient::NewStructuredWriter(
-    const std::string& table, std::vector<StructuredWriterConfig> configs,
+    std::vector<StructuredWriterConfig> configs,
     std::unique_ptr<StructuredWriter>* writer) {
   if (configs.empty()) {
     return absl::InvalidArgumentError("At least one config must be provided.");
@@ -84,7 +99,7 @@ absl::Status InProcessClient::NewStructuredWriter(
   };
   std::unique_ptr<TrajectoryWriter> trajectory_writer;
   REVERB_RETURN_IF_ERROR(
-      NewTrajectoryWriter(table, options, &trajectory_writer));
+      NewTrajectoryWriter(options, &trajectory_writer));
 
   *writer = std::make_unique<StructuredWriter>(std::move(trajectory_writer),
                                                std::move(configs));
@@ -103,6 +118,36 @@ absl::Status InProcessClient::NewSampler(const std::string& table_name,
   }
   *sampler = std::make_unique<Sampler>(std::move(table), options,
                                        /*dtypes_and_shapes=*/absl::nullopt);
+  return absl::OkStatus();
+}
+
+absl::Status InProcessClient::NewWriter(int chunk_length, int max_timesteps,
+                                        bool delta_encoded,
+                                        int max_in_flight_items,
+                                        std::unique_ptr<Writer>* writer) {
+  if (chunk_length < 1) {
+    return absl::InvalidArgumentError("chunk_length must be >= 1.");
+  }
+  if (max_timesteps < 1) {
+    return absl::InvalidArgumentError("max_timesteps must be >= 1.");
+  }
+  if (max_in_flight_items < 1) {
+    return absl::InvalidArgumentError("max_in_flight_items must be >= 1.");
+  }
+  // 本地 Writer 持 tables_ 拷贝,按 item.table() 分发。signatures 复用各 Table
+  // 自带 signature(与 NewTrajectoryWriter 一致),用于 CreateItem 校验。每张表
+  // 都必须在 map 中占一项(签名 nullopt 表示无 signature,跳过校验)。
+  auto signatures = std::make_shared<internal::FlatSignatureMap>();
+  for (const auto& [name, table] : tables_) {
+    internal::DtypesAndShapes& entry = (*signatures)[name];
+    if (table->signature().has_value()) {
+      REVERB_RETURN_IF_ERROR(internal::FlatSignatureFromSignatureProto(
+          table->signature().value(), &entry));
+    }
+  }
+  *writer = std::make_unique<Writer>(tables_, chunk_length, max_timesteps,
+                                     delta_encoded, signatures,
+                                     max_in_flight_items);
   return absl::OkStatus();
 }
 

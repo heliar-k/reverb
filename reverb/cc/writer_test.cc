@@ -43,6 +43,10 @@
 #include "reverb/cc/support/trajectory_util.h"
 #include "reverb/cc/support/uint128.h"
 #include "reverb/cc/testing/proto_test_util.h"
+#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/rate_limiter.h"
+#include "reverb/cc/selectors/fifo.h"
+#include "reverb/cc/table.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
@@ -1182,6 +1186,112 @@ TEST(WriterTest, AppendSequenceCalledWithNonEqualBatchSizes) {
               ::testing::HasSubstr("0: Tensor<name: ''"));
   EXPECT_THAT(std::string(status.message()),
               ::testing::HasSubstr("1: Tensor<name: ''"));
+}
+
+// ---------------------------------------------------------------------------
+// Local Writer path: writes directly into a {name -> Table} map via
+// Table::InsertOrAssignAsync, bypassing gRPC. (D3-a.)
+// ---------------------------------------------------------------------------
+
+// Builds a {name -> Table} map for local-Writer tests.
+internal::flat_hash_map<std::string, std::shared_ptr<Table>>
+MakeLocalWriterTables(std::vector<std::pair<std::string, int>> named_sizes) {
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables;
+  for (auto& [name, max_size] : named_sizes) {
+    tables[name] = std::make_shared<Table>(
+        /*name=*/name,
+        /*sampler=*/std::make_shared<FifoSelector>(),
+        /*remover=*/std::make_shared<FifoSelector>(),
+        /*max_size=*/max_size,
+        /*max_times_sampled=*/1,
+        /*rate_limiter=*/std::make_shared<RateLimiter>(1, 1, 0, max_size));
+  }
+  return tables;
+}
+
+TEST(WriterTest, LocalWriterRoundTrip) {
+  auto tables = MakeLocalWriterTables({{"dist", 10}});
+  Writer writer(tables, /*chunk_length=*/1, /*max_timesteps=*/1,
+                /*delta_encoded=*/false, /*signatures=*/nullptr,
+                /*max_in_flight_items=*/Writer::kDefaultMaxInFlightItems);
+
+  REVERB_ASSERT_OK(writer.Append(MakeTimestep(/*num_tensors=*/1, /*shape=*/{1})));
+  REVERB_ASSERT_OK(writer.CreateItem("dist", /*num_timesteps=*/1, 1.0));
+  REVERB_ASSERT_OK(writer.Close());
+
+  EXPECT_EQ(tables["dist"]->size(), 1);
+  Table::SampledItem sampled;
+  REVERB_ASSERT_OK(tables["dist"]->Sample(&sampled));
+  EXPECT_EQ(sampled.ref->table(), "dist");
+  EXPECT_EQ(sampled.ref->priority(), 1.0);
+  ASSERT_EQ(sampled.ref->chunks().size(), 1);
+}
+
+TEST(WriterTest, LocalWriterDispatchesToMultipleTables) {
+  auto tables = MakeLocalWriterTables({{"a", 10}, {"b", 10}});
+  Writer writer(tables, /*chunk_length=*/1, /*max_timesteps=*/1,
+                /*delta_encoded=*/false, /*signatures=*/nullptr,
+                /*max_in_flight_items=*/Writer::kDefaultMaxInFlightItems);
+
+  REVERB_ASSERT_OK(writer.Append(MakeTimestep(/*num_tensors=*/1, /*shape=*/{1})));
+  REVERB_ASSERT_OK(writer.CreateItem("a", /*num_timesteps=*/1, 1.0));
+  REVERB_ASSERT_OK(writer.Append(MakeTimestep(/*num_tensors=*/1, /*shape=*/{1})));
+  REVERB_ASSERT_OK(writer.CreateItem("b", /*num_timesteps=*/1, 2.0));
+  REVERB_ASSERT_OK(writer.Close());
+
+  EXPECT_EQ(tables["a"]->size(), 1);
+  EXPECT_EQ(tables["b"]->size(), 1);
+
+  Table::SampledItem sa;
+  REVERB_ASSERT_OK(tables["a"]->Sample(&sa));
+  EXPECT_EQ(sa.ref->table(), "a");
+  EXPECT_EQ(sa.ref->priority(), 1.0);
+
+  Table::SampledItem sb;
+  REVERB_ASSERT_OK(tables["b"]->Sample(&sb));
+  EXPECT_EQ(sb.ref->table(), "b");
+  EXPECT_EQ(sb.ref->priority(), 2.0);
+}
+
+TEST(WriterTest, LocalWriterConfirmItemsEquivalence) {
+  // max_in_flight_items=1 forces the local ConfirmItems backpressure gate to
+  // engage: after one in-flight insert, the next CreateItem blocks in
+  // ConfirmItems(0) until the table completes the insert (callback decrements
+  // num_items_in_flight_). We drain samples from a separate thread to let the
+  // table complete inserts, then assert Close() drains everything.
+  auto tables = MakeLocalWriterTables({{"dist", 10}});
+  Writer writer(tables, /*chunk_length=*/1, /*max_timesteps=*/1,
+                /*delta_encoded=*/false, /*signatures=*/nullptr,
+                /*max_in_flight_items=*/1);
+
+  absl::Notification done;
+  std::vector<absl::Status> statuses;
+  internal::StartThread("InsertItems", [&] {
+    for (int i = 0; i < 4; ++i) {
+      statuses.push_back(writer.Append(MakeTimestep(/*num_tensors=*/1,
+                                                   /*shape=*/{1})));
+      statuses.push_back(writer.CreateItem("dist", /*num_timesteps=*/1, 1.0));
+    }
+    done.Notify();
+  });
+
+  // Drain samples so the rate limiter allows inserts to complete, unblocking
+  // the blocked ConfirmItems(0) calls. Bound the wait so a deadlock fails the
+  // test instead of hanging forever.
+  absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (!done.WaitForNotificationWithTimeout(absl::Milliseconds(20))) {
+    Table::SampledItem sampled;
+    tables["dist"]->Sample(&sampled).IgnoreError();
+    if (absl::Now() > deadline) {
+      ADD_FAILURE() << "Insert thread did not complete within 10s";
+      break;
+    }
+  }
+  for (const auto& s : statuses) {
+    EXPECT_TRUE(s.ok()) << s;
+  }
+
+  REVERB_ASSERT_OK(writer.Close());
 }
 
 }  // namespace

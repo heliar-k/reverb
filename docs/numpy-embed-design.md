@@ -21,8 +21,8 @@
   - [3.1 fork 精简 proto 到 `third_party/`](#31-fork-精简-proto-到-third_party)
   - [3.2 `TrajectoryWriter` 加本地路径分支](#32-trajectorywriter-加本地路径分支)
   - [3.3 pybind PascalCase 双名别名](#33-pybind-pascalcase-双名别名)
-  - [3.4 `LocalClient.sample` 默认 `emit_timesteps=False`](#34-localclientsample-默认-emit_timestepsfalse)
-  - [3.5 `LocalClient` 无 `insert` / `writer` / pickle](#35-localclient-无-insert--writer--pickle)
+  - [3.4 `LocalClient.sample` 默认 `emit_timesteps=True`](#34-localclientsample-默认-emit_timestepstrue)
+  - [3.5 `LocalClient` 无 pickle（`insert`/`writer` 已对齐）](#35-localclient-无-pickleinsertwriter-已对齐)
   - [3.6 旧 checkpoint 不兼容](#36-旧-checkpoint-不兼容)
 - [4. 使用样例对比](#4-使用样例对比)
   - [4.1 创建 Server 与 Client](#41-创建-server-与-client)
@@ -76,14 +76,16 @@ signature 用 TF 的 `nested_structure_coder` 编解码，checkpoint 用 TFRecor
 
 | 编号 | 决策 | 理由 |
 | ------ | ------ | ------ |
-| A1 | 内嵌只做 `TrajectoryWriter` + `StructuredWriter` | 这两个是现代推荐 API；旧 `Writer`/`StreamingTrajectoryWriter` 的本地路径价值低，砍掉省复杂度 |
+| A1 | 内嵌只做 `TrajectoryWriter` + `StructuredWriter`(旧 `Writer`/`StreamingTrajectoryWriter` 本地路径砍掉) | 这两个是现代推荐 API；旧 writer 本地路径价值低，砍掉省复杂度。**`Writer` 部分被 [ADR-0001](adr/0001-embedded-writer-local-path.md) 推翻**(`StreamingTrajectoryWriter` 部分保留) |
 | A2 | 保留 gRPC 层 | 一套 C++ 代码两种模式（内嵌 + 分布式），不为内嵌牺牲分布式能力 |
 | A3 | 彻底去 TF，fork 精简 proto 到 `third_party/` | TF proto 链式拉入一堆传递依赖，精简 fork 切断 `@org_tensorflow` |
 | B1 | `TensorBuffer` 用拷贝 bytes（`std::string`） | worker 线程零 GIL，简单正确；预留零拷贝升级路径（`ponytail:` 标注） |
 | B2 | 自研 `TensorSpec` + `TensorBuffer` | 不依赖 TF，对齐 numpy dtype |
 | C1 | pybind 暴露 `timeout` 参数，超时抛 `DeadlineExceededError` | 原版 `TimeoutError` 与 Python 内置同名，易混淆 |
 | C2 | 保留 `table_worker_` + `extension_worker_` 异步线程 | 零 GIL 是性能基础，不能丢 |
-| D3 | checkpoint 用 length-delimited protobuf | TFRecord 去掉 CRC32 就是标准 length-delimited protobuf，~20 行实现 |
+| D1 | 本地 `TrajectoryWriter`/`Writer` 持 `tables_` map，按 `item.table()` 分发 | 修正“绑定单一 table”的历史偏懒选择，签名对齐 gRPC `Client`(不收 table 参数)，消除三层 API 债。详见 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) |
+| D2 | writer 级 backpressure(任意表满则 writer 停) | 对齐 gRPC writer 级单一 stream 的语义；单表场景行为不变 |
+| D3 | checkpoint 用 length-delimited protobuf | TFRecord 去掉 CRC32 就是标准 length-delimited protobuf，~20 行实现。**注**：与下方 §3.5 的 D3-a(Writer 本地化) 不同编号语境，此处 D3 为 checkpoint 决策 |
 
 ---
 
@@ -145,10 +147,13 @@ class InProcessClient {
  public:
   explicit InProcessClient(std::vector<std::shared_ptr<Table>> tables,
                            std::shared_ptr<Checkpointer> checkpointer = nullptr);
-  absl::Status NewTrajectoryWriter(const std::string& table,
-                                   const TrajectoryWriter::Options& options,
-                                   std::unique_ptr<TrajectoryWriter>* writer);
-  absl::Status NewStructuredWriter(const std::string& table, ...);
+  // 不收 table 参数，writer 持 tables_ map 按 item.table() 分发（D1）
+  absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
+                                  std::unique_ptr<TrajectoryWriter>* writer);
+  absl::Status NewStructuredWriter(std::vector<StructuredWriterConfig> configs,
+                                  std::unique_ptr<StructuredWriter>* writer);
+  absl::Status NewWriter(int chunk_length, int max_timesteps, bool delta_encoded,
+                         int max_in_flight_items, std::unique_ptr<Writer>* writer);
   absl::Status NewSampler(const std::string& table_name, ...);
   absl::Status MutatePriorities(...);
   absl::Status Reset(...);
@@ -159,14 +164,15 @@ class InProcessClient {
 };
 ```
 
-Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`mutate_priorities`/
-`reset`/`server_info`/`checkpoint` 逻辑：
+Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`writer`/
+`mutate_priorities`/`reset`/`server_info`/`checkpoint` 逻辑：
 
 - **`Client`**（gRPC）：构造为 `Client('localhost:port')`，走 gRPC。保留原版的
   `insert`/`writer`/`trajectory_writer`/`structured_writer` 全部工厂方法。
 - **`LocalClient`**（内嵌）：由 `Server(in_process=True).in_process_client` 返回，
-  包装 C++ `InProcessClient`。只提供 `trajectory_writer`/`structured_writer`/
-  `new_sampler`/`sample` 等方法（无 `insert`/`writer`，见 [3.5](#35-localclient-无-insert--writer--pickle)）。
+  包装 C++ `InProcessClient`。与 `Client` API 严格镜像——`insert`/`writer` 上提到
+  `_BaseClient` 共享单一实现，`trajectory_writer`/`structured_writer` 不收 table 参数
+  （D1）。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickleinsertwriter-已对齐)）。
 
 两者通过两个 hook 区分 C++ 调用差异：`_fetch_server_info_proto`（gRPC 传 timeout，
 内嵌忽略）和 `_new_sampler`（gRPC 无 rate-limiter timeout，内嵌有）。
@@ -252,13 +258,19 @@ C++ 侧 `Sampler::Options.rate_limiter_timeout` 和 `TrajectoryWriter::Flush`/
 原版 `TrajectoryWriter` 只走 gRPC：`RunStreamWorker` 把 chunk+item 打包进
 `InsertStreamRequest` 发出。
 
-本 fork 给 `TrajectoryWriter` 加了 `shared_ptr<Table>` 构造函数和本地路径分支
-（`is_local_` 标志）：本地路径调 `Table::InsertOrAssignAsync`，用 callback 替代
-gRPC 的 `OnReadDone`。
+本 fork 给 `TrajectoryWriter` 加了本地路径分支（`is_local_` 标志）：本地路径调
+`Table::InsertOrAssignAsync`，用 callback 替代 gRPC 的 `OnReadDone`。
 
 > **决策**：原计划新建独立的 `LocalTrajectoryWriter` 类，实际改为直接在
 > `TrajectoryWriter` 内加分支——复用全部 chunker/column 逻辑，避免代码重复。
-> `InProcessClient::NewTrajectoryWriter` 构造绑定了单一 table 的本地 writer。
+>
+> **修正(D1)**：早期实现让本地 writer 构造时绑定**单一** `table_`，逼出三层 API 债
+> （`LocalClient.trajectory_writer(table=...)` 必须显式传 table、§3.4 的默认值偏差、
+> §3.5 的 `insert`/`writer` 缺失）。现改为 writer 持 `tables_` map（拷贝，方案 P），
+> worker 按 `item.table()` 查表分发，未知表报 `kNotFound`；`InProcessClient::
+> NewTrajectoryWriter` 去掉 table 参数，完全对齐 gRPC `Client` 签名。backpressure
+> 为 writer 级单一 flag（D2：任意表满则 writer 停，对齐 gRPC writer 级 stream），
+> 单表场景行为不变。详见 [unbind-local-writer-plan.md](unbind-local-writer-plan.md)。
 
 ### 3.3 pybind PascalCase 双名别名
 
@@ -278,32 +290,34 @@ gRPC 的 `OnReadDone`。
 
 这是为了代码收敛而引入的少量 pybind 重复，权衡后可接受。
 
-### 3.4 `LocalClient.sample` 默认 `emit_timesteps=False`
+### 3.4 `LocalClient.sample` 默认 `emit_timesteps=True`
 
 `sample(emit_timesteps=...)` 控制返回整条 trajectory 还是按 timestep 拆分。
 
-- gRPC `Client` 默认 `True`（向后兼容原版行为）。
-- 内嵌 `LocalClient` 默认 `False`（内嵌场景几乎总是想要整条 trajectory，不是
-  timestep 拆分列表）。
+早期内嵌 `LocalClient` 默认 `False`（内嵌场景几乎总是想要整条 trajectory），与
+ gRPC `Client` 的 `True` 不一致。该偏差是“本地 writer 绑定单一 table”连带逼出的
+ 三层 API 债之一（见 §3.2 修正）。
 
-```python
-class LocalClient(_BaseClient):
-  _default_emit_timesteps = False   # gRPC Client 是 True
-```
+**修正(D1)**：writer 解绑 + 补 `insert`/`writer` 后，两端 API 严格镜像，
+`_default_emit_timesteps` 统一为 `True`（gRPC 的历史行为）。调用方可显式传
+`emit_timesteps=False` 取整条 trajectory。
 
-调用方可显式覆盖。这个默认值差异是**有意为之**，匹配两种模式的典型用法。
+### 3.5 `LocalClient` 无 pickle（`insert`/`writer` 已对齐）
 
-### 3.5 `LocalClient` 无 `insert` / `writer` / pickle
+gRPC `Client` 有 `insert(data, priorities)`、`writer(max_sequence_length)`、
+`__reduce__`（pickle 支持，因为 Client 只存 server 地址，可跨进程重建）。
 
-gRPC `Client` 有 `insert(data, priorities)`（便捷插入完整 trajectory）、
-`writer(max_sequence_length)`（旧版流式 Writer）、`__reduce__`（pickle 支持，
-因为 Client 只存 server 地址，可跨进程重建）。
+早期 `LocalClient` 没有 `insert`/`writer`（受“绑定单一 table”连带影响，见 §3.2
+修正），与 gRPC `Client` 不对称。
 
-`LocalClient` **没有**这些：
+**修正(D1/D3-a)**：writer 解绑后，`insert`/`writer` 上提到 `_BaseClient`，
+`LocalClient` 与 `Client` 共享单一实现（靠 `self.writer`/`self._client.NewWriter`
+鸭子类型分派），签名与语义完全一致。`LocalClient.writer` 创建本地 `Writer`
+（持 `tables_` map，按 `item.table()` 分发，`InsertCallback` 递减
+`num_items_in_flight_` 复刻 gRPC `ConfirmItems` 语义）。
 
-- `insert`/`writer` 是旧 API，内嵌场景推荐用 `trajectory_writer`。`LocalClient`
-  的 `trajectory_writer` 需要显式指定 `table`（因为本地 writer 绑定单一 table）。
-- pickle 无意义：`LocalClient` 持有进程内 Table 指针，不可跨进程序列化。
+唯一保留的真实物理约束：**无 `__reduce__`（pickle）**——`LocalClient` 持进程内
+Table 指针，不可跨进程序列化。这是物理约束，非 API 债。
 
 ### 3.6 旧 checkpoint 不兼容
 
@@ -364,7 +378,7 @@ client.insert(some_trajectory, {'t': 1.0})
 **本 fork 内嵌（`trajectory_writer`，推荐）**：
 
 ```python
-with client.trajectory_writer(table='t', num_keep_alive_refs=10) as w:
+with client.trajectory_writer(num_keep_alive_refs=10) as w:
     w.append({'obs': np.zeros(4, dtype=np.float32)})   # 纯 numpy
     w.create_item(
         table='t', priority=1.0,
@@ -372,10 +386,12 @@ with client.trajectory_writer(table='t', num_keep_alive_refs=10) as w:
     w.flush()
 ```
 
-> 说明：内嵌 `trajectory_writer` 需显式传 `table`（本地 writer 绑定单一表），
-> 而 gRPC `Client.trajectory_writer(num_keep_alive_refs)` 不传 table（每个 item
-> 在 `create_item` 时指定表）。`num_keep_alive_refs` 是循环缓冲区大小，即 trajectory
-> 最大跨度。`w.history['col'][:]` 返回 `TrajectoryColumn`，`create_item` 的
+> 说明：修正后（D1）本地 `trajectory_writer` 与 gRPC `Client.trajectory_writer`
+> 签名一致，都不传 `table`——writer 持 client 全部表，每个 item 在 `create_item`
+> 时按 `table` 参数路由。内嵌 `LocalClient` 也可用 `client.insert(...)`/
+> `client.writer(...)`，与 gRPC 完全镜像（见 [3.5](#35-localclient-无-pickleinsertwriter-已对齐)）。
+> `num_keep_alive_refs` 是循环缓冲区大小，即 trajectory 最大跨度。
+> `w.history['col'][:]` 返回 `TrajectoryColumn`，`create_item` 的
 > `trajectory` 是一个结构与期望采样结构一致嵌套 dict/list。
 
 ### 4.3 采样数据
@@ -388,11 +404,11 @@ for sequence in client.sample('t', num_samples=4):
         print(step.data)
 ```
 
-**本 fork 内嵌（默认返回整条 trajectory）**：
+**本 fork 内嵌（传 `emit_timesteps=False` 取整条 trajectory）**：
 
 ```python
-for sample in client.sample('t', num_samples=4):
-    # sample 是单个 ReplaySample(因 LocalClient 默认 emit_timesteps=False)
+for sample in client.sample('t', num_samples=4, emit_timesteps=False):
+    # sample 是单个 ReplaySample(传 emit_timesteps=False 取整条 trajectory)
     print(sample.info.key, sample.info.priority)
     print(np.asarray(sample.data[0]))   # flat list of columns
 ```
@@ -417,18 +433,18 @@ ref_step = structured_writer.create_reference_step(step_spec)
 pattern = {'x': ref_step['a'][-3:]}    # 最近 3 步
 config = structured_writer.create_config(pattern=pattern, table='t')
 
-writer = client.structured_writer(table='t', configs=[config])
+writer = client.structured_writer(configs=[config])
 for i in range(5):
     writer.append(np.asarray(float(i), dtype=np.float32))
 writer.end_episode()
 
-for sample in client.sample('t', num_samples=3):
+for sample in client.sample('t', num_samples=3, emit_timesteps=False):
     print(np.asarray(sample.data[0]))   # [0., 1., 2.], [1., 2., 3.], ...
 ```
 
-> 说明：内嵌 `structured_writer` 需显式传 `table`（与 `trajectory_writer` 一致），
-> 所有 config 的 item 都写入该表。gRPC `Client.structured_writer(configs)` 不传
-> table（每个 config 的 `table` 字段指定目标表）。
+> 说明：修正后（D1）内嵌 `structured_writer` 与 gRPC `Client.structured_writer`
+> 签名一致，都不传 `table`——每个 config 的 `table` 字段指定目标表，writer 按
+> `item.table()` 路由，支持多表写入。
 
 ### 4.5 Checkpoint 保存与恢复
 

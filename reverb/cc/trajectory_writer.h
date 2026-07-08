@@ -281,11 +281,13 @@ class TrajectoryWriter : public ColumnWriter,
       std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub,
       const Options& options);
 
-  // Local mode: writes items directly into `table` via
-  // `Table::InsertOrAssignAsync`, bypassing gRPC entirely. All chunker,
-  // column, and history logic is shared with the gRPC path.
-  explicit TrajectoryWriter(std::shared_ptr<Table> table,
-                            const Options& options);
+  // Local mode: writes items directly into the tables in `tables_` via
+  // `Table::InsertOrAssignAsync`, bypassing gRPC entirely. The item's
+  // `table()` field selects the target table. All chunker, column, and
+  // history logic is shared with the gRPC path.
+  explicit TrajectoryWriter(
+      internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables,
+      const Options& options);
 
   // Flushes pending items and then closes stream. If `Close` has already been
   // called then no action is taken.
@@ -413,12 +415,16 @@ class TrajectoryWriter : public ColumnWriter,
   // Stub used to create InsertStream gRPC streams.
   std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub_;
 
-  // True when the writer is in local mode (writes directly into `table_`
+  // True when the writer is in local mode (writes directly into `tables_`
   // instead of going over gRPC).
   bool is_local_ = false;
 
-  // Target table in local mode. Unused on the gRPC path.
-  std::shared_ptr<Table> table_;
+  // Target tables in local mode (writer holds a copy of the client's map;
+  // `shared_ptr<Table>` refcounts keep the Table objects alive, and
+  // `LoadLatest` mutates the pointed-to objects in place so the writer sees
+  // restored state). Unused on the gRPC path. Items are dispatched by
+  // `item.table()` lookup; an unknown table yields `kNotFound`.
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
 
   // Local-mode backpressure: cleared to false by `InsertOrAssignAsync` when the
   // table's insert queue is full, set back to true by the insert-completion

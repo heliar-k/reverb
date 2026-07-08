@@ -42,10 +42,13 @@
 #include "reverb/cc/reverb_service.grpc.pb.h"
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/schema.pb.h"
+#include "reverb/cc/chunk_store.h"
+#include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/support/grpc_util.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
+#include "reverb/cc/table.h"
 #include "reverb/cc/tensor_compression.h"
 
 namespace deepmind {
@@ -83,6 +86,28 @@ Writer::Writer(std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stu
       closed_(false),
       inserted_dtypes_and_shapes_(max_timesteps) {
   CHECK_GT(max_in_flight_items_, 0);
+}
+
+Writer::Writer(
+    internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables,
+    int chunk_length, int max_timesteps, bool delta_encoded,
+    std::shared_ptr<internal::FlatSignatureMap> signatures,
+    int max_in_flight_items)
+    : is_local_(true),
+      tables_(std::move(tables)),
+      chunk_length_(chunk_length),
+      max_timesteps_(max_timesteps),
+      delta_encoded_(delta_encoded),
+      max_in_flight_items_(max_in_flight_items),
+      num_items_in_flight_(0),
+      signatures_(std::move(signatures)),
+      next_chunk_key_(NewID()),
+      episode_id_(NewID()),
+      index_within_episode_(0),
+      closed_(false),
+      inserted_dtypes_and_shapes_(max_timesteps) {
+  CHECK_GT(max_in_flight_items_, 0);
+  REVERB_CHECK(!tables_.empty());
 }
 
 Writer::~Writer() {
@@ -416,6 +441,14 @@ absl::Status Writer::Close(bool retry_on_unavailable) {
                               << FormatGrpcStatus(status);
     }
     stream_ = nullptr;
+  } else if (is_local_) {
+    // Local path: no stream/confirmation worker. Drain all in-flight inserts via
+    // the callback-driven `ConfirmItems(0)`, then release local chunk/callback
+    // state.
+    REVERB_LOG_IF(REVERB_ERROR, !ConfirmItems(0))
+        << "Unable to confirm that all items were written.";
+    local_chunks_.clear();
+    local_pending_callbacks_.clear();
   }
   chunks_.clear();
   closed_ = true;
@@ -491,6 +524,14 @@ absl::Status Writer::Finish(bool retry_on_unavailable) {
 }
 
 absl::Status Writer::WriteWithRetries(bool retry_on_unavailable) {
+  // Local mode: no stream, no retries. `WritePendingDataLocal` dispatches
+  // directly into the tables and its insert-completion callbacks drive
+  // `num_items_in_flight_`.
+  if (is_local_) {
+    return WritePendingDataLocal() ? absl::OkStatus()
+                                   : absl::InternalError(
+                                         "Local Writer failed to write data.");
+  }
   while (true) {
     if (WritePendingData()) return absl::OkStatus();
     stream_->WritesDone();
@@ -580,14 +621,114 @@ bool Writer::WritePendingData() {
   return true;
 }
 
+bool Writer::WritePendingDataLocal() {
+  // Materialize referenced chunks into `shared_ptr<ChunkStore::Chunk>` and
+  // dedup via `local_chunks_` (keyed by chunk key), mirroring the reactor's
+  // `chunks_` map. Only chunks not already materialized are created. This
+  // keeps a single shared_ptr per chunk so multi-table inserts referencing
+  // the same chunk share storage (gRPC-path semantics).
+  for (auto& chunk : chunks_) {
+    uint64_t key = chunk.chunk_key();
+    if (!streamed_chunk_keys_.contains(key)) {
+      // `ChunkStore::Chunk` owns a copy of the `ChunkData` proto.
+      local_chunks_[key] = std::make_shared<ChunkStore::Chunk>(chunk);
+      streamed_chunk_keys_.insert(key);
+    }
+  }
+
+  while (!pending_items_.empty()) {
+    // Backpressure: block until in-flight count drops below the limit. The
+    // insert-completion callback (fired on the table worker thread) decrements
+    // `num_items_in_flight_` and wakes this await.
+    if (!ConfirmItems(max_in_flight_items_ - 1)) {
+      return false;
+    }
+
+    PrioritizedItem item = pending_items_.front();
+    const std::string& table_name = item.table();
+    auto table_it = tables_.find(table_name);
+    if (table_it == tables_.end()) {
+      return false;
+    }
+
+    // Gather the chunks referenced by this item's trajectory.
+    std::vector<uint64_t> item_chunk_keys =
+        internal::GetChunkKeys(item.flat_trajectory());
+    std::vector<std::shared_ptr<ChunkStore::Chunk>> item_chunks;
+    item_chunks.reserve(item_chunk_keys.size());
+    for (uint64_t ck : item_chunk_keys) {
+      auto it = local_chunks_.find(ck);
+      if (it == local_chunks_.end()) {
+        // Should not happen: the chunk was just materialized above.
+        return false;
+      }
+      item_chunks.push_back(it->second);
+    }
+
+    uint64_t item_key = item.key();
+    TableItem table_item(std::move(item), std::move(item_chunks));
+
+    // Increment in-flight BEFORE dispatching: the table worker runs inserts on
+    // its own thread and the completion callback can fire before
+    // `InsertOrAssignAsync` returns. Registering first keeps the count correct
+    // and lets the callback's decrement land.
+    {
+      absl::MutexLock lock(mu_);
+      ++num_items_in_flight_;
+    }
+
+    // ponytail: per-item shared_ptr callback so the weak_ptr handed to the
+    // table stays alive until the insert completes. Kept in
+    // `local_pending_callbacks_` (cleared on Close drain) so the table worker's
+    // `weak_ptr::lock` succeeds. The callback decrements
+    // `num_items_in_flight_`, mirroring gRPC's ItemConfirmationWorker.
+    auto cb = std::make_shared<Table::InsertCallback>(
+        [this](uint64_t /*completed_key*/) {
+          absl::MutexLock lock(mu_);
+          --num_items_in_flight_;
+        });
+    local_pending_callbacks_.push_back(cb);
+
+    bool can_insert_more = false;
+    absl::Status s = table_it->second->InsertOrAssignAsync(
+        std::move(table_item), &can_insert_more, cb);
+    if (!s.ok()) {
+      // Undo the in-flight bump; surface failure.
+      absl::MutexLock lock(mu_);
+      --num_items_in_flight_;
+      return false;
+    }
+
+    pending_items_.pop_front();
+
+    // If the table's insert queue is full, wait for an outstanding insert to
+    // complete before pulling another item (writer-level backpressure, aligned
+    // with the gRPC path's ConfirmItems gate above).
+    if (!can_insert_more) {
+      ConfirmItems(max_in_flight_items_ - 1);
+    }
+  }
+  return true;
+}
+
 uint64_t Writer::NewID() {
   return absl::Uniform<uint64_t>(bit_gen_, 0, UINT64_MAX);
 }
 
 bool Writer::ConfirmItems(int limit) {
   absl::ReaderMutexLock lock(mu_);
+  // gRPC: unblock when the worker thread stops (stream error) so awaiters
+  // don't deadlock. Local: there is no confirmation worker thread; the
+  // insert-completion callback decrements `num_items_in_flight_`, so we wait
+  // on `num_items_in_flight_ <= limit` with a `closed_` escape (mirrors
+  // TrajectoryWriter's `!closed_ && !stream_ok_` await pattern) to avoid
+  // permanent blocking if a table worker errors and a callback never fires.
   auto done = [limit, this]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
-    return num_items_in_flight_ <= limit || !item_confirmation_worker_running_;
+    if (is_local_) {
+      return num_items_in_flight_ <= limit || closed_;
+    }
+    return num_items_in_flight_ <= limit ||
+           !item_confirmation_worker_running_;
   };
   mu_.Await(absl::Condition(&done));
   return num_items_in_flight_ <= limit;

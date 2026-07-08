@@ -103,13 +103,20 @@ std::shared_ptr<Table> MakeTable(int max_size = 100) {
       /*rate_limiter=*/std::make_shared<RateLimiter>(1, 1, 0, max_size));
 }
 
+// Wraps a single table into the {name -> Table} map the unchained local
+// TrajectoryWriter constructor expects.
+internal::flat_hash_map<std::string, std::shared_ptr<Table>> AsMap(
+    const std::shared_ptr<Table>& table) {
+  return {{table->name(), table}};
+}
+
 // ---------------------------------------------------------------------------
 // Append validation (exercises the chunker integration without gRPC).
 // ---------------------------------------------------------------------------
 
 TEST(TrajectoryWriter, AppendValidatesDtype) {
   auto table = MakeTable();
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/10,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/10,
                                              /*num_keep_alive_refs=*/10));
   StepRef refs;
 
@@ -130,7 +137,7 @@ TEST(TrajectoryWriter, AppendValidatesDtype) {
 
 TEST(TrajectoryWriter, AppendValidatesShapes) {
   auto table = MakeTable();
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/10,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/10,
                                              /*num_keep_alive_refs=*/10));
   StepRef refs;
 
@@ -150,7 +157,7 @@ TEST(TrajectoryWriter, AppendValidatesShapes) {
 
 TEST(TrajectoryWriter, AppendAcceptsPartialSteps) {
   auto table = MakeTable();
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/10,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/10,
                                              /*num_keep_alive_refs=*/10));
 
   StepRef both;
@@ -168,7 +175,7 @@ TEST(TrajectoryWriter, AppendAcceptsPartialSteps) {
 
 TEST(TrajectoryWriter, AppendPartialRejectsMultipleUsesOfSameColumn) {
   auto table = MakeTable();
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/10,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/10,
                                              /*num_keep_alive_refs=*/10));
 
   StepRef first_column_only;
@@ -192,7 +199,7 @@ TEST(TrajectoryWriter, AppendPartialRejectsMultipleUsesOfSameColumn) {
 
 TEST(TrajectoryWriter, EpisodeStepIsIncrementedByAppend) {
   auto table = MakeTable();
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/1,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/1,
                                              /*num_keep_alive_refs=*/2));
 
   EXPECT_EQ(writer.episode_steps(), 0);
@@ -223,7 +230,7 @@ TEST(TrajectoryWriter, EpisodeStepIsIncrementedByAppend) {
 
 TEST(TrajectoryWriter, LocalRoundTripInsertsAndIsSampleable) {
   auto table = MakeTable(/*max_size=*/10);
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/1,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/1,
                                              /*num_keep_alive_refs=*/1));
 
   // Append a single int32 step.
@@ -253,7 +260,7 @@ TEST(TrajectoryWriter, LocalRoundTripInsertsAndIsSampleable) {
 TEST(TrajectoryWriter, LocalRoundTripFlushesIncompleteChunk) {
   auto table = MakeTable(/*max_size=*/10);
   // max_chunk_length=2 means the chunk is NOT finalized after one Append.
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/2,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/2,
                                              /*num_keep_alive_refs=*/2));
 
   StepRef refs;
@@ -275,7 +282,7 @@ TEST(TrajectoryWriter, LocalRoundTripFlushesIncompleteChunk) {
 
 TEST(TrajectoryWriter, LocalRoundTripMultipleItemsShareChunk) {
   auto table = MakeTable(/*max_size=*/10);
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/2,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/2,
                                              /*num_keep_alive_refs=*/2));
 
   // Two steps in the same chunk (max_chunk_length=2).
@@ -312,7 +319,7 @@ TEST(TrajectoryWriter, LocalRoundTripMultipleItemsShareChunk) {
 
 TEST(TrajectoryWriter, LocalRoundTripEndEpisodeFinalizesChunks) {
   auto table = MakeTable(/*max_size=*/10);
-  TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/2,
+  TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/2,
                                              /*num_keep_alive_refs=*/2));
 
   StepRef step;
@@ -328,7 +335,7 @@ TEST(TrajectoryWriter, LocalRoundTripEndEpisodeFinalizesChunks) {
 TEST(TrajectoryWriter, LocalRoundTripDestructorFlushesPending) {
   auto table = MakeTable(/*max_size=*/10);
   {
-    TrajectoryWriter writer(table, MakeOptions(/*max_chunk_length=*/2,
+    TrajectoryWriter writer(AsMap(table), MakeOptions(/*max_chunk_length=*/2,
                                                /*num_keep_alive_refs=*/2));
     StepRef refs;
     REVERB_ASSERT_OK(writer.Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}),
@@ -338,6 +345,110 @@ TEST(TrajectoryWriter, LocalRoundTripDestructorFlushesPending) {
     // No explicit Flush/EndEpisode; the destructor must flush the item.
   }
   EXPECT_EQ(table->size(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-table local path: writer holds a {name -> Table} map and dispatches
+// by item.table(). (Unchained from the single-table_ binding.)
+// ---------------------------------------------------------------------------
+
+// Builds a {name -> Table} map with the given (name, max_size) pairs. Each
+// table uses a Queue(1) limiter so inserts proceed without sampling pressure.
+internal::flat_hash_map<std::string, std::shared_ptr<Table>> MakeTables(
+    std::vector<std::pair<std::string, int>> named_sizes) {
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables;
+  for (auto& [name, max_size] : named_sizes) {
+    tables[name] = std::make_shared<Table>(
+        /*name=*/name,
+        /*sampler=*/std::make_shared<FifoSelector>(),
+        /*remover=*/std::make_shared<FifoSelector>(),
+        /*max_size=*/max_size,
+        /*max_times_sampled=*/1,
+        /*rate_limiter=*/std::make_shared<RateLimiter>(1, 1, 0, max_size));
+  }
+  return tables;
+}
+
+TEST(TrajectoryWriter, LocalRoundTripDispatchesToMultipleTables) {
+  auto tables = MakeTables({{"a", 10}, {"b", 10}});
+  TrajectoryWriter writer(tables, MakeOptions(/*max_chunk_length=*/1,
+                                             /*num_keep_alive_refs=*/1));
+
+  StepRef refs_a;
+  REVERB_ASSERT_OK(
+      writer.Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs_a));
+  REVERB_ASSERT_OK(writer.CreateItem("a", 1.0, MakeTrajectory({{refs_a[0]}})));
+
+  StepRef refs_b;
+  REVERB_ASSERT_OK(
+      writer.Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs_b));
+  REVERB_ASSERT_OK(writer.CreateItem("b", 2.0, MakeTrajectory({{refs_b[0]}})));
+
+  REVERB_ASSERT_OK(writer.Flush());
+
+  EXPECT_EQ(tables["a"]->size(), 1);
+  EXPECT_EQ(tables["b"]->size(), 1);
+
+  Table::SampledItem sampled_a;
+  REVERB_ASSERT_OK(tables["a"]->Sample(&sampled_a));
+  EXPECT_EQ(sampled_a.ref->table(), "a");
+  EXPECT_EQ(sampled_a.ref->priority(), 1.0);
+
+  Table::SampledItem sampled_b;
+  REVERB_ASSERT_OK(tables["b"]->Sample(&sampled_b));
+  EXPECT_EQ(sampled_b.ref->table(), "b");
+  EXPECT_EQ(sampled_b.ref->priority(), 2.0);
+}
+
+TEST(TrajectoryWriter, LocalRoundTripRejectsCreateItemForUnknownTable) {
+  auto tables = MakeTables({{"a", 10}, {"b", 10}});
+  TrajectoryWriter writer(tables, MakeOptions(/*max_chunk_length=*/1,
+                                             /*num_keep_alive_refs=*/1));
+
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer.Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  // CreateItem itself succeeds (validation is deferred); the error surfaces
+  // when the worker tries to dispatch to a table not in the map.
+  REVERB_ASSERT_OK(writer.CreateItem("c", 1.0, MakeTrajectory({{refs[0]}})));
+
+  // Flush propagates the worker's kNotFound error as the unrecoverable status.
+  auto status = writer.Flush(/*ignore_last_num_items=*/0,
+                             /*timeout=*/absl::Milliseconds(500));
+  EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
+}
+
+TEST(TrajectoryWriter, LocalRoundTripBackpressureAcrossTables) {
+  // max_size=1 => max_enqueued_inserts=1. A Queue(1) limiter blocks inserts
+  // until a sample is drawn, so the second insert cannot be queued and the
+  // writer-level backpressure engages (can_insert_more=false).
+  auto tables = MakeTables({{"a", 1}});
+  TrajectoryWriter writer(tables, MakeOptions(/*max_chunk_length=*/1,
+                                             /*num_keep_alive_refs=*/4));
+
+  for (int i = 0; i < 4; ++i) {
+    StepRef refs;
+    REVERB_ASSERT_OK(
+        writer.Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+    REVERB_ASSERT_OK(writer.CreateItem("a", 1.0, MakeTrajectory({{refs[0]}})));
+  }
+
+  // With the table blocked (no samples drawn) the worker cannot drain all
+  // items, so Flush times out. This is the writer-level backpressure engaging.
+  auto status = writer.Flush(/*ignore_last_num_items=*/0,
+                             /*timeout=*/absl::Milliseconds(100));
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded);
+
+  // Draining one sample lets one insert complete, but the remaining items keep
+  // the writer blocked (still writer-level backpressure, single channel).
+  Table::SampledItem sampled;
+  REVERB_ASSERT_OK(tables["a"]->Sample(&sampled));
+  // Still blocked on the rest.
+  auto status2 = writer.Flush(/*ignore_last_num_items=*/0,
+                              /*timeout=*/absl::Milliseconds(100));
+  EXPECT_EQ(status2.code(), absl::StatusCode::kDeadlineExceeded);
+
+  writer.Close();
 }
 
 // ---------------------------------------------------------------------------

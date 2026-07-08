@@ -808,6 +808,19 @@ PYBIND11_MODULE(libpybind, m) {
   // ponytail: PascalCase aliases mirror the gRPC `Client` naming so that
   // `reverb/client.py` can share one code path between `Client` and
   // `LocalClient`. Both names are bound to the same callable; no behavior diff.
+  auto new_writer_fn =
+      [](InProcessClient* client, int chunk_length, int max_timesteps,
+         bool delta_encoded, int max_in_flight_items) -> Writer* {
+        std::unique_ptr<Writer> writer;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->NewWriter(chunk_length, max_timesteps, delta_encoded,
+                                     max_in_flight_items, &writer);
+        }
+        MaybeRaiseFromStatus(status);
+        return writer.release();
+      };
   auto new_sampler_fn =
       [](InProcessClient* client, const std::string& table,
          int64_t max_samples, size_t buffer_size,
@@ -886,7 +899,7 @@ PYBIND11_MODULE(libpybind, m) {
            py::arg("tables"), py::arg("checkpointer") = nullptr)
       .def(
           "new_trajectory_writer",
-          [](InProcessClient* client, const std::string& table,
+          [](InProcessClient* client,
              std::shared_ptr<ChunkerOptions> chunker_options)
               -> TrajectoryWriter* {
             TrajectoryWriter::Options options;
@@ -896,15 +909,33 @@ PYBIND11_MODULE(libpybind, m) {
             {
               py::gil_scoped_release g;
               status =
-                  client->NewTrajectoryWriter(table, options, &writer);
+                  client->NewTrajectoryWriter(options, &writer);
             }
             MaybeRaiseFromStatus(status);
             return writer.release();
           },
-          py::arg("table"), py::arg("chunker_options"))
+          py::arg("chunker_options"))
+      .def(
+          "NewTrajectoryWriter",
+          [](InProcessClient* client,
+             std::shared_ptr<ChunkerOptions> chunker_options)
+              -> TrajectoryWriter* {
+            TrajectoryWriter::Options options;
+            options.chunker_options = std::move(chunker_options);
+            std::unique_ptr<TrajectoryWriter> writer;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status =
+                  client->NewTrajectoryWriter(options, &writer);
+            }
+            MaybeRaiseFromStatus(status);
+            return writer.release();
+          },
+          py::arg("chunker_options"))
       .def(
           "new_structured_writer",
-          [](InProcessClient* client, const std::string& table,
+          [](InProcessClient* client,
              std::vector<std::string> serialized_configs)
               -> StructuredWriter* {
             std::vector<StructuredWriterConfig> configs;
@@ -924,12 +955,46 @@ PYBIND11_MODULE(libpybind, m) {
             {
               py::gil_scoped_release g;
               status =
-                  client->NewStructuredWriter(table, std::move(configs), &writer);
+                  client->NewStructuredWriter(std::move(configs), &writer);
             }
             MaybeRaiseFromStatus(status);
             return writer.release();
           },
-          py::arg("table"), py::arg("configs"))
+          py::arg("configs"))
+      .def(
+          "NewStructuredWriter",
+          [](InProcessClient* client,
+             std::vector<std::string> serialized_configs)
+              -> StructuredWriter* {
+            std::vector<StructuredWriterConfig> configs;
+            for (const auto &serialised_config : serialized_configs) {
+              configs.emplace_back();
+              if (!configs.back().ParseFromString(
+                      std::string(serialised_config))) {
+                MaybeRaiseFromStatus(absl::InvalidArgumentError(absl::StrCat(
+                    "Unable to deserialize StructuredWriterConfig from "
+                    "serialized proto bytes: '",
+                    std::string(serialised_config), "'")));
+                return nullptr;
+              }
+            }
+            std::unique_ptr<StructuredWriter> writer;
+            absl::Status status;
+            {
+              py::gil_scoped_release g;
+              status =
+                  client->NewStructuredWriter(std::move(configs), &writer);
+            }
+            MaybeRaiseFromStatus(status);
+            return writer.release();
+          },
+          py::arg("configs"))
+      .def("new_writer", new_writer_fn,
+           py::arg("chunk_length"), py::arg("max_timesteps"),
+           py::arg("delta_encoded") = false, py::arg("max_in_flight_items") = 25)
+      .def("NewWriter", new_writer_fn,
+           py::arg("chunk_length"), py::arg("max_timesteps"),
+           py::arg("delta_encoded") = false, py::arg("max_in_flight_items") = 25)
       .def("new_sampler", new_sampler_fn,
            py::arg("table"), py::arg("max_samples") = 1,
            py::arg("buffer_size") = 1,

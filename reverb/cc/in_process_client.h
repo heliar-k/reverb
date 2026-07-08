@@ -31,6 +31,7 @@
 #include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/trajectory_writer.h"
+#include "reverb/cc/writer.h"
 
 namespace deepmind {
 namespace reverb {
@@ -46,24 +47,23 @@ class InProcessClient {
       std::vector<std::shared_ptr<Table>> tables,
       std::shared_ptr<Checkpointer> checkpointer = nullptr);
 
-  // 校验 `options` 并通过本地构造函数创建 `TrajectoryWriter`,绑定到 `table`。
-  // 本地 TrajectoryWriter 在构造时绑定单一 table,所有 `CreateItem` 写入该
-  // table(`CreateItem` 的 table 名参数仅用于 signature 校验,本地路径不校验)。
-  // 与 `Client::NewTrajectoryWriter` 的区别:进程内直连必须显式指定目标 table。
-  absl::Status NewTrajectoryWriter(const std::string& table,
-                                   const TrajectoryWriter::Options& options,
-                                   std::unique_ptr<TrajectoryWriter>* writer);
+  // 校验 `options` 并通过本地构造函数创建 `TrajectoryWriter`。writer 持有
+  // client 全部 `tables_` 的拷贝(shared_ptr 引用计数 +1),按 `item.table()`
+  // 分发到目标 table,未知表在 worker dispatch 时报 `kNotFound`。
+  // 签名对齐 gRPC `Client::NewTrajectoryWriter`(不收 table 参数),signature
+  // 校验用各 Table 自带的 signature 经 `FlatSignatureFromSignatureProto` 填入
+  // `options.flat_signature_map`(等价于 gRPC 侧从 ServerInfo 缓存拿)。
+  absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
+                                  std::unique_ptr<TrajectoryWriter>* writer);
 
   // 校验 `configs` 并创建 `StructuredWriter`。内部按 `Client::NewStructuredWriter`
   // 的逻辑算 max_num_keep_alive_refs、补 buffer_length 条件、构造
   // `AutoTunedChunkerOptions`,然后调 `NewTrajectoryWriter`。
   //
-  // 本地路径限制:所有 config 的 item 最终都写入同一个 `table`(本地
-  // TrajectoryWriter 绑定单一 table,`CreateItem` 的 table 名参数仅用于
-  // signature 校验)。若需多表写入,请为每个 table 单独创建 StructuredWriter。
-  absl::Status NewStructuredWriter(const std::string& table,
-                                   std::vector<StructuredWriterConfig> configs,
-                                   std::unique_ptr<StructuredWriter>* writer);
+  // 每个 config 的 `table` 字段决定其 item 落入哪个 table(经底层
+  // TrajectoryWriter 的 `tables_` map 分发),支持多表写入。
+  absl::Status NewStructuredWriter(std::vector<StructuredWriterConfig> configs,
+                                  std::unique_ptr<StructuredWriter>* writer);
 
   // 通过本地构造函数创建 `Sampler`,直接从 `table` 采样。
   // 不做 signature 校验(dtypes_and_shapes = nullopt),与
@@ -71,6 +71,12 @@ class InProcessClient {
   absl::Status NewSampler(const std::string& table_name,
                           const Sampler::Options& options,
                           std::unique_ptr<Sampler>* sampler);
+
+  // 通过本地构造函数创建 `Writer`,直接持 `tables_` 拷贝,签名对齐
+  // gRPC `Client::NewWriter`。writer 按 `item.table()` 分发到目标 table。
+  absl::Status NewWriter(int chunk_length, int max_timesteps, bool delta_encoded,
+                         int max_in_flight_items,
+                         std::unique_ptr<Writer>* writer);
 
   // 直接调 `Table::MutateItems`。
   absl::Status MutatePriorities(absl::string_view table,

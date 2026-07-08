@@ -28,6 +28,8 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "reverb/cc/chunk_store.h"
+#include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/reverb_service.grpc.pb.h"
@@ -35,6 +37,7 @@
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/table.h"
 
 namespace deepmind {
 namespace reverb {
@@ -47,6 +50,17 @@ class Writer {
 
   // The client must not be deleted while any of its writer instances exist.
   Writer(std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub,
+         int chunk_length, int max_timesteps, bool delta_encoded = false,
+         std::shared_ptr<internal::FlatSignatureMap> signatures = nullptr,
+         int max_in_flight_items = kDefaultMaxInFlightItems);
+
+  // Local mode: writes items directly into the tables in `tables` via
+  // `Table::InsertOrAssignAsync`, bypassing gRPC entirely. The item's `table()`
+  // field selects the target table. All chunk/buffer logic is shared with the
+  // gRPC path; only `WritePendingData`/`Close`/`ConfirmItems` branch on
+  // `is_local_`. The writer holds a copy of the map (shared_ptr refcounts keep
+  // the Table objects alive).
+  Writer(internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables,
          int chunk_length, int max_timesteps, bool delta_encoded = false,
          std::shared_ptr<internal::FlatSignatureMap> signatures = nullptr,
          int max_in_flight_items = kDefaultMaxInFlightItems);
@@ -114,6 +128,14 @@ class Writer {
   // items in `pending_items_`
   bool WritePendingData();
 
+  // Local-mode counterpart of `WritePendingData`: materializes referenced
+  // chunks into `shared_ptr<ChunkStore::Chunk>` (deduplicated by chunk key in
+  // `local_chunks_`), then for each pending item dispatches via
+  // `Table::InsertOrAssignAsync` to `tables_[item.table()]`. The insert
+  // completion callback decrements `num_items_in_flight_`, mirroring the gRPC
+  // `ItemConfirmationWorker`'s response handling.
+  bool WritePendingDataLocal();
+
   // Helper for generating a random ID.
   uint64_t NewID();
 
@@ -149,6 +171,28 @@ class Writer {
 
   // gRPC stub for the ReverbService.
   std::shared_ptr</* grpc_gen:: */ReverbService::StubInterface> stub_;
+
+  // True when the writer is in local mode (writes directly into `tables_`
+  // instead of going over gRPC).
+  bool is_local_ = false;
+
+  // Target tables in local mode (writer holds a copy of the client's map).
+  // Unused on the gRPC path. Items are dispatched by `item.table()` lookup;
+  // an unknown table yields an error.
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
+
+  // Local-mode chunk store: materialized `shared_ptr<ChunkStore::Chunk>` keyed
+  // by chunk key, so each inserted `TableItem` can reference its chunks. Mirrors
+  // the reactor's `chunks_` map. Populated on demand from `chunks_` and
+  // deduplicated via `streamed_chunk_keys_`.
+  internal::flat_hash_map<uint64_t, std::shared_ptr<ChunkStore::Chunk>>
+      local_chunks_;
+
+  // Local-mode insert-completion callbacks, kept alive here so the
+  // `weak_ptr` handed to `Table::InsertOrAssignAsync` is not destroyed before
+  // the table worker invokes it. Cleared once `Close` drains all in-flight
+  // inserts. Mirrors `TrajectoryWriter::ItemAndRefs::insert_callback`.
+  std::list<std::shared_ptr<Table::InsertCallback>> local_pending_callbacks_;
 
   // gRPC stream to the ReverbService.InsertStream endpoint.
   std::unique_ptr<grpc::ClientReaderWriterInterface<InsertStreamRequest,

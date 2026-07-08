@@ -347,10 +347,11 @@ TrajectoryWriter::TrajectoryWriter(
   REVERB_CHECK_OK(options.Validate());
 }
 
-TrajectoryWriter::TrajectoryWriter(std::shared_ptr<Table> table,
-                                   const Options& options)
+TrajectoryWriter::TrajectoryWriter(
+    internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables,
+    const Options& options)
     : is_local_(true),
-      table_(std::move(table)),
+      tables_(std::move(tables)),
       options_(options),
       key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
       episode_id_(key_generator_->Generate()),
@@ -361,7 +362,7 @@ TrajectoryWriter::TrajectoryWriter(std::shared_ptr<Table> table,
                                 [this] { (void)RunLocalWorker(); })),
       stream_ok_(true) {
   REVERB_CHECK_OK(options.Validate());
-  REVERB_CHECK(table_ != nullptr);
+  REVERB_CHECK(!tables_.empty());
 }
 
 TrajectoryWriter::~TrajectoryWriter() {
@@ -702,6 +703,23 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
       }
     }
 
+    // Dispatch by item.table(): look up the target table in the writer's map.
+    // An unknown table yields kNotFound (previously the single-table binding
+    // silently ignored the table field).
+    const std::string& table_name = item_and_refs->item.table();
+    auto table_it = tables_.find(table_name);
+    if (table_it == tables_.end()) {
+      absl::MutexLock l(&mu_);
+      stream_ok_ = false;
+      stream_status_ = absl::NotFoundError(absl::StrCat(
+          "TrajectoryWriter::RunLocalWorker: table '", table_name,
+          "' not found."));
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+      return stream_status_;
+    }
+    Table* target_table = table_it->second.get();
+
     // Assemble the list of referenced chunks, deduplicating by chunk key.
     std::vector<std::shared_ptr<ChunkStore::Chunk>> chunks;
     internal::flat_hash_set<uint64_t> sent_keys;
@@ -751,7 +769,7 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
       write_queue_.pop_front();
     }
 
-    absl::Status s = table_->InsertOrAssignAsync(
+    absl::Status s = target_table->InsertOrAssignAsync(
         std::move(table_item), &can_insert_more, item_and_refs->insert_callback);
     if (!s.ok()) {
       absl::MutexLock l(&mu_);

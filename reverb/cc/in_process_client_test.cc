@@ -114,7 +114,7 @@ TEST(InProcessClientTest, WriteAndSampleRoundTrip) {
   // Write one int32 step and create/flush an item into the table.
   std::unique_ptr<TrajectoryWriter> writer;
   REVERB_ASSERT_OK(
-      client.NewTrajectoryWriter("t", MakeOptions(1, 1), &writer));
+      client.NewTrajectoryWriter(MakeOptions(1, 1), &writer));
 
   StepRef refs;
   REVERB_ASSERT_OK(
@@ -139,11 +139,22 @@ TEST(InProcessClientTest, WriteAndSampleRoundTrip) {
 }
 
 TEST(InProcessClientTest, NewTrajectoryWriterRejectsUnknownTable) {
+  // After unchaining, NewTrajectoryWriter takes no `table` argument (the
+  // writer holds all client tables and dispatches by item.table()). An
+  // unknown table is rejected at CreateItem time by ItemAndRefs::Validate
+  // (the flat_signature_map built from the client's tables doesn't contain
+  // it), mirroring the gRPC path's deferred validation.
   auto table = MakeTable("t");
   InProcessClient client({table});
   std::unique_ptr<TrajectoryWriter> writer;
-  auto status = client.NewTrajectoryWriter("missing", MakeOptions(1, 1), &writer);
-  EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
+  REVERB_ASSERT_OK(client.NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  auto status = writer->CreateItem("missing", 1.0, MakeTrajectory({{refs[0]}}));
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("could not be found"));
 }
 
 TEST(InProcessClientTest, NewSamplerRejectsUnknownTable) {
@@ -161,7 +172,7 @@ TEST(InProcessClientTest, MutatePrioritiesAndReset) {
   // Insert an item the lazy way: borrow a writer.
   std::unique_ptr<TrajectoryWriter> writer;
   REVERB_ASSERT_OK(
-      client.NewTrajectoryWriter("t", MakeOptions(1, 1), &writer));
+      client.NewTrajectoryWriter(MakeOptions(1, 1), &writer));
   StepRef refs;
   REVERB_ASSERT_OK(
       writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
@@ -234,7 +245,7 @@ TEST(InProcessClientTest, CheckpointSaveAndLoadLatestRoundTrip) {
 
   std::unique_ptr<TrajectoryWriter> writer;
   REVERB_ASSERT_OK(
-      saver.NewTrajectoryWriter("ckpt_table", MakeOptions(1, 1), &writer));
+      saver.NewTrajectoryWriter(MakeOptions(1, 1), &writer));
   StepRef refs;
   REVERB_ASSERT_OK(
       writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
@@ -293,7 +304,7 @@ TEST(InProcessClientTest, LoadFromPathRoundTrip) {
 
   std::unique_ptr<TrajectoryWriter> writer;
   REVERB_ASSERT_OK(
-      saver.NewTrajectoryWriter("ckpt_table", MakeOptions(1, 1), &writer));
+      saver.NewTrajectoryWriter(MakeOptions(1, 1), &writer));
   StepRef refs;
   REVERB_ASSERT_OK(
       writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
@@ -350,7 +361,7 @@ TEST(InProcessClientTest, NewStructuredWriterRejectsEmptyConfigs) {
   auto table = MakeTable("t");
   InProcessClient client({table});
   std::unique_ptr<StructuredWriter> writer;
-  EXPECT_EQ(client.NewStructuredWriter("t", {}, &writer).code(),
+  EXPECT_EQ(client.NewStructuredWriter({}, &writer).code(),
             absl::StatusCode::kInvalidArgument);
 }
 
@@ -390,7 +401,7 @@ TEST(InProcessClientTest, StructuredWriterConditionWithRelativeSlice) {
   cond->set_inverse(true);
 
   std::unique_ptr<StructuredWriter> writer;
-  REVERB_ASSERT_OK(client.NewStructuredWriter("sw", {config}, &writer));
+  REVERB_ASSERT_OK(client.NewStructuredWriter({config}, &writer));
 
   for (int i = 0; i < 5; i++) {
     // Python `writer.append(i)` passes a Python int, which becomes a 0-d
@@ -421,6 +432,61 @@ TEST(InProcessClientTest, StructuredWriterConditionWithRelativeSlice) {
   // "[0,0,0]" report was caused by sampling with max_times_sampled=0, not by
   // an engine defect.
   EXPECT_THAT(values, ::testing::ElementsAre(0, 1, 2));
+}
+
+// D1/D3: StructuredWriter dispatches to multiple tables via config.table().
+// After unchaining, NewStructuredWriter takes no `table` argument; each
+// config's `table` field routes the item to the right table through the
+// underlying TrajectoryWriter's `tables_` map.
+TEST(InProcessClientTest, StructuredWriterDispatchesToMultipleTablesViaConfigs) {
+  auto table_a = MakeTable("a", /*max_size=*/100);
+  auto table_b = MakeTable("b", /*max_size=*/100);
+  InProcessClient client({table_a, table_b});
+
+  // Config A: emit the latest step into table "a".
+  StructuredWriterConfig config_a;
+  auto* node_a = config_a.add_flat();
+  node_a->set_flat_source_index(0);
+  node_a->set_start(-1);  // most recent step
+  config_a.set_table("a");
+  config_a.mutable_priority()->mutable_constant_fn()->set_value(1.0);
+
+  // Config B: same pattern, different table.
+  StructuredWriterConfig config_b;
+  auto* node_b = config_b.add_flat();
+  node_b->set_flat_source_index(0);
+  node_b->set_start(-1);
+  config_b.set_table("b");
+  config_b.mutable_priority()->mutable_constant_fn()->set_value(2.0);
+
+  std::unique_ptr<StructuredWriter> writer;
+  REVERB_ASSERT_OK(client.NewStructuredWriter({config_a, config_b}, &writer));
+
+  REVERB_ASSERT_OK(writer->Append(
+      Step({MakeConstantBuffer<int32_t>(DataType::Int32, {}, 7)})));
+  REVERB_ASSERT_OK(writer->EndEpisode(/*clear_buffers=*/true));
+
+  EXPECT_EQ(table_a->size(), 1);
+  EXPECT_EQ(table_b->size(), 1);
+
+  // Each table received an item carrying the appended value, with its own
+  // priority.
+  Sampler::Options sopts;
+  sopts.max_samples = 1;
+
+  std::unique_ptr<Sampler> sampler_a;
+  REVERB_ASSERT_OK(client.NewSampler("a", sopts, &sampler_a));
+  std::vector<TensorBuffer> data_a;
+  REVERB_ASSERT_OK(sampler_a->GetNextTrajectory(&data_a));
+  ASSERT_EQ(data_a.size(), 1u);
+  EXPECT_EQ(*reinterpret_cast<const int32_t*>(data_a[0].bytes().data()), 7);
+
+  std::unique_ptr<Sampler> sampler_b;
+  REVERB_ASSERT_OK(client.NewSampler("b", sopts, &sampler_b));
+  std::vector<TensorBuffer> data_b;
+  REVERB_ASSERT_OK(sampler_b->GetNextTrajectory(&data_b));
+  ASSERT_EQ(data_b.size(), 1u);
+  EXPECT_EQ(*reinterpret_cast<const int32_t*>(data_b[0].bytes().data()), 7);
 }
 
 }  // namespace
