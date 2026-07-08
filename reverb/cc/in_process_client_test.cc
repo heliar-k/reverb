@@ -282,6 +282,83 @@ TEST(InProcessClientTest, LoadLatestOnEmptyRootReturnsNotFound) {
   EXPECT_EQ(client.LoadLatest().code(), absl::StatusCode::kNotFound);
 }
 
+TEST(InProcessClientTest, LoadFromPathRoundTrip) {
+  // Save 阶段:写一个 item,checkpoint 到 path。
+  auto table = MakeTable("ckpt_table");
+  auto checkpointer =
+      std::make_shared<SimpleCheckpointer>(MakeCkptRoot());
+
+  std::vector<std::shared_ptr<Table>> save_tables{table};
+  InProcessClient saver(save_tables, checkpointer);
+
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(
+      saver.NewTrajectoryWriter("ckpt_table", MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(
+      writer->CreateItem("ckpt_table", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush());
+  ASSERT_EQ(table->size(), 1);
+
+  std::string path;
+  REVERB_ASSERT_OK(saver.Checkpoint(&path));
+  ASSERT_TRUE(std::filesystem::exists(path));
+
+  // Load(path) 阶段:用一个 *同 name* 的空 table 的新 client 从指定 path
+  // 恢复。Load 用 loader 自有的 chunk_store_ 接收 checkpoint 中的 chunk。
+  auto loaded_table = MakeTable("ckpt_table");
+  std::vector<std::shared_ptr<Table>> load_tables{loaded_table};
+  InProcessClient loader(load_tables, checkpointer);
+  REVERB_ASSERT_OK(loader.Load(path));
+  EXPECT_EQ(loaded_table->size(), 1);
+
+  // 采样 round-trip:加载的 item 能正常采样出原数据。
+  Sampler::Options sopts;
+  sopts.max_samples = 1;
+  std::unique_ptr<Sampler> sampler;
+  REVERB_ASSERT_OK(loader.NewSampler("ckpt_table", sopts, &sampler));
+  std::vector<TensorBuffer> data;
+  REVERB_ASSERT_OK(sampler->GetNextTrajectory(&data));
+  ASSERT_EQ(data.size(), 1u);
+  EXPECT_EQ(data[0].dtype(), DataType::Int32);
+  EXPECT_EQ(data[0].shape(), std::vector<int64_t>({1, 1}));
+}
+
+TEST(InProcessClientTest, LoadWithoutCheckpointerFails) {
+  auto table = MakeTable("t");
+  InProcessClient client({table});  // no checkpointer
+  EXPECT_EQ(client.Load("/any/path").code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(InProcessClientTest, MutatePrioritiesUnknownTableFails) {
+  auto table = MakeTable("t");
+  InProcessClient client({table});
+  EXPECT_EQ(client.MutatePriorities("missing", {}, {}).code(),
+            absl::StatusCode::kNotFound);
+}
+
+TEST(InProcessClientTest, ResetUnknownTableFails) {
+  auto table = MakeTable("t");
+  InProcessClient client({table});
+  EXPECT_EQ(client.Reset("missing").code(), absl::StatusCode::kNotFound);
+}
+
+TEST(InProcessClientTest, NewStructuredWriterRejectsEmptyConfigs) {
+  auto table = MakeTable("t");
+  InProcessClient client({table});
+  std::unique_ptr<StructuredWriter> writer;
+  EXPECT_EQ(client.NewStructuredWriter("t", {}, &writer).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+// REVERB_CHECK 无 NDEBUG 防护:opt/dbg 下均评估并 abort,死亡测试稳定触发。
+TEST(InProcessClientTest, ConstructorRejectsNullTable) {
+  ASSERT_DEATH(InProcessClient client({nullptr}), "null table");
+}
+
 // Regression for A9: StructuredWriter in in-process mode with a condition
 // that fires multiple times AND a relative slice (start=-1) must yield one
 // trajectory per matching step, each carrying that step's value.

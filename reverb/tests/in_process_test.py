@@ -718,5 +718,191 @@ class ClientLocalClientParityTest(absltest.TestCase):
       grpc_server.stop()
 
 
+
+class TrajectoryWriterConfigureTest(absltest.TestCase):
+  """configure() against a real in-process writer (not a mock).
+
+  Mirrors trajectory_writer_test.test_configure_seen_column but routes through
+  LocalClient.trajectory_writer so the C++ ConfigureChunker path is actually
+  exercised end-to-end.
+  """
+
+  def test_configure_seen_column_round_trip(self):
+    server = _make_server(table_name='t', max_size=10, min_size=1)
+    client = server.in_process_client
+
+    w = client.trajectory_writer(
+        table='t', num_keep_alive_refs=3, max_chunk_length=2)
+    # Establish the 'v' column.
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+    # The C++ chunker refuses ApplyConfig while its buffer holds unflushed
+    # data, so finalize the column into a chunk first via an item + flush.
+    w.create_item(
+        table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+    w.flush()
+    # Reconfigure the seen column to a constant chunk length of 1.
+    w.configure(('v',), num_keep_alive_refs=3, max_chunk_length=1)
+
+    # The writer must remain usable after configure.
+    w.append({'v': np.array([2.0], dtype=np.float32)})
+    w.append({'v': np.array([3.0], dtype=np.float32)})
+    w.create_item(
+        table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+    w.end_episode()
+
+    # Two items inserted (the flushed 1-step one + the 3-step one); FIFO
+    # returns the 3-step one second.
+    samples = list(client.sample('t', num_samples=2, emit_timesteps=False))
+    got = [np.asarray(s.data[0]).tolist() for s in samples]
+    self.assertIn([[1.0], [2.0], [3.0]], got)
+
+
+class TrajectoryWriterFlushTimeoutTest(absltest.TestCase):
+  """in-process flush(timeout_ms=...) surfaces DeadlineExceededError.
+
+  Mirrors trajectory_writer_test.test_timeout_on_flush but via LocalClient.
+  A Queue(1) limiter blocks the second insert (0 samples drawn), so items pile
+  up unconfirmed in the writer's in-flight set and flush times out.
+  """
+
+  def _blocked_server(self):
+    return reverb.Server(
+        tables=[
+            reverb.Table(
+                name='t',
+                sampler=reverb.selectors.Fifo(),
+                remover=reverb.selectors.Fifo(),
+                max_size=1,
+                max_times_sampled=1,
+                rate_limiter=reverb.rate_limiters.Queue(1),
+            )
+        ],
+        in_process=True,
+    )
+
+  def test_flush_times_out(self):
+    client = self._blocked_server().in_process_client
+    w = client.trajectory_writer(table='t', num_keep_alive_refs=1)
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+
+    with self.assertRaises(errors.DeadlineExceededError):
+      for _ in range(4):
+        w.create_item(
+            table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+        w.flush(timeout_ms=1)
+
+
+class TrajectoryWriterEndEpisodeTimeoutTest(absltest.TestCase):
+  """in-process end_episode(timeout_ms=...) surfaces DeadlineExceededError."""
+
+  def _blocked_server(self):
+    return reverb.Server(
+        tables=[
+            reverb.Table(
+                name='t',
+                sampler=reverb.selectors.Fifo(),
+                remover=reverb.selectors.Fifo(),
+                max_size=1,
+                max_times_sampled=1,
+                rate_limiter=reverb.rate_limiters.Queue(1),
+            )
+        ],
+        in_process=True,
+    )
+
+  def test_end_episode_times_out(self):
+    client = self._blocked_server().in_process_client
+    w = client.trajectory_writer(table='t', num_keep_alive_refs=1)
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+
+    with self.assertRaises(errors.DeadlineExceededError):
+      for _ in range(4):
+        w.create_item(
+            table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+        w.end_episode(clear_buffers=False, timeout_ms=1)
+
+
+class TrajectoryWriterEndEpisodeClearBuffersFalseTest(absltest.TestCase):
+  """end_episode(clear_buffers=False) keeps buffers across episodes."""
+
+  def test_history_persists_across_episodes(self):
+    server = _make_server(table_name='t', max_size=10, min_size=1)
+    client = server.in_process_client
+    w = client.trajectory_writer(table='t', num_keep_alive_refs=3)
+
+    # Episode 1: two steps.
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+    w.append({'v': np.array([2.0], dtype=np.float32)})
+    w.create_item(
+        table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+    w.end_episode(clear_buffers=False)
+
+    # episode_steps reset, but the 'v' buffer must still hold episode 1.
+    self.assertEqual(w.episode_steps, 0)
+    self.assertEqual(len(w.history['v']), 2)
+
+    # Episode 2: one more step; the new item spans both episodes.
+    w.append({'v': np.array([3.0], dtype=np.float32)})
+    self.assertEqual(len(w.history['v']), 3)
+    w.create_item(
+        table='t', priority=1.0, trajectory={'v': w.history['v'][:]})
+    w.end_episode()
+
+    # Two items inserted (episode-1's 2-step and the cross-episode 3-step);
+    # the 3-step one carries data from both episodes.
+    samples = list(client.sample('t', num_samples=2, emit_timesteps=False))
+    got = [np.asarray(s.data[0]).tolist() for s in samples]
+    self.assertIn([[1.0], [2.0], [3.0]], got)
+
+
+class TrajectoryWriterAppendDtypeMismatchTest(absltest.TestCase):
+  """append dtype mismatch raises ValueError naming the structured path."""
+
+  def test_dtype_mismatch_names_column(self):
+    server = _make_server(table_name='t', max_size=10, min_size=1)
+    client = server.in_process_client
+    w = client.trajectory_writer(table='t', num_keep_alive_refs=1)
+
+    w.append({'v': np.array([1.0], dtype=np.float32)})
+    with self.assertRaises(ValueError) as ctx:
+      w.append({'v': np.array([2], dtype=np.int32)})
+    # The C++ "for column N" message must be rewritten to the path 'v'.
+    self.assertIn("'v'", str(ctx.exception))
+
+
+class MultiTableServerInfoTest(absltest.TestCase):
+  """server_info reflects every table on a multi-table LocalClient."""
+
+  def test_two_tables_reported(self):
+    server = reverb.Server(
+        tables=[
+            reverb.Table(
+                name='t1',
+                sampler=reverb.selectors.Fifo(),
+                remover=reverb.selectors.Fifo(),
+                max_size=7,
+                max_times_sampled=1,
+                rate_limiter=reverb.rate_limiters.MinSize(1),
+            ),
+            reverb.Table(
+                name='t2',
+                sampler=reverb.selectors.Fifo(),
+                remover=reverb.selectors.Fifo(),
+                max_size=3,
+                max_times_sampled=1,
+                rate_limiter=reverb.rate_limiters.MinSize(1),
+            ),
+        ],
+        in_process=True,
+    )
+    client = server.in_process_client
+
+    info = client.server_info()
+    self.assertEqual(set(info), {'t1', 't2'})
+    self.assertEqual(info['t1'].max_size, 7)
+    self.assertEqual(info['t2'].max_size, 3)
+    self.assertEqual(info['t1'].current_size, 0)
+    self.assertEqual(info['t2'].current_size, 0)
+
 if __name__ == '__main__':
   absltest.main()
