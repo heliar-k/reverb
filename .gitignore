@@ -11,6 +11,7 @@
 /findings.md
 /progress.md
 /TODO.md
+/.pi/
 
 # Python bytecode cache
 __pycache__/
