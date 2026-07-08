@@ -153,7 +153,7 @@ class InProcessClient {
  public:
   explicit InProcessClient(std::vector<std::shared_ptr<Table>> tables,
                            std::shared_ptr<Checkpointer> checkpointer = nullptr);
-  // 不收 table 参数，writer 持 tables_ map 按 item.table() 分发（D1）
+  // 不收 table 参数，writer 持 tables_ map 按 item.table() 分发
   absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
                                   std::unique_ptr<TrajectoryWriter>* writer);
   absl::Status NewStructuredWriter(std::vector<StructuredWriterConfig> configs,
@@ -177,8 +177,8 @@ Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`wr
   `insert`/`writer`/`trajectory_writer`/`structured_writer` 全部工厂方法。
 - **`LocalClient`**（内嵌）：由 `Server(in_process=True).in_process_client` 返回，
   包装 C++ `InProcessClient`。与 `Client` API 严格镜像——`insert`/`writer` 上提到
-  `_BaseClient` 共享单一实现，`trajectory_writer`/`structured_writer` 不收 table 参数
-  （D1）。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickle)）。
+  `_BaseClient` 共享单一实现，`trajectory_writer`/`structured_writer` 不收 table
+  参数。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickle)）。
 
 两者通过两个 hook 区分 C++ 调用差异：`_fetch_server_info_proto`（gRPC 传 timeout，
 内嵌忽略）和 `_new_sampler`（gRPC 无 rate-limiter timeout，内嵌有）。
@@ -199,8 +199,11 @@ def decode_signature(data: bytes) -> Any: ...
 ```
 
 `Table` 构造时 signature 的叶子必须是 `signature_codec.TensorSpec`（不是 TF 的）。
-编码后传给 C++ `Table` 的是序列化后的 `SignatureProto` 字符串。C++ 侧只透传、
-不解析（signature 校验在 Python `TrajectoryWriter` 里做，或本地路径跳过）。
+编码后传给 C++ `Table` 的是序列化后的 `SignatureProto` 字符串。writer 构造时
+（gRPC 和本地路径都）用 `FlatSignatureFromSignatureProto` 把各 `Table::signature()`
+转成 `FlatSignatureMap` 塞进 `TrajectoryWriter::Options`，`CreateItem` 时
+`ItemAndRefs::Validate` 据此校验 trajectory 与表签名是否匹配——两端同一套 C++
+校验路径。
 
 ### 2.4 Checkpoint：`TFRecord` → length-delimited protobuf
 
@@ -381,9 +384,9 @@ with client.trajectory_writer(num_keep_alive_refs=10) as w:
     w.flush()
 ```
 
-> 说明：修正后（D1）本地 `trajectory_writer` 与 gRPC `Client.trajectory_writer`
-> 签名一致，都不传 `table`——writer 持 client 全部表，每个 item 在 `create_item`
-> 时按 `table` 参数路由。内嵌 `LocalClient` 也可用 `client.insert(...)`/
+> 说明：本地 `trajectory_writer` 与 gRPC `Client.trajectory_writer` 签名一致，
+> 都不传 `table`——writer 持 client 全部表，每个 item 在 `create_item` 时按
+> `table` 参数路由。内嵌 `LocalClient` 也可用 `client.insert(...)`/
 > `client.writer(...)`，与 gRPC 完全镜像（见 [3.5](#35-localclient-无-pickle)）。
 > `num_keep_alive_refs` 是循环缓冲区大小，即 trajectory 最大跨度。
 > `w.history['col'][:]` 返回 `TrajectoryColumn`，`create_item` 的
@@ -437,8 +440,8 @@ for sample in client.sample('t', num_samples=3, emit_timesteps=False):
     print(np.asarray(sample.data[0]))   # [0., 1., 2.], [1., 2., 3.], ...
 ```
 
-> 说明：修正后（D1）内嵌 `structured_writer` 与 gRPC `Client.structured_writer`
-> 签名一致，都不传 `table`——每个 config 的 `table` 字段指定目标表，writer 按
+> 说明：内嵌 `structured_writer` 与 gRPC `Client.structured_writer` 签名一致，
+> 都不传 `table`——每个 config 的 `table` 字段指定目标表，writer 按
 > `item.table()` 路由，支持多表写入。
 
 ### 4.5 Checkpoint 保存与恢复
@@ -498,7 +501,7 @@ Python API
   └──────────┬───────────────────────┘
              │ InsertOrAssignAsync
              ▼
-  TrajectoryWriter(table)   ← 本地路径分支 (is_local_=true)
+  TrajectoryWriter(tables_)   ← 本地路径分支 (is_local_=true)
     ├── Chunker (TensorBuffer)
     └── 列式 append → create_item → flush → Table
 
