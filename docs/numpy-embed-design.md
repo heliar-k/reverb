@@ -31,6 +31,12 @@
   - [4.4 StructuredWriter](#44-structuredwriter)
   - [4.5 Checkpoint 保存与恢复](#45-checkpoint-保存与恢复)
 - [5. 架构总览](#5-架构总览)
+- [6. 附录：本地 Writer 解绑与本地化（D1/D2/D3-a 摘录）](#6-附录本地-writer-解绑与本地化d1d2d3-a-摘录)
+  - [6.1 问题溯源](#61-问题溯源)
+  - [6.2 决策点](#62-决策点)
+  - [6.3 修正目标与交付边界](#63-修正目标与交付边界)
+  - [6.4 writer 持 map 的生命周期方式：持拷贝（方案 P）](#64-writer-持-map-的生命周期方式持拷贝方案-p)
+  - [6.5 ADR-0001：推翻 A1 砍 Writer 决策](#65-adr-0001推翻-a1-砍-writer-决策)
 
 ---
 
@@ -523,3 +529,194 @@ checkpoint: SimpleCheckpointer (length-delimited protobuf, 非 TFRecord)
 
 C++ 闭包零 TF（`bazel query deps(//reverb:pybind)` 无 `org_tensorflow`/`local_xla`），
 Python 闭包零 TF（无 `tf_nightly`/`keras`）。首次 `bazel build` 不再下载 TF 源码树。
+
+---
+
+## 6. 附录：本地 Writer 解绑与本地化（D1/D2/D3-a 摘录）
+
+> 本节摘录自 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) 与
+> [adr/0001-embedded-writer-local-path.md](adr/0001-embedded-writer-local-path.md)，
+> 是对上文 §3.2/§3.4/§3.5 所述修正的完整背景与决策记录。
+
+### 6.1 问题溯源
+
+设计文档 §3.2 把“本地 `TrajectoryWriter` 绑定单一 table”当作类结构折中的一部分，
+§3.4（`LocalClient.sample` 默认 `emit_timesteps=False`）和 §3.5（`LocalClient` 无
+`insert`/`writer`）被列为两个平行的“不得不做的变更”。
+
+代码核实后发现这三者其实是**同一个根因的三面**：
+
+1. 本地 writer 构造函数收 `shared_ptr<Table> table_`，worker `RunLocalWorker`
+   硬编码 `table_->InsertOrAssignAsync(...)`。
+2. `CreateItem(table, ...)` 的 `table` 参数在本地路径**完全不用于路由**——
+   只写进 `item.set_table()` 字段，该字段本地路径从不读取；signature 校验默认
+   跳过（`options.flat_signature_map = nullopt`）。
+3. 绑定单一 table → `LocalClient.trajectory_writer(table=...)` 必须显式传 table
+   → 无法对齐 gRPC `Client.trajectory_writer(num_keep_alive_refs)` 的无 table 签名
+   → 砍掉 `insert`/`writer`（§3.5）→ 只剩多步 trajectory 写入 → 翻默认值（§3.4）。
+
+**判断**：当时选择绑定单一 table 是偏懒。`InProcessClient` 本就持有
+`flat_hash_map<string, shared_ptr<Table>> tables_`，把 writer 改成持 map、worker
+按 `item.table()` 查表分发，是顺着现有结构就能做的事。省了几行 C++，付了三层
+API 债。修正把债还掉。
+
+### 6.2 决策点
+
+#### D1：`NewTrajectoryWriter`/`NewStructuredWriter` 去掉 `table` 参数
+
+核实 gRPC `Client::NewTrajectoryWriter` 签名**不收 table 参数**。gRPC 路径的表名
+校验延迟到 `CreateItem` 时，由 `ItemAndRefs::Validate` 用 `flat_signature_map`（从
+`ServerInfo` 缓存里拿的全部表 signature）查表做。
+
+**决策：去掉 `table` 参数，完全对齐 gRPC 签名。** 理由：保留 `table` 作 early 校验
+会引入新的签名不对称（gRPC 不收、内嵌收），陷入“看起来对齐、实际契约不同”的陷阱——
+正是本次修正要消灭的东西。对齐比 early 校验更重要；gRPC 的延迟校验本就是 proven
+设计，内嵌沿用即可。
+
+落地：
+
+- `InProcessClient::NewTrajectoryWriter(const Options& options, ...)` 不收 table，
+  writer 构造时持完整 `tables_` map。
+- `RunLocalWorker` 按 `item.table()` 查 `tables_` 分发，找不到报 `kNotFound`。
+- signature 校验对齐 gRPC：用现成的 `internal::FlatSignatureFromSignatureProto`（gRPC
+  侧同样走的成熟函数）把各 Table 的 signature 转成 `FlatSignatureMap` 塞进 options。
+  `ItemAndRefs::Validate` 走 gRPC 同一路径，无边界 bug 风险。
+- `NewStructuredWriter` 同步去掉 `table` 参数（内部调 `NewTrajectoryWriter`）。
+
+#### D2：backpressure 多表化——writer 级，对齐 gRPC
+
+核实 gRPC 路径的 backpressure 是 **writer 级单一通道**：所有表的数据共用一个 gRPC
+`InsertStream`，`write_inflight_` 是 writer 级单一 bool，`WriteIfNotEmpty` 在 write
+在飞期间 `mu_.Await` 阻塞。不管 item 要写哪个表，只要 stream 上有一个 write 未完成，
+整个 writer 就停。
+
+**决策：writer 级 backpressure，任意表满则 writer 停。** 理由：与 gRPC 语义完全
+同构——gRPC 是 stream 级阻塞，本地是 `local_can_insert_more_` 单一 flag，两者语义
+等价。改动最小（沿用单一 flag，只是 `InsertOrAssignAsync` 的表从固定变为按 item
+查），单表场景行为不变。
+
+代价：A 满 B 没满时 writer 也停，但这是可接受的（与 gRPC 一致，且一个 writer 交替
+写多表本就是 `insert` 多表场景，停顿不会放大）。
+
+#### D3：Python `LocalClient.insert` / `writer`——给 `Writer` 类加本地路径
+
+核实 `insert` 与 `writer` 的绑定关系及 gRPC `Client` 用法：
+
+- `Client.insert` **硬依赖** `writer`：`insert` 实现就是
+  `with self.writer(max_sequence_length=1) as w: w.append(data); w.create_item(...)`。
+  `insert` 是 gRPC `Client` 高频主力 API（tests 26 处用法），内部依赖 `writer`，
+  两者都是活 API。
+- `Writer` 类**没有真正废弃**：仍在 `__init__.py` 正式导出，docstring 是
+  "will eventually be deprecated"（将来某天），非已废弃。本 fork 还主动恢复了它
+  （去掉 `NotImplementedError`）。
+- `Writer` 类是**独立实现**，非 `TrajectoryWriter` 的封装：自带
+  `buffer_`/`chunks_`/`pending_items_`/gRPC `stream_`/`item_confirmation_worker_` 线程，
+  不用 chunker/column 抽象，是更早期的同步实现。
+
+**决策：给 `Writer` 类加本地路径，实现 `LocalClient.writer`/`insert`，与 gRPC `Client`
+完全对齐。**
+
+##### gRPC 链路调研：server 侧“远端处理”只有三件事，且全不依赖 gRPC
+
+`ProcessIncomingRequest` 的全部工作：
+
+1. **`SaveChunks`**——把请求里的 `ChunkData` 存进 reactor 的 `chunks_` map，纯内存操作。
+2. **`GetItemWithChunks`**——按 item 的 `flat_trajectory` 引用的 chunk key，从
+   `chunks_` 找出对应 `shared_ptr<Chunk>`，构造 `Table::Item(item, chunks)`，纯内存操作。
+3. **`table->InsertOrAssignAsync`**——按表名查表，调 `InsertOrAssignAsync` 插入，
+   `insert_completed_` callback 在插入完成后触发。
+
+C++ `Writer` 本就持有与 reactor 一一对应的成员（`chunks_` 对应 reactor 的 `chunks_`，
+`tables_[table_name]` 对应 `server_->TableByName`，callback 对应 reactor 的
+`insert_completed_`）。因此本地路径几乎是把 reactor 的 `ProcessIncomingRequest`
+平移进 `Writer::WritePendingData`——变量名都一一对应。
+
+实际工作量：绝大部分原样复用（`Append`/`AppendSequence`/`CreateItem`/`Finish`/
+`Flush`/`Close`/`ConfirmItems` 同步骨架不动），只改 `WritePendingData`——把
+`stream_->Write(request)` 替换为内联的 `SaveChunks` + `GetItemWithChunks` +
+`tables_[name]->InsertOrAssignAsync`。
+
+##### 确认机制：保留 `Writer` 同步骨架，callback 递减计数
+
+`Writer` 是同步模型：调用线程直接 `Append`→`Finish`→`WritePendingData`，
+`ConfirmItems(limit)` 在调用线程同步阻塞等 `num_items_in_flight_` 降下来。这与
+`TrajectoryWriter` 的异步模型（write_queue + worker 线程）根本不同，不能套用
+`TrajectoryWriter` 的 `local_can_insert_more_` flag 模式。
+
+本地化方案：保留同步骨架，只换信号源——每 insert 建 per-item `InsertCallback`，
+捕获 `this`，在表 worker 线程触发时持 `mu_` 递减 `num_items_in_flight_` 并 signal。
+`ConfirmItems(limit)`/`num_items_in_flight_` 不动，唤醒源从“gRPC READ 响应”换成
+“callback signal”。`Close()` 本地路径：`ConfirmItems(0)` drain → 释放 callback，
+无遗留 in-flight，析构安全。
+
+`ConfirmItems` 的 `done` 条件本地路径改为 `num_items_in_flight_ <= limit || closed_`
+（加 `closed_` 逃生，防表 worker 出错致 callback 永不触发时永久阻塞，对齐
+`TrajectoryWriter` 的 `!closed_ && !stream_ok_` 等待模式）。
+
+### 6.3 修正目标与交付边界
+
+**本次修正是一个原子交付单元**——`TrajectoryWriter` 解绑与 `Writer` 本地化（D3-a）
+**一起上，不拆分**。理由：简化用户认知（一次性对齐），避免中间态（只解绑不补 Writer
+时，`LocalClient` 有 `trajectory_writer` 但无 `insert`/`writer`，仍不对称）。
+
+- **C++ 层**：本地 `TrajectoryWriter`/`Writer` 持 `tables_` map 而非单一 `table_`，
+  worker 按 `item.table()` 分发。`CreateItem` 指向未知表时报错（原静默）。
+- **Python 层**：`LocalClient.trajectory_writer`/`structured_writer` 去掉 `table` 参数，
+  签名对齐 gRPC `Client`。补 `insert`/`writer`，语义对齐。
+- 消解 §3.4：`_default_emit_timesteps` 统一回 `True`。
+- 保留 §3.5 中唯一真实的物理约束：无 `__reduce__`（pickle），因为 `LocalClient`
+  持进程内指针不可跨进程序列化。
+
+### 6.4 writer 持 map 的生命周期方式：持拷贝（方案 P）
+
+两个类（`TrajectoryWriter`/`Writer`）解绑后都要持 `tables_` map。决策：**writer 持
+map 拷贝**（复制 `flat_hash_map<string, shared_ptr<Table>>`，每个 `shared_ptr<Table>`
+引用计数 +1），不改 `InProcessClient::tables_` 为 `shared_ptr<map>`。理由：
+
+1. **checkpoint 恢复语义正确**：`LoadLatest` 原地改写 `Table` 对象内容
+   （`InitializeFromCheckpoint` 重建 sampler/remover/rate_limiter，
+   `InsertCheckpointItem` 灌回 item），**不替换 `shared_ptr<Table>` 指向**。writer 持
+   的 shared_ptr 副本与 client 的指向同一 Table 对象，`LoadLatest` 后 writer 自动看到
+   恢复状态。
+2. **`LoadLatest` 前提保证安全**：`LoadLatest` 要求各 table 为空，即仅新建 server 时
+   调用一次。有 writer 在写的表不空，不会与 `LoadLatest` 竞态。
+3. **性能可忽略**：writer 创建是 per-context（per-episode），非 per-step 热路径。
+   map 拷贝 = 几个 `shared_ptr` 原子递增（典型 1-4 个表，十几纳秒），相对 writer
+   构造本身的微秒/毫秒开销是噪声。
+4. **ripple 最小**：不改 `InProcessClient` 成员类型，`LoadLatest`/`Load`/`GetTable`
+   逻辑全不动。
+
+### 6.5 ADR-0001：推翻 A1 砍 Writer 决策
+
+**背景**：设计文档 §1.3 决策 A1 当初决定：内嵌模式只做 `TrajectoryWriter` +
+`StructuredWriter`，旧 `Writer`/`StreamingTrajectoryWriter` 的本地路径“价值低，
+砍掉省复杂度”。这导致 `LocalClient` 无 `insert`/`writer`，与 gRPC `Client` 的 API
+不对称（§3.5），并连带逼出 `LocalClient.sample` 默认 `emit_timesteps=False` 的偏差
+（§3.4）。
+
+**触发推翻的事实**：
+
+- `Writer` **没有真正废弃**：仍在 `__init__.py` 正式导出，docstring 是 "will
+  eventually be deprecated"（将来某天），非已废弃；本 fork 还主动恢复了它。
+- `insert` **硬依赖** `writer`：`insert` 实现就是
+  `with self.writer(max_sequence_length=1) as w: w.append(data); w.create_item(...)`。
+  `insert` 是 gRPC `Client` 高频主力 API（tests 26 处用法），A1 砍 `writer` 等于内嵌
+  用户也丢了 `insert` 这个便捷入口。
+- gRPC `Client` 三套写入 API（`insert`/`writer`/`trajectory_writer`）并存且都活，
+  `trajectory_writer` 是推荐项但不替代另两者。
+
+**决策：推翻 A1 关于 Writer 的部分。** 给 `Writer` 类加本地路径（基于 server 侧
+`ProcessIncomingRequest` 的三件事全不依赖 gRPC，可平移进 `Writer::WritePendingData`）。
+`LocalClient` 补 `writer`/`insert`，与 gRPC `Client` API 严格镜像。A1 的“省复杂度”
+理由被“API 严格镜像”取代。
+
+**后果**：
+
+- `LocalClient` 具备 `insert`/`writer`/`trajectory_writer`/`structured_writer` 全套，
+  与 gRPC `Client` 签名一致，代码可直接迁移。
+- `_default_emit_timesteps` 两端统一为 `True`（消解 §3.4）。
+- §3.5 缩减为仅“无 pickle”（`__reduce__`），这是 `LocalClient` 持进程内指针的真实
+  物理约束，非 API 债。
+- `StreamingTrajectoryWriter` 仍不在内嵌范围（A1 该部分保留，本决策只推翻 Writer 部分）。
+
+**状态**：accepted。supersedes §1.3 决策 A1 中“旧 `Writer` 本地路径砍掉”的部分。
