@@ -22,7 +22,7 @@
   - [3.2 `TrajectoryWriter` 加本地路径分支](#32-trajectorywriter-加本地路径分支)
   - [3.3 pybind PascalCase 双名别名](#33-pybind-pascalcase-双名别名)
   - [3.4 `LocalClient.sample` 默认 `emit_timesteps=True`](#34-localclientsample-默认-emit_timestepstrue)
-  - [3.5 `LocalClient` 无 pickle（`insert`/`writer` 已对齐）](#35-localclient-无-pickleinsertwriter-已对齐)
+  - [3.5 `LocalClient` 无 pickle](#35-localclient-无-pickle)
   - [3.6 旧 checkpoint 不兼容](#36-旧-checkpoint-不兼容)
 - [4. 使用样例对比](#4-使用样例对比)
   - [4.1 创建 Server 与 Client](#41-创建-server-与-client)
@@ -91,7 +91,7 @@ signature 用 TF 的 `nested_structure_coder` 编解码，checkpoint 用 TFRecor
 | C2 | 保留 `table_worker_` + `extension_worker_` 异步线程 | 零 GIL 是性能基础，不能丢 |
 | D1 | 本地 `TrajectoryWriter`/`Writer` 持 `tables_` map，按 `item.table()` 分发 | 修正“绑定单一 table”的历史偏懒选择，签名对齐 gRPC `Client`(不收 table 参数)，消除三层 API 债。详见 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) |
 | D2 | writer 级 backpressure(任意表满则 writer 停) | 对齐 gRPC writer 级单一 stream 的语义；单表场景行为不变 |
-| D3 | checkpoint 用 length-delimited protobuf | TFRecord 去掉 CRC32 就是标准 length-delimited protobuf，~20 行实现。**注**：与下方 §3.5 的 D3-a(Writer 本地化) 不同编号语境，此处 D3 为 checkpoint 决策 |
+| D3 | checkpoint 用 length-delimited protobuf | TFRecord 去掉 CRC32 就是标准 length-delimited protobuf，~20 行实现。**注**：与 §6 的 D3-a(Writer 本地化) 不同编号语境，此处 D3 为 checkpoint 决策 |
 
 ---
 
@@ -178,7 +178,7 @@ Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`wr
 - **`LocalClient`**（内嵌）：由 `Server(in_process=True).in_process_client` 返回，
   包装 C++ `InProcessClient`。与 `Client` API 严格镜像——`insert`/`writer` 上提到
   `_BaseClient` 共享单一实现，`trajectory_writer`/`structured_writer` 不收 table 参数
-  （D1）。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickleinsertwriter-已对齐)）。
+  （D1）。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickle)）。
 
 两者通过两个 hook 区分 C++ 调用差异：`_fetch_server_info_proto`（gRPC 传 timeout，
 内嵌忽略）和 `_new_sampler`（gRPC 无 rate-limiter timeout，内嵌有）。
@@ -246,7 +246,7 @@ C++ 侧 `Sampler::Options.rate_limiter_timeout` 和 `TrajectoryWriter::Flush`/
 
 ## 3. 不得不做的变更
 
-这些变更不是"想做"，而是"去 TF + 加内嵌"的必然结果，有些带来了 API 不对称。
+这些变更不是“想做”，而是“去 TF + 加内嵌”的必然结果。
 
 ### 3.1 fork 精简 proto 到 `third_party/`
 
@@ -267,16 +267,16 @@ C++ 侧 `Sampler::Options.rate_limiter_timeout` 和 `TrajectoryWriter::Flush`/
 本 fork 给 `TrajectoryWriter` 加了本地路径分支（`is_local_` 标志）：本地路径调
 `Table::InsertOrAssignAsync`，用 callback 替代 gRPC 的 `OnReadDone`。
 
-> **决策**：原计划新建独立的 `LocalTrajectoryWriter` 类，实际改为直接在
-> `TrajectoryWriter` 内加分支——复用全部 chunker/column 逻辑，避免代码重复。
->
-> **修正(D1)**：早期实现让本地 writer 构造时绑定**单一** `table_`，逼出三层 API 债
-> （`LocalClient.trajectory_writer(table=...)` 必须显式传 table、§3.4 的默认值偏差、
-> §3.5 的 `insert`/`writer` 缺失）。现改为 writer 持 `tables_` map（拷贝，方案 P），
-> worker 按 `item.table()` 查表分发，未知表报 `kNotFound`；`InProcessClient::
-> NewTrajectoryWriter` 去掉 table 参数，完全对齐 gRPC `Client` 签名。backpressure
-> 为 writer 级单一 flag（D2：任意表满则 writer 停，对齐 gRPC writer 级 stream），
-> 单表场景行为不变。详见 [unbind-local-writer-plan.md](unbind-local-writer-plan.md)。
+原计划新建独立的 `LocalTrajectoryWriter` 类，实际改为直接在 `TrajectoryWriter`
+内加分支——复用全部 chunker/column 逻辑，避免代码重复。
+
+本地 writer 持 `tables_` map（拷贝，方案 P），不绑单一 table：worker 按
+`item.table()` 查表分发，未知表报 `kNotFound`；backpressure 为 writer 级单一 flag
+（D2：任意表满则 writer 停，对齐 gRPC writer 级 stream）。`InProcessClient::
+NewTrajectoryWriter` 不收 table 参数，完全对齐 gRPC `Client` 签名。完整决策背景
+（含早期“绑定单一 table”的折中如何逼出三层 API 债、为何改为持 map）见
+[§6](#6-附录本地-writer-解绑与本地化d1d2d3-a-摘录) 与
+[unbind-local-writer-plan.md](unbind-local-writer-plan.md)。
 
 ### 3.3 pybind PascalCase 双名别名
 
@@ -299,31 +299,20 @@ C++ 侧 `Sampler::Options.rate_limiter_timeout` 和 `TrajectoryWriter::Flush`/
 ### 3.4 `LocalClient.sample` 默认 `emit_timesteps=True`
 
 `sample(emit_timesteps=...)` 控制返回整条 trajectory 还是按 timestep 拆分。
+两端 `Client` 与 `LocalClient` 默认都为 `True`（gRPC 的历史行为），调用方可显式传
+`emit_timesteps=False` 取整条 trajectory。两端默认一致，无不对称。
 
-早期内嵌 `LocalClient` 默认 `False`（内嵌场景几乎总是想要整条 trajectory），与
- gRPC `Client` 的 `True` 不一致。该偏差是“本地 writer 绑定单一 table”连带逼出的
- 三层 API 债之一（见 §3.2 修正）。
+### 3.5 `LocalClient` 无 pickle
 
-**修正(D1)**：writer 解绑 + 补 `insert`/`writer` 后，两端 API 严格镜像，
-`_default_emit_timesteps` 统一为 `True`（gRPC 的历史行为）。调用方可显式传
-`emit_timesteps=False` 取整条 trajectory。
-
-### 3.5 `LocalClient` 无 pickle（`insert`/`writer` 已对齐）
-
-gRPC `Client` 有 `insert(data, priorities)`、`writer(max_sequence_length)`、
-`__reduce__`（pickle 支持，因为 Client 只存 server 地址，可跨进程重建）。
-
-早期 `LocalClient` 没有 `insert`/`writer`（受“绑定单一 table”连带影响，见 §3.2
-修正），与 gRPC `Client` 不对称。
-
-**修正(D1/D3-a)**：writer 解绑后，`insert`/`writer` 上提到 `_BaseClient`，
-`LocalClient` 与 `Client` 共享单一实现（靠 `self.writer`/`self._client.NewWriter`
-鸭子类型分派），签名与语义完全一致。`LocalClient.writer` 创建本地 `Writer`
-（持 `tables_` map，按 `item.table()` 分发，`InsertCallback` 递减
+`LocalClient` 与 gRPC `Client` 的写入 API 完全对齐：`insert`/`writer` 上提到
+`_BaseClient` 共享单一实现（靠 `self.writer`/`self._client.NewWriter` 鸭子类型分派），
+`trajectory_writer`/`structured_writer` 不收 table 参数。`LocalClient.writer` 创建本地
+`Writer`（持 `tables_` map，按 `item.table()` 分发，`InsertCallback` 递减
 `num_items_in_flight_` 复刻 gRPC `ConfirmItems` 语义）。
 
 唯一保留的真实物理约束：**无 `__reduce__`（pickle）**——`LocalClient` 持进程内
-Table 指针，不可跨进程序列化。这是物理约束，非 API 债。
+Table 指针，不可跨进程序列化。这是物理约束，非 API 债。Writer 本地化与 `insert`/
+`writer` 补全的完整决策背景见 [§6](#6-附录本地-writer-解绑与本地化d1d2d3-a-摘录)。
 
 ### 3.6 旧 checkpoint 不兼容
 
@@ -395,7 +384,7 @@ with client.trajectory_writer(num_keep_alive_refs=10) as w:
 > 说明：修正后（D1）本地 `trajectory_writer` 与 gRPC `Client.trajectory_writer`
 > 签名一致，都不传 `table`——writer 持 client 全部表，每个 item 在 `create_item`
 > 时按 `table` 参数路由。内嵌 `LocalClient` 也可用 `client.insert(...)`/
-> `client.writer(...)`，与 gRPC 完全镜像（见 [3.5](#35-localclient-无-pickleinsertwriter-已对齐)）。
+> `client.writer(...)`，与 gRPC 完全镜像（见 [3.5](#35-localclient-无-pickle)）。
 > `num_keep_alive_refs` 是循环缓冲区大小，即 trajectory 最大跨度。
 > `w.history['col'][:]` 返回 `TrajectoryColumn`，`create_item` 的
 > `trajectory` 是一个结构与期望采样结构一致嵌套 dict/list。
@@ -536,14 +525,13 @@ Python 闭包零 TF（无 `tf_nightly`/`keras`）。首次 `bazel build` 不再�
 
 > 本节摘录自 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) 与
 > [adr/0001-embedded-writer-local-path.md](adr/0001-embedded-writer-local-path.md)，
-> 是对上文 §3.2/§3.4/§3.5 所述修正的完整背景与决策记录。
+> 是上文 §3.2/§3.4/§3.5 当前实现背后的完整背景与决策记录（含早期“绑定单一 table”
+> 折中如何被推翻）。
 
 ### 6.1 问题溯源
 
-设计文档 §3.2 把“本地 `TrajectoryWriter` 绑定单一 table”当作类结构折中的一部分，
-§3.4（`LocalClient.sample` 默认 `emit_timesteps=False`）和 §3.5（`LocalClient` 无
-`insert`/`writer`）被列为两个平行的“不得不做的变更”。
-
+早期实现曾把“本地 `TrajectoryWriter` 绑定单一 table”当作类结构折中，连带
+`LocalClient.sample` 默认 `emit_timesteps=False`、`LocalClient` 无 `insert`/`writer`。
 代码核实后发现这三者其实是**同一个根因的三面**：
 
 1. 本地 writer 构造函数收 `shared_ptr<Table> table_`，worker `RunLocalWorker`
@@ -663,8 +651,8 @@ C++ `Writer` 本就持有与 reactor 一一对应的成员（`chunks_` 对应 re
   worker 按 `item.table()` 分发。`CreateItem` 指向未知表时报错（原静默）。
 - **Python 层**：`LocalClient.trajectory_writer`/`structured_writer` 去掉 `table` 参数，
   签名对齐 gRPC `Client`。补 `insert`/`writer`，语义对齐。
-- 消解 §3.4：`_default_emit_timesteps` 统一回 `True`。
-- 保留 §3.5 中唯一真实的物理约束：无 `__reduce__`（pickle），因为 `LocalClient`
+- 消解早期 `emit_timesteps=False` 偏差：`_default_emit_timesteps` 统一回 `True`。
+- 保留唯一真实的物理约束：无 `__reduce__`（pickle），因为 `LocalClient`
   持进程内指针不可跨进程序列化。
 
 ### 6.4 writer 持 map 的生命周期方式：持拷贝（方案 P）
@@ -690,9 +678,8 @@ map 拷贝**（复制 `flat_hash_map<string, shared_ptr<Table>>`，每个 `share
 
 **背景**：设计文档 §1.3 决策 A1 当初决定：内嵌模式只做 `TrajectoryWriter` +
 `StructuredWriter`，旧 `Writer`/`StreamingTrajectoryWriter` 的本地路径“价值低，
-砍掉省复杂度”。这导致 `LocalClient` 无 `insert`/`writer`，与 gRPC `Client` 的 API
-不对称（§3.5），并连带逼出 `LocalClient.sample` 默认 `emit_timesteps=False` 的偏差
-（§3.4）。
+砍掉省复杂度”。这导致早期 `LocalClient` 无 `insert`/`writer`，与 gRPC `Client`
+的 API 不对称，并连带逼出 `LocalClient.sample` 默认 `emit_timesteps=False` 的偏差。
 
 **触发推翻的事实**：
 
@@ -714,9 +701,9 @@ map 拷贝**（复制 `flat_hash_map<string, shared_ptr<Table>>`，每个 `share
 
 - `LocalClient` 具备 `insert`/`writer`/`trajectory_writer`/`structured_writer` 全套，
   与 gRPC `Client` 签名一致，代码可直接迁移。
-- `_default_emit_timesteps` 两端统一为 `True`（消解 §3.4）。
-- §3.5 缩减为仅“无 pickle”（`__reduce__`），这是 `LocalClient` 持进程内指针的真实
-  物理约束，非 API 债。
+- `_default_emit_timesteps` 两端统一为 `True`。
+- §3.5 仅保留“无 pickle”（`__reduce__`）这一真实物理约束，这是 `LocalClient` 持
+  进程内指针的物理事实，非 API 债。
 - `StreamingTrajectoryWriter` 仍不在内嵌范围（A1 该部分保留，本决策只推翻 Writer 部分）。
 
 **状态**：accepted。supersedes §1.3 决策 A1 中“旧 `Writer` 本地路径砍掉”的部分。
