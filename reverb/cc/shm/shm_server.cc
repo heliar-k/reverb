@@ -591,7 +591,7 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     bool can_insert_more = false;
     absl::Status s = table_->InsertOrAssignAsync(std::move(table_item),
                                                  &can_insert_more, cb);
-if (!s.ok()) {
+    if (!s.ok()) {
       return s;
     }
     // ponytail: v1 ignores can_insert_more on the server side — the dispatch

@@ -119,7 +119,7 @@ std::shared_ptr<Table> MakeTable(const std::string& name, int max_size = 100) {
 }
 
 // A table whose rate limiter never blocks (min/max_diff wide open): inserts
-// and samples proceed freely. Used by the backpressure test so the writer's
+// and samples proceed freely. Used by the sequential-insert-ack test so the
 // ACK path is exercised without the rate limiter gating inserts (which would
 // hang the worker's blocking ACK poll when no sampler is draining).
 std::shared_ptr<Table> MakePermissiveTable(const std::string& name,
@@ -247,17 +247,26 @@ TEST(ShmInsertTest, MultiChunkItemRoundTrips) {
   sampler->Close();
 }
 
-// Backpressure (decision C2): with a tight rate limiter (max_size=1, no
-// samples drained), writing many items must block at Flush until the table's
-// insert queue backpressures the writer via the ACK path. We don't deadlock,
-// which proves the ACK -> local_can_insert_more_ -> data_cv_ loop is wired:
-// the writer can only make progress as the table callback fires and releases
-// offsets. After draining samples, the remaining items flush through.
-TEST(ShmInsertTest, BackpressureDoesNotDeadlock) {
+// v1 synchronous insert round-trip (decision C2): with a tight rate
+// limiter (max_size=1, no samples drained), writing many items must not
+// deadlock. v1 RunShmWorker is STRICTLY SYNCHRONOUS (in_flight <= 1): each
+// item does ALLOCATE -> INSERT -> read_blocking(ACK) -> erase from
+// in_flight -> RELEASE, then loops to the next item. in_flight_items_ never
+// exceeds 1, so there is no in_flight>1 pipelined backpressure gate in v1.
+// local_can_insert_more_ is set to true on ACK but is NEVER read/awaited by
+// RunShmWorker (unlike RunLocalWorker, which waits on it at line ~815) — it is
+// vestigial from RunLocalWorker and NOT a backpressure gate in v1. The only
+// backpressure here is the natural C->S ring-full block on Write plus the
+// serial ACK wait. After draining samples, the remaining items flush through.
+//
+// ponytail: true in_flight>1 async/pipelined backpressure is deferred —
+// upgrade RunShmWorker to async batch + reuse local_can_insert_more_ as the
+// gate.
+TEST(ShmInsertTest, SequentialInsertAckDoesNotDeadlock) {
   // Permissive rate limiter + small max_size: all 10 inserts complete (the
   // Fifo remover evicts the oldest beyond max_size), exercising the writer's
-  // ALLOCATE->INSERT->ACK->RELEASE loop 10 times. If the ACK/backpressure path
-  // wedges, Flush times out instead of hanging.
+  // ALLOCATE->INSERT->ACK->RELEASE loop 10 times. If the ACK path wedges,
+  // Flush times out instead of hanging.
   auto table = MakePermissiveTable("t", /*max_size=*/2);
   auto fx = ShmFixture::Make(table, "bp");
   ASSERT_NE(fx, nullptr);
@@ -266,9 +275,9 @@ TEST(ShmInsertTest, BackpressureDoesNotDeadlock) {
   REVERB_ASSERT_OK(
       fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
 
-  // Write 10 items with a 100ms flush timeout each. If the ACK/backpressure
-  // path is broken (writer never gets confirmation), Flush times out and the
-  // test fails with DeadlineExceeded instead of hanging.
+  // Write 10 items with a 100ms flush timeout each. If the synchronous
+  // INSERT->ACK path is broken (writer never gets confirmation), Flush times
+  // out and the test fails with DeadlineExceeded instead of hanging.
   for (int i = 0; i < 10; i++) {
     StepRef refs;
     REVERB_ASSERT_OK(

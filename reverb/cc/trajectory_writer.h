@@ -440,9 +440,6 @@ class TrajectoryWriter : public ColumnWriter,
   // instead of going over gRPC).
   bool is_local_ = false;
 
-  // True when the writer is in SHM mode (inserts go over SHM to a ShmServer).
-  bool is_shm_ = false;
-
   // Borrowed SHM connection (SHM mode only). Owned by ShmClient; must outlive
   // the writer.
   shm::ShmConnection* shm_conn_ = nullptr;

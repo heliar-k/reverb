@@ -371,8 +371,7 @@ TrajectoryWriter::TrajectoryWriter(
 
 TrajectoryWriter::TrajectoryWriter(shm::ShmConnection* conn,
                                    const Options& options)
-    : is_shm_(true),
-      shm_conn_(conn),
+    : shm_conn_(conn),
       options_(options),
       key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
       episode_id_(key_generator_->Generate()),
@@ -1070,7 +1069,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     MsgType ack_type;
     std::string ack_body;
     absl::Status as = read_blocking(&shm_conn_->s2c, &ack_type, &ack_body);
-if (!as.ok()) {
+    if (!as.ok()) {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);
       stream_ok_ = false;
@@ -1148,6 +1147,13 @@ if (!as.ok()) {
     }
 
     // Completion: erase from in_flight, allow more inserts, signal waiters.
+    // ponytail: v1 RunShmWorker is strictly synchronous (in_flight <= 1) —
+    // each INSERT blocks on read_blocking(ACK) before the next item is popped,
+    // so in_flight_items_ never exceeds 1. local_can_insert_more_ is set here
+    // but NEVER read/awaited by RunShmWorker (unlike RunLocalWorker, which
+    // waits on it while false). It is vestigial from RunLocalWorker and NOT a
+    // backpressure gate in v1. Upgrade: async batched inserts reusing this as
+    // the in_flight>1 gate.
     {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);
