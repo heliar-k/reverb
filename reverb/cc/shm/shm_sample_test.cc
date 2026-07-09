@@ -275,14 +275,19 @@ TEST(ShmSampleTest, EmptyTableTimeoutIsDeadlineExceeded) {
   (*server)->Stop();
 }
 
-// RELEASE recycles pool blocks: sampling many items from a table whose pool is
-// small must not leak. If RELEASE were broken, the pool would exhaust and the
-// server's Allocate would block forever (test hangs). The Nth sample succeeds
-// => earlier blocks were recycled. The default pool has 256 blocks per tier,
-// far fewer than 40 samples of [5,2] uint64 = 80 bytes -> 256-byte tier.
+// RELEASE recycles pool blocks: sampling many items must not leak. Each
+// sample ([5,2] uint64 = 80 bytes) lands in the pool's 256-byte tier, which
+// has kDefaultBlocksPerSlab (256) blocks. We sample 600 times — more than
+// the 256-block tier holds — so a broken RELEASE (never Deallocating) would
+// exhaust the tier after 256 allocations and the 257th pool_.Allocate would
+// block forever on its condvar, hanging the test (bazel kills it as TIMEOUT).
+// If RELEASE works, blocks recycle and all 600 samples succeed. Do NOT lower
+// the count below 257 without also shrinking the pool (ShmServer::Create has
+// no pool-config knob); 600 leaves headroom above the 256-block threshold.
 TEST(ShmSampleTest, ReleaseRecyclesPoolBlocks) {
-  auto table = MakeTable(100);
-  for (int i = 1; i <= 40; i++) {
+  constexpr int kNumSamples = 600;
+  auto table = MakeTable(kNumSamples);
+  for (int i = 1; i <= kNumSamples; i++) {
     InsertItem(table.get(), /*key=*/i, /*priority=*/1.0,
                /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
   }
@@ -296,9 +301,10 @@ TEST(ShmSampleTest, ReleaseRecyclesPoolBlocks) {
   REVERB_ASSERT_OK(client.status());
 
   std::unique_ptr<ShmSampler> sampler;
-  REVERB_ASSERT_OK((*client)->NewSampler("queue", {40}, &sampler));
+  REVERB_ASSERT_OK(
+      (*client)->NewSampler("queue", {kNumSamples}, &sampler));
 
-  for (int i = 0; i < 40; i++) {
+  for (int i = 0; i < kNumSamples; i++) {
     std::vector<TensorBuffer> data;
     REVERB_EXPECT_OK(sampler->GetNextTrajectory(&data))
         << "sample " << i << " failed (pool likely leaked)";

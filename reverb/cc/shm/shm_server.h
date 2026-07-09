@@ -23,10 +23,10 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/shm/byte_pool.h"
 #include "reverb/cc/shm/ring.h"
@@ -49,7 +49,7 @@ struct ClientState {
   int fd = -1;                       // udsocket fd (closed on disconnect)
   int client_pid = 0;
   ShmConnection conn;                // c2s, s2c rings; pool unused server-side
-  absl::flat_hash_set<uint64_t> outstanding_offsets_;  // C3: crash recovery (⑥)
+  internal::flat_hash_set<uint64_t> outstanding_offsets_;  // C3: crash recovery (⑥)
 
   // Stashed S→C messages that did not fit (ring full). Flushed each dispatch
   // pass via a non-blocking Write. ponytail: vector, upgrade to ring-buffer.

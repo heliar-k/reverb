@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/shm/bootstrap.h"
