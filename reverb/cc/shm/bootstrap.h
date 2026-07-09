@@ -48,6 +48,11 @@ class ShmBootstrapServer {
   // owns it and must close) and the client's PID (read via SO_PEERCRED).
   absl::StatusOr<std::pair<int, int>> Accept();
 
+  // The listening socket fd, for callers (e.g. ShmServer's dispatch loop)
+  // that need to poll for new connections without blocking. Spec §8.4: the
+  // dispatch loop must not stall on accept while clients have pending work.
+  int listen_fd() const { return listen_fd_; }
+
   const std::string& socket_path() const { return socket_path_; }
 
  private:

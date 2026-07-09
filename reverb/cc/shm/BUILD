@@ -127,6 +127,7 @@ reverb_cc_library(
     name = "shm_connection",
     hdrs = ["shm_connection.h"],
     deps = [
+        ":byte_pool",
         ":ring",
     ],
 )
@@ -142,6 +143,98 @@ reverb_cc_test(
         "//reverb/cc/platform:status_matchers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---- ShmServer (ticket ③) ----
+
+# ponytail: libpython linkopts come transitively from :tensor_proxy (via
+# :table/:trajectory_util); the server builds TensorBuffers (no GIL) but links
+# the numpy C-API symbols through that dep.
+reverb_cc_library(
+    name = "shm_server",
+    srcs = ["shm_server.cc"],
+    hdrs = ["shm_server.h"],
+    deps = [
+        ":bootstrap",
+        ":byte_pool",
+        ":ring",
+        ":shm_connection",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc/platform:hash_map",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/support:tensor_proxy",
+        "//reverb/cc/support:trajectory_util",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+# ---- ShmClient (ticket ③) ----
+
+reverb_cc_library(
+    name = "shm_client",
+    srcs = ["shm_client.cc"],
+    hdrs = ["shm_client.h"],
+    deps = [
+        ":bootstrap",
+        ":byte_pool",
+        ":ring",
+        ":shm_connection",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc:errors",
+        "//reverb/cc:sampler",
+        "//reverb/cc:table",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform:thread",
+        "//reverb/cc/support:queue",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+# ---- Sample-path integration test (ticket ③) ----
+
+reverb_cc_test(
+    name = "shm_sample_test",
+    srcs = ["shm_sample_test.cc"],
+    deps = [
+        ":shm_client",
+        ":shm_server",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc:chunk_store",
+        "//reverb/cc:sampler",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc:tensor_compression",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],

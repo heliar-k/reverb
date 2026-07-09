@@ -1,0 +1,306 @@
+// Copyright 2019 DeepMind Technologies Limited.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "reverb/cc/shm/shm_client.h"
+
+#include <cstring>
+#include <memory>
+#include <sched.h>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "reverb/cc/errors.h"
+#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/thread.h"
+#include "reverb/cc/sampler.h"
+#include "reverb/cc/shm/bootstrap.h"
+#include "reverb/cc/support/tensor_proxy.h"
+#include "third_party/reverb_tensor/reverb_tensor.pb.h"
+
+namespace deepmind {
+namespace reverb {
+namespace shm {
+
+namespace {
+
+// ponytail: poll a non-blocking Ring::Read with sched_yield until a message is
+// ready (spec §3.1 / R5: the blocking policy is the caller's job, not Ring's).
+// Mirrors the helper used in echo_test / byte_pool_echo_test.
+absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload,
+                          absl::Duration timeout = absl::InfiniteDuration()) {
+  absl::Time deadline = absl::Now() + timeout;
+  while (true) {
+    absl::Status s = ring->Read(msg_type, payload);
+    if (s.ok()) return absl::OkStatus();
+    if (!absl::IsNotFound(s)) return s;  // real error
+    if (absl::Now() >= deadline) {
+      return absl::DeadlineExceededError("ShmClient: response timed out");
+    }
+    sched_yield();
+  }
+}
+
+}  // namespace
+
+// ---- ShmSampler ----
+
+ShmSampler::ShmSampler(ShmConnection* conn, std::string table_name,
+                       int64_t max_samples, absl::Duration rate_limiter_timeout)
+    : conn_(conn),
+      table_name_(std::move(table_name)),
+      max_samples_(max_samples),
+      rate_limiter_timeout_(rate_limiter_timeout),
+      samples_(/*capacity=*/8) {}
+
+// static
+absl::StatusOr<std::unique_ptr<ShmSampler>> ShmSampler::Create(
+    ShmConnection* conn, const std::string& table_name,
+    const Sampler::Options& options) {
+  if (conn == nullptr) {
+    return absl::InvalidArgumentError("conn must not be null");
+  }
+  int64_t max_samples = options.max_samples == Sampler::kUnlimitedMaxSamples
+                            ? INT64_MAX
+                            : options.max_samples;
+  if (max_samples < 1) {
+    return absl::InvalidArgumentError("max_samples must be >= 1");
+  }
+  auto s = absl::WrapUnique(
+      new ShmSampler(conn, table_name, max_samples, options.rate_limiter_timeout));
+  s->worker_thread_ = internal::StartThread("ShmSamplerWorker",
+                                            [self = s.get()] { self->RunWorker(); });
+  return s;
+}
+
+ShmSampler::~ShmSampler() { Close(); }
+
+void ShmSampler::Close() {
+  if (closed_.exchange(true)) return;
+  samples_.Close();
+  if (worker_thread_) worker_thread_.reset();  // joins
+}
+
+absl::Status ShmSampler::GetNextTrajectory(
+    std::vector<TensorBuffer>* data,
+    std::shared_ptr<const SampleInfo>* info) {
+  std::unique_ptr<Sample> sample;
+  if (!samples_.Pop(&sample)) {
+    // Queue closed: either max_samples hit, cancelled, or a worker error.
+    absl::ReaderMutexLock lock(mu_);
+    if (returned_ == max_samples_) {
+      return absl::OutOfRangeError("`max_samples` already returned.");
+    }
+    if (closed_.load()) {
+      return absl::CancelledError("ShmSampler has been cancelled.");
+    }
+    return worker_status_.ok() ? absl::CancelledError("ShmSampler closed.")
+                               : worker_status_;
+  }
+  REVERB_RETURN_IF_ERROR(sample->AsTrajectory(data));
+  if (info != nullptr) *info = sample->info();
+
+  absl::WriterMutexLock lock(mu_);
+  ++returned_;
+  if (returned_ == max_samples_) samples_.Close();
+  return absl::OkStatus();
+}
+
+void ShmSampler::RunWorker() {
+  // ponytail: reserve one slot per sample, mirroring LocalSamplerWorker. On a
+  // server-side timeout with nobody waiting to pop, the reservation is kept
+  // and reused by the retry (PushBatch consumes it; a retry that succeeds
+  // pushes into the same reserved slot). A timeout with a waiter, or any other
+  // error, is surfaced via worker_status_ and the queue is closed.
+  while (true) {
+    {
+      absl::WriterMutexLock lock(mu_);
+      // Stop fetching when we've already requested max_samples (mirrors
+      // Sampler::RunWorker's progress_trigger: requested_ < max_samples_).
+      if (closed_.load() || requested_ >= max_samples_ ||
+          !worker_status_.ok()) {
+        return;
+      }
+      if (!samples_.Reserve(1)) {
+        return;  // queue closed
+      }
+      ++requested_;
+    }
+    auto result = FetchOne();
+    if (!result.ok()) {
+      absl::Status st = result.status();
+      if (absl::IsDeadlineExceeded(st) &&
+          samples_.num_waiting_to_pop() < 1) {
+        // Nobody waiting: keep the reservation, rewind requested_, retry.
+        absl::WriterMutexLock lock(mu_);
+        --requested_;
+        continue;
+      }
+      // Real error: record it, close the queue so GetNextTrajectory unblocks.
+      // The outstanding reservation is dropped (queue is closing anyway).
+      absl::WriterMutexLock lock(mu_);
+      if (worker_status_.ok() && !absl::IsCancelled(st)) {
+        worker_status_ = st;
+      }
+      samples_.Close();
+      return;
+    }
+    std::vector<std::unique_ptr<Sample>> batch;
+    batch.push_back(std::move(*result));
+    samples_.PushBatch(&batch);
+  }
+}
+
+absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
+  // 1. Send SAMPLE request on C→S (blocks if the ring is full — natural
+  //    backpressure, §8.7).
+  ShmSampleRequest req;
+  req.set_table(table_name_);
+  req.set_num_samples(1);
+  req.set_timeout_ms(
+      NonnegativeDurationToInt64Millis(rate_limiter_timeout_));
+  std::string req_body;
+  req.SerializeToString(&req_body);
+  REVERB_RETURN_IF_ERROR(
+      conn_->c2s.Write(SAMPLE, absl::MakeSpan(req_body)));
+
+  // 2. Poll S→C for the response. A server-side timeout comes back as ERROR
+  //    with DEADLINE_EXCEEDED; surface it so the worker/sampler maps it.
+  MsgType resp_type;
+  std::string resp_body;
+  REVERB_RETURN_IF_ERROR(ReadBlocking(&conn_->s2c, &resp_type, &resp_body));
+
+  if (resp_type == ERROR) {
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError("ShmSampler: malformed ShmError");
+    }
+    if (err.code() == ShmError::DEADLINE_EXCEEDED) {
+      return errors::RateLimiterTimeout();
+    }
+    return absl::InternalError(
+        absl::StrCat("ShmSampler: server error: ", err.message()));
+  }
+  if (resp_type != SAMPLE_RESP) {
+    return absl::InternalError(
+        absl::StrCat("ShmSampler: unexpected response type ", resp_type));
+  }
+
+  ShmSampleResponse resp;
+  if (!resp.ParseFromString(resp_body) || resp.samples_size() < 1) {
+    return absl::InternalError("ShmSampler: malformed ShmSampleResponse");
+  }
+  const ShmSample& shm_sample = resp.samples(0);
+
+  // 3. Build TensorBuffers from the pool bytes (worker thread, no GIL). Each
+  //    column's bytes are copied out of SHM BEFORE releasing, so the sample is
+  //    self-owned once queued (matches the spec note: assemble then RELEASE).
+  std::vector<std::vector<TensorBuffer>> column_chunks;
+  column_chunks.reserve(shm_sample.columns_size());
+  std::vector<uint64_t> offsets;
+  offsets.reserve(shm_sample.columns_size());
+  std::vector<bool> squeeze_columns;
+  squeeze_columns.reserve(shm_sample.columns_size());
+
+  for (const ShmColumn& col : shm_sample.columns()) {
+    offsets.push_back(col.shm_offset());
+    squeeze_columns.push_back(col.squeeze());
+
+    // Reconstruct the batched TensorBuffer from spec + the SHM bytes at the
+    // offset. The server sent the batched (un-squeezed) tensor; Sample's
+    // AsTrajectory applies the squeeze using squeeze_columns, exactly as the
+    // local AsSample path does.
+    TensorSpec spec;
+    spec.dtype = *DataTypeFromProto(col.spec().dtype());
+    spec.shape.reserve(col.spec().shape().dim_size());
+    for (int64_t d : col.spec().shape().dim()) spec.shape.push_back(d);
+    std::string bytes(col.length(), '\0');
+    std::memcpy(&bytes[0], conn_->pool.At(col.shm_offset()), col.length());
+    // Each column arrives as a single pre-concatenated batched tensor; wrap it
+    // as a one-chunk column so Sample::AsTrajectory returns it directly (and
+    // applies squeeze when set).
+    std::vector<TensorBuffer> chunks;
+    chunks.emplace_back(spec, std::move(bytes));
+    column_chunks.push_back(std::move(chunks));
+  }
+
+  // 4. Assemble the Sample (mirrors AsSample: column_chunks + squeeze_columns).
+  auto info = std::make_shared<SampleInfo>(shm_sample.info());
+  auto sample = std::make_unique<Sample>(std::move(info),
+                                         std::move(column_chunks),
+                                         std::move(squeeze_columns));
+
+  // 5. RELEASE the pool offsets now that bytes are copied out (C3).
+  ShmReleaseRequest rel;
+  for (uint64_t off : offsets) rel.add_offsets(off);
+  std::string rel_body;
+  rel.SerializeToString(&rel_body);
+  REVERB_RETURN_IF_ERROR(
+      conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body)));
+
+  return sample;
+}
+
+// ---- ShmClient ----
+
+ShmClient::~ShmClient() = default;
+
+ShmClient::ShmClient(ShmConnection conn) : conn_(std::move(conn)) {}
+
+// static
+absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
+    const std::string& socket_path) {
+  // Bootstrap handshake (retry briefly while the server binds the socket).
+  absl::StatusOr<WelcomeResponse> w;
+  for (int i = 0; i < 200; i++) {
+    w = ClientBootstrap(socket_path, /*client_pid=*/getpid());
+    if (w.ok()) break;
+    sched_yield();
+  }
+  REVERB_RETURN_IF_ERROR(w.status());
+
+  // Open the three segments: pool (RW, C4) + the two rings.
+  REVERB_ASSIGN_OR_RETURN(ShmBytePool pool,
+                          ShmBytePool::Open(w->pool_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(Ring c2s, Ring::Open(w->c2s_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(Ring s2c, Ring::Open(w->s2c_shm_name()));
+
+  ShmConnection conn;
+  conn.c2s = std::move(c2s);
+  conn.s2c = std::move(s2c);
+  conn.pool = std::move(pool);
+  conn.pool_shm_name = w->pool_shm_name();
+
+  return absl::WrapUnique(new ShmClient(std::move(conn)));
+}
+
+absl::Status ShmClient::NewSampler(const std::string& table_name,
+                                   const Sampler::Options& options,
+                                   std::unique_ptr<ShmSampler>* sampler) {
+  auto s = ShmSampler::Create(&conn_, table_name, options);
+  REVERB_RETURN_IF_ERROR(s.status());
+  *sampler = std::move(*s);
+  return absl::OkStatus();
+}
+
+}  // namespace shm
+}  // namespace reverb
+}  // namespace deepmind
