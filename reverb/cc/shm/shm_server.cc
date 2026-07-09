@@ -229,11 +229,43 @@ void ShmServer::HandleClientRequests(size_t client_id) {
         }
         break;
       }
+      case INSERT: {
+        ShmInsertRequest req;
+        if (!req.ParseFromString(payload)) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: malformed ShmInsertRequest from client "
+              << client_id;
+          break;
+        }
+        auto st = HandleInsert(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleInsert failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
+      case ALLOCATE: {
+        ShmAllocateRequest req;
+        if (!req.ParseFromString(payload)) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: malformed ShmAllocateRequest from client "
+              << client_id;
+          break;
+        }
+        auto st = HandleAllocate(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleAllocate failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
       case CLOSE:
         // ponytail: v1 just stops draining; full disconnect cleanup is ticket ⑥.
         return;
       default:
-        // INSERT/ALLOCATE/etc. are ticket ④; ignore for now.
+        // Unknown msg type: ignore (forward-compat).
         break;
     }
   }
@@ -390,6 +422,187 @@ absl::Status ShmServer::HandleRelease(ClientState& state,
     }
     state.outstanding_offsets_.erase(offset);
   }
+  return absl::OkStatus();
+}
+
+absl::Status ShmServer::HandleAllocate(ClientState& state,
+                                       const ShmAllocateRequest& req) {
+  // C4: the server is the sole pool allocator. Grant the offset, track it as
+  // outstanding (refcount=1) so a client crash (⑥) reclaims it, and reply with
+  // ALLOCATE_RESP. The client memcpy's insert bytes here, then sends INSERT and
+  // waits for InsertAck.offsets_to_release before reusing the region (C2).
+  REVERB_ASSIGN_OR_RETURN(uint64_t offset, pool_.Allocate(req.num_bytes()));
+  pool_.Ref(offset);  // outstanding against client crash
+  state.outstanding_offsets_.insert(offset);
+  ShmAllocateResponse resp;
+  resp.set_shm_offset(offset);
+  std::string body;
+  resp.SerializeToString(&body);
+  return EnqueueS2C(state, ALLOCATE_RESP, body);
+}
+
+absl::Status ShmServer::HandleInsert(ClientState& state,
+                                      const ShmInsertRequest& req) {
+  // 1. Deserialize each referenced ChunkData from the pool (C4: client wrote
+  //    serialized bytes at the granted offset). ChunkData is self-describing,
+  //    so ShmChunkRef.specs/sequence_range/delta_encoded are redundant metadata
+  //    — the deserialized proto carries everything the ChunkStore needs.
+  //    ponytail: skip populating the redundant ShmChunkRef metadata client-side.
+  internal::flat_hash_map<uint64_t, std::shared_ptr<ChunkStore::Chunk>> chunks;
+  for (const ShmChunkRef& ref : req.chunks()) {
+    if (ref.total_length() == 0) {
+      return absl::InvalidArgumentError(
+          "ShmServer::HandleInsert: zero-length chunk");
+    }
+    ChunkData cd;
+    if (!cd.ParseFromArray(pool_.At(ref.shm_offset()),
+                           static_cast<int>(ref.total_length()))) {
+      return absl::InternalError(absl::StrCat(
+          "ShmServer::HandleInsert: failed to parse ChunkData at offset ",
+          ref.shm_offset(), " (len ", ref.total_length(), ")"));
+    }
+    if (cd.chunk_key() != ref.chunk_key()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "ShmServer::HandleInsert: chunk_key mismatch (ref ",
+          ref.chunk_key(), " vs proto ", cd.chunk_key(), ")"));
+    }
+    // ChunkStore::Chunk owns a copy of the ChunkData proto. Multiple items
+    // may reference the same chunk_key; dedup so storage is shared.
+    chunks.try_emplace(cd.chunk_key(),
+                       std::make_shared<ChunkStore::Chunk>(std::move(cd)));
+  }
+
+  // 2. For each PrioritizedItem, gather its referenced chunks and dispatch via
+  //    InsertOrAssignAsync. The table name comes from item.table(). The
+  //    completion callback fires on the table worker's callback-executor thread
+  //    — NOT the dispatch thread — so it must not write the S→C ring directly
+  //    (Ring is SPSC, single producer = the dispatch thread). Instead it stashes
+  //    an InsertAck into the client's mutex-protected outbox; FlushOutbox
+  //    (called each dispatch pass) drains it to S→C. This preserves the
+  //    single-producer invariant while honoring C2 (client waits for ACK before
+  //    reusing offsets).
+  //
+  //    ponytail: one ACK per insert request, aggregating all item keys and all
+  //    chunk offsets. The client correlates by waiting for the next INSERT_ACK
+  //    after sending INSERT (SPSC ordering guarantees it matches). A per-item
+  //    ACK would let the client release offsets earlier, but v1's
+  //    one-INSERT-per-item writer means there is exactly one item per ACK
+  //    anyway. Ceiling: a batched-INSERT client would hold all offsets until the
+  //    whole batch acks. Upgrade: per-item ACKs keyed by item key.
+  std::vector<uint64_t> chunk_offsets;
+  chunk_offsets.reserve(req.chunks_size());
+  for (const ShmChunkRef& ref : req.chunks()) {
+    chunk_offsets.push_back(ref.shm_offset());
+  }
+
+  InsertAck ack_template;
+  for (uint64_t off : chunk_offsets) ack_template.add_offsets_to_release(off);
+
+  // Collect the keys to ACK. We count outstanding items; when all complete,
+  // enqueue the aggregate ACK. ponytail: atomic counter + outbox push under
+  // outbox_mu; the dispatch thread is the sole reader/drainer.
+  int num_items = req.items_size();
+  if (num_items == 0) {
+    // No items: still ack so the client can release the chunk offsets it
+    // allocated (e.g. a chunks-only prefetch — v1 writer doesn't do this, but
+    // be defensive).
+    InsertAck ack = ack_template;
+    std::string body;
+    ack.SerializeToString(&body);
+    return EnqueueS2C(state, INSERT_ACK, body);
+  }
+
+  auto remaining = std::make_shared<std::atomic<int>>(num_items);
+  auto ack_keys = std::make_shared<std::vector<uint64_t>>();
+  ClientState* state_ptr = &state;
+  auto offsets = std::make_shared<std::vector<uint64_t>>(std::move(chunk_offsets));
+
+  for (const PrioritizedItem& item_proto : req.items()) {
+    const std::string& table_name = item_proto.table();
+    if (table_name != table_->name()) {
+      // ponytail: v1 server owns exactly ONE table (spec §3.4). A mismatch is
+      // a client error; surface via the ACK's empty key set (the client treats
+      // a missing key as failure). Multi-table server is a later ticket.
+      REVERB_LOG(REVERB_WARNING) << "ShmServer::HandleInsert: table '"
+                                 << table_name << "' != server table '"
+                                 << table_->name() << "'; skipping item "
+                                 << item_proto.key();
+      // Count as completed so the ACK still fires.
+      if (remaining->fetch_sub(1) == 1) {
+        InsertAck ack;
+        for (uint64_t k : *ack_keys) ack.add_keys(k);
+        for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
+        std::string body;
+        ack.SerializeToString(&body);
+        REVERB_RETURN_IF_ERROR(EnqueueS2C(*state_ptr, INSERT_ACK, body));
+      }
+      continue;
+    }
+
+    // Gather the chunks referenced by this item's trajectory.
+    std::vector<std::shared_ptr<ChunkStore::Chunk>> item_chunks;
+    std::vector<uint64_t> keys = internal::GetChunkKeys(item_proto.flat_trajectory());
+    item_chunks.reserve(keys.size());
+    for (uint64_t ck : keys) {
+      auto it = chunks.find(ck);
+      if (it == chunks.end()) {
+        return absl::InternalError(absl::StrCat(
+            "ShmServer::HandleInsert: item ", item_proto.key(),
+            " references unknown chunk ", ck));
+      }
+      item_chunks.push_back(it->second);
+    }
+
+    TableItem table_item(item_proto, std::move(item_chunks));
+
+    // The callback fires on the table callback-executor thread. It must not
+    // touch the S→C ring directly; it pushes the completed key, and when the
+    // last item completes it enqueues the aggregate ACK into the outbox.
+    auto cb = std::make_shared<Table::InsertCallback>(
+        [remaining, ack_keys, offsets, state_ptr](uint64_t completed_key) {
+          ack_keys->push_back(completed_key);
+          if (remaining->fetch_sub(1) == 1) {
+            InsertAck ack;
+            for (uint64_t k : *ack_keys) ack.add_keys(k);
+            for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
+            std::string body;
+            ack.SerializeToString(&body);
+            // EnqueueS2C writes to the ring directly (dispatch thread) or
+            // stashes in outbox on ResourceExhausted. Called off the dispatch
+            // thread, the direct write would race the dispatch thread's S→C
+            // producer. Route through the outbox unconditionally instead.
+            absl::MutexLock lock(&state_ptr->outbox_mu);
+            state_ptr->outbox.emplace_back(
+                static_cast<uint16_t>(INSERT_ACK), std::move(body));
+            // All inserts confirmed: drop the keepalive so the callbacks (and
+            // what they capture) are reclaimed. This breaks the would-be
+            // cycle (cb -> lambda -> ... ; the lambda does NOT capture cb).
+            state_ptr->pending_insert_callbacks.clear();
+          }
+        });
+    // Keepalive: InsertOrAssignAsync stores a weak_ptr; the table worker fires
+    // the callback AFTER HandleInsert returns, so the shared_ptr must outlive
+    // this function. Stash it on the client; cleared by the last callback.
+    {
+      absl::MutexLock lock(&state.outbox_mu);
+      state.pending_insert_callbacks.push_back(cb);
+    }
+
+    bool can_insert_more = false;
+    absl::Status s = table_->InsertOrAssignAsync(std::move(table_item),
+                                                 &can_insert_more, cb);
+if (!s.ok()) {
+      return s;
+    }
+    // ponytail: v1 ignores can_insert_more on the server side — the dispatch
+    // thread reads one INSERT at a time and the table's pending_inserts_ queue
+    // absorbs bursts (max_enqueued_inserts). Backpressure is enforced
+    // client-side via the ACK wait. If the table queue fills, the client's
+    // outstanding items pile up in in_flight_items_ and the writer's
+    // local_can_insert_more_ gate kicks in. Upgrade: honor can_insert_more by
+    // deferring the read of the next INSERT until a completion fires.
+  }
+
   return absl::OkStatus();
 }
 

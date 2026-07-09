@@ -48,6 +48,10 @@ namespace reverb {
 class TrajectoryColumn;   // Defined below.
 class ArenaOwnedRequest;  // Defined in trajectory_writer.cc.
 
+namespace shm {
+struct ShmConnection;  // Defined in reverb/cc/shm/shm_connection.h.
+}  // namespace shm
+
 // A `ColumnWriter` allows creating replay items based on sparse or partial
 // trajectories. The easiest way to explain a `ColumnWriter` is by comparing it
 // to a the more traditional `Writer` (see writer.h).
@@ -289,6 +293,13 @@ class TrajectoryWriter : public ColumnWriter,
       internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables,
       const Options& options);
 
+  // SHM mode (ticket ④): the writer's chunker/column/backpressure logic runs
+  // client-side, but the final InsertOrAssignAsync goes over SHM to a
+  // ShmServer in another process. `conn` is borrowed (owned by ShmClient) and
+  // must outlive the writer. The item's `table()` selects the server-side
+  // table (v1: the server owns one table). See appendix A4 / decision C2.
+  explicit TrajectoryWriter(shm::ShmConnection* conn, const Options& options);
+
   // Flushes pending items and then closes stream. If `Close` has already been
   // called then no action is taken.
   ~TrajectoryWriter() override;
@@ -380,6 +391,16 @@ class TrajectoryWriter : public ColumnWriter,
   // from `in_flight_items_`, mirroring `OnReadDone` on the gRPC path.
   absl::Status RunLocalWorker();
 
+  // SHM-mode worker loop (ticket ④). Mirrors `RunLocalWorker` (drain
+  // write_queue_, wait AllReady, OnItemFinalized, assemble chunks) EXCEPT the
+  // insert step: serialize each unique ChunkData, ALLOCATE a pool offset from
+  // the server, memcpy the bytes, build a ShmInsertRequest with ShmChunkRefs,
+  // send INSERT, then wait for InsertAck on S→C. The ACK fires the completion
+  // callback (erase in_flight, set local_can_insert_more_, signal data_cv_) and
+  // the client RELEASEs the ack'd offsets (C2). Reuses all chunker/column
+  // backpressure machinery — only the transport changes.
+  absl::Status RunShmWorker();
+
   // Sets `context_` and opens a gRPC InsertStream to the server iff the writer
   // has not yet been closed.
   absl::Status SetContextAndCreateStream() ABSL_LOCKS_EXCLUDED(mu_);
@@ -418,6 +439,13 @@ class TrajectoryWriter : public ColumnWriter,
   // True when the writer is in local mode (writes directly into `tables_`
   // instead of going over gRPC).
   bool is_local_ = false;
+
+  // True when the writer is in SHM mode (inserts go over SHM to a ShmServer).
+  bool is_shm_ = false;
+
+  // Borrowed SHM connection (SHM mode only). Owned by ShmClient; must outlive
+  // the writer.
+  shm::ShmConnection* shm_conn_ = nullptr;
 
   // Target tables in local mode (writer holds a copy of the client's map;
   // `shared_ptr<Table>` refcounts keep the Table objects alive, and

@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "reverb/cc/chunk_store.h"
 #include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/shm/byte_pool.h"
@@ -55,6 +56,16 @@ struct ClientState {
   // pass via a non-blocking Write. ponytail: vector, upgrade to ring-buffer.
   absl::Mutex outbox_mu;
   std::vector<std::pair<uint16_t, std::string>> outbox
+      ABSL_GUARDED_BY(outbox_mu);
+
+  // Insert-callback keepalive (ticket ④): InsertOrAssignAsync stores a
+  // weak_ptr to the callback; the table worker fires it asynchronously, AFTER
+  // HandleInsert returns. The shared_ptr must therefore outlive HandleInsert.
+  // We stash them here and clear them once the aggregate InsertAck is enqueued
+  // (i.e. the last item's callback has fired). Guarded by outbox_mu (the
+  // callback fires on the table callback-executor thread, not the dispatch
+  // thread). Mirrors Writer::WritePendingDataLocal's local_pending_callbacks_.
+  std::vector<std::shared_ptr<Table::InsertCallback>> pending_insert_callbacks
       ABSL_GUARDED_BY(outbox_mu);
 };
 
@@ -108,6 +119,18 @@ class ShmServer {
   // Release path: Unref each offset, →0 deallocates (C3).
   absl::Status HandleRelease(ClientState& state,
                              const ShmReleaseRequest& req);
+
+  // Insert path (ticket ④): deserialize each ShmChunkRef's ChunkData from the
+  // pool, build a TableItem per PrioritizedItem, InsertOrAssignAsync. The
+  // table-worker completion callback stashes InsertAck{keys,
+  // offsets_to_release} into the client's outbox (C2); the dispatch thread —
+  // the sole S→C producer — drains it via FlushOutbox.
+  absl::Status HandleInsert(ClientState& state, const ShmInsertRequest& req);
+
+  // C4 allocate path: client requests a pool offset; server (sole allocator)
+  // grants it. Mirrors byte_pool_echo_test's inline handler.
+  absl::Status HandleAllocate(ClientState& state,
+                              const ShmAllocateRequest& req);
 
   // Enqueue a S→C message: try a non-blocking write, stash in outbox if full.
   absl::Status EnqueueS2C(ClientState& state, MsgType type,

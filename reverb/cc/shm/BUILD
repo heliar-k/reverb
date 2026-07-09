@@ -163,6 +163,8 @@ reverb_cc_library(
         ":ring",
         ":shm_connection",
         ":shm_protocol_cc_proto",
+        "//reverb/cc:chunk_store",
+        "//reverb/cc:schema_cc_proto",
         "//reverb/cc:table",
         "//reverb/cc/platform:hash_map",
         "//reverb/cc/platform:hash_set",
@@ -193,13 +195,20 @@ reverb_cc_library(
         ":ring",
         ":shm_connection",
         ":shm_protocol_cc_proto",
+        "//reverb/cc:chunk_store",
         "//reverb/cc:errors",
+        "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
+        "//reverb/cc:structured_writer",
         "//reverb/cc:table",
+        "//reverb/cc:trajectory_writer",
+        "//reverb/cc:writer",
+        "//reverb/cc/platform:hash_map",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
         "//reverb/cc/platform:thread",
         "//reverb/cc/support:queue",
+        "//reverb/cc/support:signature",
         "//reverb/cc/support:tensor_proxy",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/memory",
@@ -234,6 +243,35 @@ reverb_cc_test(
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---- Insert-path integration test (ticket ④) ----
+
+# ponytail: :shm_client/:shm_server now pull :trajectory_writer -> :chunker ->
+# :tensor_proxy (pybind11/numpy C-API), so this binary links libpython to
+# resolve Py* symbols (same as :shm_sample_test). See shm_sample_test.cc header
+# comment on the libpython/openssl clash that prevents a CPython interpreter.
+reverb_cc_test(
+    name = "shm_insert_test",
+    srcs = ["shm_insert_test.cc"],
+    deps = [
+        ":shm_client",
+        ":shm_server",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc:chunker",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc:structured_writer",
+        "//reverb/cc:table",
+        "//reverb/cc:trajectory_writer",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/support:tensor_proxy",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",

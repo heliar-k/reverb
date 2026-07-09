@@ -24,13 +24,17 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "reverb/cc/platform/thread.h"
+#include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/shm/byte_pool.h"
 #include "reverb/cc/shm/ring.h"
 #include "reverb/cc/shm/shm_connection.h"
 #include "reverb/cc/shm/shm_protocol.pb.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/support/queue.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/trajectory_writer.h"
+#include "reverb/cc/writer.h"
 
 namespace deepmind {
 namespace reverb {
@@ -109,6 +113,36 @@ class ShmClient {
   absl::Status NewSampler(const std::string& table_name,
                           const Sampler::Options& options,
                           std::unique_ptr<ShmSampler>* sampler);
+
+  // ---- Writer path (ticket ④) ----
+
+  // Constructs a TrajectoryWriter in SHM mode: the chunker/column/backpressure
+  // logic runs client-side, but inserts go over SHM to the server's Table
+  // (appendix A4). `options.flat_signature_map` is left as-is (no
+  // ServerInfo round-trip in v1); pass a populated map if you want
+  // ItemAndRefs::Validate to check trajectory signatures against a known
+  // table signature.
+  absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
+                                   std::unique_ptr<TrajectoryWriter>* writer);
+
+  // Mirrors InProcessClient::NewStructuredWriter: runs
+  // PrepareStructuredWriterConfigs to compute max_num_keep_alive_refs, builds
+  // AutoTunedChunkerOptions, and wraps a SHM TrajectoryWriter. Each config's
+  // `table` field routes its item to the server-side table.
+  absl::Status NewStructuredWriter(
+      std::vector<StructuredWriterConfig> configs,
+      std::unique_ptr<StructuredWriter>* writer);
+
+  // ponytail: the plain Writer (writer.h) has no SHM seam — its local ctor
+  // takes a tables map, but an SHM client holds no tables (the server does).
+  // Adding an SHM transport to Writer would duplicate RunShmWorker's logic for
+  // a legacy API. Deferred: callers that need SHM inserts should use
+  // NewTrajectoryWriter / NewStructuredWriter. Upgrade: either add an SHM
+  // ctor to Writer mirroring TrajectoryWriter's, or deprecate Writer for SHM
+  // clients. TODO(④): implement if a caller needs it.
+  absl::Status NewWriter(int chunk_length, int max_timesteps,
+                         bool delta_encoded, int max_in_flight_items,
+                         std::unique_ptr<Writer>* writer);
 
   ShmConnection* connection() { return &conn_; }
 

@@ -75,11 +75,11 @@ in_process 路径预灌数据），dispatch 线程轮询 client 的 C→S ring�
 
 **Blocked by:** ③ Sample path: server→client, read-only
 
-- [ ] `HandleInsert`：读 `ShmInsertRequest` → 按 `ShmChunkRef.specs` 拆多列 → `CompressTensorAsProto` 各列压缩 → `Table::InsertOrAssignAsync`（带 callback）→ callback 写 `INSERT_ACK`（含 `offsets_to_release`）
-- [ ] C4 insert 时序：client 申请偏移 → memcpy chunk 字节 → 发 `INSERT` → **等 `INSERT_ACK.offsets_to_release` 才释放偏移**（C2）
-- [ ] `ShmClient.NewTrajectoryWriter`：复用 chunker/column 逻辑，`RunLocalWorker` 的 `InsertOrAssignAsync` 换成 SHM insert 往返；`local_can_insert_more_`/`num_items_in_flight_` 靠 ACK 递减
-- [ ] `ShmClient.NewWriter`（plain Writer）+ `NewStructuredWriter`（经 `PrepareStructuredWriterConfigs`）
-- [ ] 端到端测试：client writer 写 → server table 有数据 → client sampler 读回一致；structured_writer 多表写入；backpressure 触发（in_flight 满 writer 阻塞）
+- [x] `HandleInsert`：读 `ShmInsertRequest` → 按 `ShmChunkRef.specs` 拆多列 → `CompressTensorAsProto` 各列压缩 → `Table::InsertOrAssignAsync`（带 callback）→ callback 写 `INSERT_ACK`（含 `offsets_to_release`）
+- [x] C4 insert 时序：client 申请偏移 → memcpy chunk 字节 → 发 `INSERT` → **等 `INSERT_ACK.offsets_to_release` 才释放偏移**（C2）
+- [x] `ShmClient.NewTrajectoryWriter`：复用 chunker/column 逻辑，`RunLocalWorker` 的 `InsertOrAssignAsync` 换成 SHM insert 往返；`local_can_insert_more_`/`num_items_in_flight_` 靠 ACK 递减
+- [~] `ShmClient.NewWriter`（plain Writer）+ `NewStructuredWriter`（经 `PrepareStructuredWriterConfigs`）— StructuredWriter 完成；plain Writer 延期（无 SHM seam，见 `// ponytail:` TODO）
+- [x] 端到端测试：client writer 写 → server table 有数据 → client sampler 读回一致；structured_writer 多表写入；backpressure 触发（in_flight 满 writer 阻塞）
 
 ---
 

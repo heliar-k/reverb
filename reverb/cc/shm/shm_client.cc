@@ -33,7 +33,11 @@
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/shm/bootstrap.h"
+#include "reverb/cc/structured_writer.h"
+#include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/trajectory_writer.h"
+#include "reverb/cc/writer.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
@@ -299,6 +303,57 @@ absl::Status ShmClient::NewSampler(const std::string& table_name,
   REVERB_RETURN_IF_ERROR(s.status());
   *sampler = std::move(*s);
   return absl::OkStatus();
+}
+
+absl::Status ShmClient::NewTrajectoryWriter(
+    const TrajectoryWriter::Options& options,
+    std::unique_ptr<TrajectoryWriter>* writer) {
+  REVERB_RETURN_IF_ERROR(options.Validate());
+  // SHM mode: the writer's RunShmWorker sends inserts over conn_. No local
+  // tables — the server owns the Table. flat_signature_map is left as-is (no
+  // ServerInfo round-trip in v1); callers wanting signature validation must
+  // populate it themselves. See appendix A4.
+  *writer = std::make_unique<TrajectoryWriter>(&conn_, options);
+  return absl::OkStatus();
+}
+
+absl::Status ShmClient::NewStructuredWriter(
+    std::vector<StructuredWriterConfig> configs,
+    std::unique_ptr<StructuredWriter>* writer) {
+  if (configs.empty()) {
+    return absl::InvalidArgumentError("At least one config must be provided.");
+  }
+  // ponytail: configs 的补条件/校验/max_num_keep_alive_refs 计算已收敛到
+  // PrepareStructuredWriterConfigs(与 Client/InProcessClient 共用)。
+  REVERB_ASSIGN_OR_RETURN(
+      int max_num_keep_alive_refs,
+      PrepareStructuredWriterConfigs(configs));
+
+  TrajectoryWriter::Options options = {
+      .chunker_options =
+          std::make_shared<AutoTunedChunkerOptions>(max_num_keep_alive_refs),
+  };
+  std::unique_ptr<TrajectoryWriter> trajectory_writer;
+  REVERB_RETURN_IF_ERROR(
+      NewTrajectoryWriter(options, &trajectory_writer));
+
+  *writer = std::make_unique<StructuredWriter>(std::move(trajectory_writer),
+                                               std::move(configs));
+  return absl::OkStatus();
+}
+
+absl::Status ShmClient::NewWriter(int /*chunk_length*/,
+                                  int /*max_timesteps*/,
+                                  bool /*delta_encoded*/,
+                                  int /*max_in_flight_items*/,
+                                  std::unique_ptr<Writer>* /*writer*/) {
+  // ponytail: deferred — the plain Writer (writer.h) has no SHM transport
+  // seam. Its local ctor takes a tables map the SHM client doesn't hold.
+  // Adding SHM to Writer would duplicate RunShmWorker for a legacy API.
+  // Use NewTrajectoryWriter / NewStructuredWriter for SHM inserts.
+  return absl::UnimplementedError(
+      "ShmClient::NewWriter is not implemented for SHM; use "
+      "NewTrajectoryWriter or NewStructuredWriter.");
 }
 
 }  // namespace shm

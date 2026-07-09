@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <sched.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,6 +52,8 @@
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
+#include "reverb/cc/shm/shm_connection.h"
+#include "reverb/cc/shm/shm_protocol.pb.h"
 
 namespace deepmind {
 namespace reverb {
@@ -363,6 +367,23 @@ TrajectoryWriter::TrajectoryWriter(
       stream_ok_(true) {
   REVERB_CHECK_OK(options.Validate());
   REVERB_CHECK(!tables_.empty());
+}
+
+TrajectoryWriter::TrajectoryWriter(shm::ShmConnection* conn,
+                                   const Options& options)
+    : is_shm_(true),
+      shm_conn_(conn),
+      options_(options),
+      key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
+      episode_id_(key_generator_->Generate()),
+      episode_step_(0),
+      closed_(false),
+      stream_worker_(
+          internal::StartThread("TrajectoryWriter_ShmWorker",
+                                [this] { (void)RunShmWorker(); })),
+      stream_ok_(true) {
+  REVERB_CHECK_OK(options.Validate());
+  REVERB_CHECK(shm_conn_ != nullptr);
 }
 
 TrajectoryWriter::~TrajectoryWriter() {
@@ -796,6 +817,364 @@ absl::Status TrajectoryWriter::RunLocalWorker() {
         }
       }
     }
+    {
+      absl::MutexLock l(&mu_);
+      if (in_flight_items_.size() + write_queue_.size() >=
+          kPendingItemsWarningThreshold) {
+        REVERB_LOG_EVERY_N(REVERB_WARNING, 10) << absl::StrFormat(
+            "The number of pending items is alarmingly high, did you forget "
+            "to call Flush? %d items are waiting to be inserted and %d items "
+            "have been queued but haven't been confirmed yet.",
+            write_queue_.size(), in_flight_items_.size());
+      }
+    }
+  }
+}
+
+absl::Status TrajectoryWriter::RunShmWorker() {
+  // ponytail: this is RunLocalWorker with the InsertOrAssignAsync step swapped
+  // for an SHM round-trip (ALLOCATE per chunk → memcpy → INSERT → wait
+  // INSERT_ACK → RELEASE offsets). All chunker/column/backpressure machinery
+  // is identical; only the transport changes (appendix A4 / decision C2).
+  //
+  // The ACK IS the completion signal: on ACK the worker erases the item from
+  // in_flight_items_, sets local_can_insert_more_, signals data_cv_, and
+  // RELEASEs the chunk offsets. There is no async table callback in SHM mode
+  // (the server's table callback writes the ACK; the client side is a
+  // synchronous poll).
+  //
+  // The SHM proto types (Ring, MsgType, ShmInsertRequest, ...) live in
+  // deepmind::reverb::shm; bring them into scope locally rather than
+  // qualifying every use. ponytail: function-local using-directive keeps the
+  // blast radius to this worker only.
+  using namespace ::deepmind::reverb::shm;
+
+  auto read_blocking = [](Ring* ring, MsgType* type,
+                          std::string* payload) -> absl::Status {
+    // poll non-blocking Read + sched_yield (spec R5: blocking policy is the
+    // caller's job, not Ring's). Same helper as ShmSampler/ShmClient.
+    while (true) {
+      absl::Status s = ring->Read(type, payload);
+      if (s.ok()) return absl::OkStatus();
+      if (!absl::IsNotFound(s)) return s;
+      sched_yield();
+    }
+  };
+
+  while (true) {
+    ItemAndRefs* item_and_refs = nullptr;
+    {
+      absl::MutexLock l(&mu_);
+      while (write_queue_.empty() && !closed_ && stream_ok_) {
+        data_cv_.Wait(&mu_);
+      }
+      if (!stream_ok_) {
+        return stream_status_;
+      }
+      if (closed_ && write_queue_.empty()) {
+        return absl::OkStatus();
+      }
+      item_and_refs = write_queue_.front().get();
+    }
+
+    // Wait until all referenced chunks are finalized (mirrors RunLocalWorker).
+    if (!AllReady(item_and_refs->refs)) {
+      for (const std::shared_ptr<CellRef>& ref : item_and_refs->refs) {
+        if (!ref->IsReady()) {
+          auto chunker_sp = ref->chunker().lock();
+          if (chunker_sp) {
+            absl::Status s = chunker_sp->Flush();
+            if (!s.ok()) {
+              absl::MutexLock l(&mu_);
+              stream_ok_ = false;
+              stream_status_ = s;
+              unrecoverable_status_ = s;
+              data_cv_.Signal();
+              return s;
+            }
+          }
+        }
+      }
+      absl::MutexLock l(&mu_);
+      if (!AllReady(item_and_refs->refs)) {
+        data_cv_.Wait(&mu_);
+      }
+      continue;
+    }
+
+    // Notify chunkers (mirrors RunLocalWorker / gRPC path).
+    internal::flat_hash_map<Chunker*, std::vector<std::shared_ptr<CellRef>>>
+        refs_per_chunker;
+    for (auto& ref : item_and_refs->refs) {
+      auto chunker_sp = ref->chunker().lock();
+      if (!chunker_sp) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Chunker::OnItemFinalized: Unable to lock the weak_ptr for the "
+            "chunker associated with chunk_key: ",
+            ref->chunk_key()));
+      }
+      refs_per_chunker[chunker_sp.get()].push_back(ref);
+    }
+    for (auto& [chunker, refs] : refs_per_chunker) {
+      absl::Status status =
+          chunker->OnItemFinalized(item_and_refs->item, refs);
+      if (!status.ok()) {
+        absl::MutexLock l(&mu_);
+        stream_ok_ = false;
+        stream_status_ = status;
+        unrecoverable_status_ = status;
+        data_cv_.Signal();
+        return status;
+      }
+    }
+
+    // Assemble the unique referenced chunks, deduplicating by chunk key
+    // (mirrors RunLocalWorker). Serialize each ChunkData proto and ALLOCATE a
+    // pool offset for its bytes (C4: client asks the server, the sole
+    // allocator).
+    //
+    // ponytail: ShmChunkRef.specs/sequence_range/delta_encoded are redundant —
+    // ChunkData is self-describing and the server deserializes it whole. We
+    // populate only chunk_key/shm_offset/total_length. Upgrade: populate the
+    // metadata if the server ever skips deserialization for the fast path.
+    ShmInsertRequest req;
+    std::vector<uint64_t> chunk_offsets;  // for RELEASE after ACK (C2)
+    internal::flat_hash_set<uint64_t> sent_keys;
+    bool alloc_failed = false;
+    for (const std::shared_ptr<CellRef>& ref : item_and_refs->refs) {
+      uint64_t ck = ref->chunk_key();
+      if (!sent_keys.insert(ck).second) continue;
+
+      auto chunk_container = ref->GetChunk();
+      const ChunkData* cd = chunk_container->get();
+      std::string bytes;
+      if (!cd->SerializeToString(&bytes)) {
+        absl::MutexLock l(&mu_);
+        stream_ok_ = false;
+        stream_status_ = absl::InternalError(absl::StrCat(
+            "RunShmWorker: failed to serialize ChunkData ", ck));
+        unrecoverable_status_ = stream_status_;
+        data_cv_.Signal();
+        return stream_status_;
+      }
+      // C4: ask the server for a pool offset of the right size.
+      ShmAllocateRequest areq;
+      areq.set_num_bytes(bytes.size());
+      std::string areq_body;
+      areq.SerializeToString(&areq_body);
+      absl::Status ws = shm_conn_->c2s.Write(ALLOCATE,
+                                             absl::MakeSpan(areq_body));
+      if (!ws.ok()) {
+        alloc_failed = true;
+        absl::MutexLock l(&mu_);
+        stream_ok_ = false;
+        stream_status_ = ws;
+        unrecoverable_status_ = ws;
+        data_cv_.Signal();
+        break;
+      }
+      MsgType atype;
+      std::string aresp_body;
+      absl::Status rs = read_blocking(&shm_conn_->s2c, &atype, &aresp_body);
+      if (!rs.ok()) {
+        alloc_failed = true;
+        absl::MutexLock l(&mu_);
+        stream_ok_ = false;
+        stream_status_ = rs;
+        unrecoverable_status_ = rs;
+        data_cv_.Signal();
+        break;
+      }
+      if (atype != ALLOCATE_RESP) {
+        alloc_failed = true;
+        absl::MutexLock l(&mu_);
+        stream_status_ = absl::InternalError(absl::StrCat(
+            "RunShmWorker: expected ALLOCATE_RESP, got ", atype));
+        stream_ok_ = false;
+        unrecoverable_status_ = stream_status_;
+        data_cv_.Signal();
+        break;
+      }
+      ShmAllocateResponse aresp;
+      if (!aresp.ParseFromString(aresp_body)) {
+        alloc_failed = true;
+        absl::MutexLock l(&mu_);
+        stream_status_ =
+            absl::InternalError("RunShmWorker: malformed ShmAllocateResponse");
+        stream_ok_ = false;
+        unrecoverable_status_ = stream_status_;
+        data_cv_.Signal();
+        break;
+      }
+      uint64_t offset = aresp.shm_offset();
+      // C4: client memcpy's the serialized bytes into the granted region
+      // (RW mmap). The region must stay valid until INSERT_ACK (C2).
+      std::memcpy(shm_conn_->pool.At(offset), bytes.data(), bytes.size());
+
+      ShmChunkRef* cref = req.add_chunks();
+      cref->set_chunk_key(ck);
+      cref->set_shm_offset(offset);
+      cref->set_total_length(bytes.size());
+      chunk_offsets.push_back(offset);
+    }
+    if (alloc_failed) {
+      // Release any offsets we already allocated before the failure so the
+      // pool doesn't leak (C3).
+      if (!chunk_offsets.empty()) {
+        ShmReleaseRequest rel;
+        for (uint64_t off : chunk_offsets) rel.add_offsets(off);
+        std::string rel_body;
+        rel.SerializeToString(&rel_body);
+        (void)shm_conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      }
+      return unrecoverable_status_;
+    }
+
+    // The item itself. The server looks up its table by item.table() (v1:
+    // the server owns one table).
+    *req.add_items() = item_and_refs->item;
+    uint64_t key = item_and_refs->item.key();
+
+    // Move the item to in_flight BEFORE sending INSERT. The server's ACK is
+    // the completion signal; on ACK we erase from in_flight and release
+    // offsets. Registering first is harmless (no async callback here, but it
+    // keeps the invariant symmetric with RunLocalWorker and Flush's count).
+    {
+      absl::MutexLock l(&mu_);
+      in_flight_items_[key] = std::move(write_queue_.front());
+      write_queue_.pop_front();
+    }
+
+    // Send INSERT (blocks if the C→S ring is full — natural backpressure).
+    std::string req_body;
+    req.SerializeToString(&req_body);
+    absl::Status is = shm_conn_->c2s.Write(INSERT, absl::MakeSpan(req_body));
+    if (!is.ok()) {
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_ok_ = false;
+      stream_status_ = is;
+      unrecoverable_status_ = is;
+      data_cv_.Signal();
+      // Release the offsets we allocated; the INSERT never went.
+      ShmReleaseRequest rel;
+      for (uint64_t off : chunk_offsets) rel.add_offsets(off);
+      std::string rel_body;
+      rel.SerializeToString(&rel_body);
+      (void)shm_conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      return is;
+    }
+
+    // Wait for INSERT_ACK (C2: client must not reuse offsets until ACK's
+    // offsets_to_release arrives). The ACK is the completion signal.
+    MsgType ack_type;
+    std::string ack_body;
+    absl::Status as = read_blocking(&shm_conn_->s2c, &ack_type, &ack_body);
+if (!as.ok()) {
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_ok_ = false;
+      stream_status_ = as;
+      unrecoverable_status_ = as;
+      data_cv_.Signal();
+      return as;
+    }
+    if (ack_type == ERROR) {
+      // ponytail: surface the server error but keep the offsets outstanding —
+      // the server may still be processing; a future retry path (⑥) reclaims
+      // them. For v1, release them to avoid a pool leak.
+      ShmReleaseRequest rel;
+      for (uint64_t off : chunk_offsets) rel.add_offsets(off);
+      std::string rel_body;
+      rel.SerializeToString(&rel_body);
+      (void)shm_conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_ok_ = false;
+      stream_status_ = absl::InternalError(
+          "RunShmWorker: server returned ERROR for INSERT");
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+      return stream_status_;
+    }
+    if (ack_type != INSERT_ACK) {
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_status_ = absl::InternalError(absl::StrCat(
+          "RunShmWorker: expected INSERT_ACK, got ", ack_type));
+      stream_ok_ = false;
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+      return stream_status_;
+    }
+    InsertAck ack;
+    if (!ack.ParseFromString(ack_body)) {
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_status_ =
+          absl::InternalError("RunShmWorker: malformed InsertAck");
+      stream_ok_ = false;
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+      return stream_status_;
+    }
+
+    // Verify the server confirmed this item's key. ponytail: v1 sends one
+    // item per INSERT, so the ACK must contain exactly our key. If the server
+    // rejected it (e.g. unknown table), the key is absent — surface failure.
+    bool confirmed = false;
+    for (uint64_t k : ack.keys()) {
+      if (k == key) {
+        confirmed = true;
+        break;
+      }
+    }
+    if (!confirmed) {
+      // Release offsets (C2) and surface.
+      ShmReleaseRequest rel;
+      for (uint64_t off : chunk_offsets) rel.add_offsets(off);
+      std::string rel_body;
+      rel.SerializeToString(&rel_body);
+      (void)shm_conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      stream_status_ = absl::NotFoundError(absl::StrCat(
+          "RunShmWorker: server did not confirm item ", key,
+          " (unknown table or rejected)"));
+      stream_ok_ = false;
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+      return stream_status_;
+    }
+
+    // Completion: erase from in_flight, allow more inserts, signal waiters.
+    {
+      absl::MutexLock l(&mu_);
+      in_flight_items_.erase(key);
+      local_can_insert_more_ = true;
+      data_cv_.Signal();
+    }
+
+    // C2: now that the server has copied the bytes into its ChunkStore, the
+    // client may release the pool offsets it allocated.
+    ShmReleaseRequest rel;
+    for (uint64_t off : chunk_offsets) rel.add_offsets(off);
+    std::string rel_body;
+    rel.SerializeToString(&rel_body);
+    absl::Status rs = shm_conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+    if (!rs.ok()) {
+      // Non-fatal for data integrity (the server tracks outstanding offsets
+      // and reclaims on disconnect, ⑥); but log via unrecoverable_status_ so
+      // it surfaces. ponytail: a stuck RELEASE would eventually exhaust the
+      // pool tier; surface it.
+      absl::MutexLock l(&mu_);
+      stream_ok_ = false;
+      stream_status_ = rs;
+      unrecoverable_status_ = rs;
+      data_cv_.Signal();
+      return rs;
+    }
+
     {
       absl::MutexLock l(&mu_);
       if (in_flight_items_.size() + write_queue_.size() >=
