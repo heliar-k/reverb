@@ -49,6 +49,50 @@ reverb_cc_test(
     ],
 )
 
+# ---- Byte Pool ----
+
+reverb_cc_library(
+    name = "byte_pool",
+    srcs = ["byte_pool.cc"],
+    hdrs = ["byte_pool.h"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+reverb_cc_test(
+    name = "byte_pool_test",
+    srcs = ["byte_pool_test.cc"],
+    deps = [
+        ":byte_pool",
+        "//reverb/cc/platform:status_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+reverb_cc_test(
+    name = "byte_pool_echo_test",
+    srcs = ["byte_pool_echo_test.cc"],
+    deps = [
+        ":bootstrap",
+        ":byte_pool",
+        ":ring",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc/platform:status_matchers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 # ---- Bootstrap (udsocket) ----
 
 reverb_cc_library(
