@@ -1,0 +1,126 @@
+// Protocol definitions for the Reverb SHM transport layer.
+//
+// See docs/numpy-shm-spec.md §4 and docs/numpy-shm-design.md §8.3. A ring slot
+// is [SlotHeader{16 bytes}][payload bytes]; the payload is a length-delimited
+// proto whose message type is identified by the slot's `msg_type` (see `MsgType`
+// below). Multi-slot messages carry a `seq` so the reader reassembles the
+// fragments (design §8.4).
+
+syntax = "proto3";
+
+package deepmind.reverb.shm;
+
+import "reverb/cc/schema.proto";
+import "reverb/cc/patterns.proto";
+import "reverb/cc/reverb_service.proto";
+import "third_party/reverb_tensor/reverb_tensor.proto";
+
+option cc_enable_arenas = true;
+
+// Wire message type, stored in `SlotHeader.msg_type` (uint16). C→S requests use
+// small values, S→C responses use 100+. The two ALLOCATE types implement
+// decision C4: a client asks the server (the sole allocator) for a pool offset
+// before writing insert bytes.
+enum MsgType {
+  MSG_TYPE_UNSPECIFIED = 0;
+  // C→S
+  HELLO = 1;
+  INSERT = 2;
+  SAMPLE = 3;
+  RELEASE = 4;
+  ALLOCATE = 5;  // C4: client requests a pool offset from the server
+  CLOSE = 9;
+  // S→C
+  WELCOME = 101;
+  INSERT_ACK = 102;
+  SAMPLE_RESP = 103;
+  ALLOCATE_RESP = 104;  // C4: server returns the granted pool offset
+  ERROR = 105;
+}
+
+// ── C→S ──
+
+message HelloRequest {
+  int32 client_pid = 1;
+  uint32 protocol_version = 2;
+}
+
+message ShmInsertRequest {
+  repeated ShmChunkRef chunks = 1;
+  repeated .deepmind.reverb.PrioritizedItem items = 2;
+  repeated uint64 keep_chunk_keys = 3;
+}
+
+message ShmChunkRef {
+  uint64 chunk_key = 1;
+  uint64 shm_offset = 2;
+  uint64 total_length = 3;
+  repeated .reverb.tensor.SignatureProto.TensorSpec specs = 4;
+  .deepmind.reverb.SequenceRange sequence_range = 5;
+  bool delta_encoded = 6;
+}
+
+message ShmSampleRequest {
+  string table = 1;
+  int64 num_samples = 2;
+  int64 timeout_ms = 3;  // rate_limiter_timeout, -1 = InfiniteDuration
+  bool emit_timesteps = 4;
+}
+
+message ShmReleaseRequest {
+  repeated uint64 offsets = 1;
+}
+
+// C4: client asks the server (sole allocator) for a pool offset of the given
+// size before memcpy-ing insert bytes. Server replies with ALLOCATE_RESP.
+message ShmAllocateRequest {
+  uint64 num_bytes = 1;
+}
+
+// ── S→C ──
+
+message WelcomeResponse {
+  string pool_shm_name = 1;
+  string c2s_shm_name = 2;
+  string s2c_shm_name = 3;
+  .deepmind.reverb.ServerInfoResponse server_info = 4;
+}
+
+message InsertAck {
+  repeated uint64 keys = 1;
+  repeated uint64 offsets_to_release = 2;  // insert consumed these; client may free
+}
+
+message ShmSampleResponse {
+  repeated ShmSample samples = 1;
+}
+
+message ShmSample {
+  .deepmind.reverb.SampleInfo info = 1;
+  repeated ShmColumn columns = 2;
+}
+
+message ShmColumn {
+  uint64 shm_offset = 1;
+  uint64 length = 2;
+  .reverb.tensor.SignatureProto.TensorSpec spec = 3;
+  bool squeeze = 4;
+}
+
+message ShmAllocateResponse {
+  uint64 shm_offset = 1;  // granted offset; client may now memcpy bytes here
+}
+
+message ShmError {
+  enum Code {
+    UNKNOWN = 0;
+    DEADLINE_EXCEEDED = 1;
+    INVALID_ARGUMENT = 2;
+    NOT_FOUND = 3;
+    RESOURCE_EXHAUSTED = 4;
+    INTERNAL = 5;
+  }
+  Code code = 1;
+  string message = 2;
+  uint64 request_seq = 3;  // producer_seq of the failing request (design §8.9)
+}
