@@ -96,6 +96,60 @@ TEST(BootstrapTest, NamesAreNonEmpty) {
   auto a = server.Accept();
   REVERB_ASSERT_OK(a.status());
   auto [client_fd, client_pid] = std::move(a).value();
+  // Drain the client's Hello before closing: skipping RecvHello races the
+  // client's write(Hello) against close() and can SIGPIPE the process under
+  // tight scheduling (pre-existing flake; same fix as HelloWelcomeRoundTrip).
+  REVERB_ASSERT_OK(RecvHello(client_fd));
+  REVERB_ASSERT_OK(SendWelcome(client_fd, expected));
+  close(client_fd);
+  client_thread.join();
+}
+
+TEST(BootstrapTest, SegmentNamesMatchA3Format) {
+  // Spec A3: names must be PID-suffixed so concurrent server instances don't
+  // collide. The server (in-process) generates them from its own PID + the
+  // accepted client's PID; the client asserts the suffix matches the real PIDs.
+  auto sock = UniqueSocket("a3");
+  auto s = ShmBootstrapServer::Create(sock);
+  REVERB_ASSERT_OK(s.status());
+  ShmBootstrapServer server = std::move(s).value();
+  int server_pid = getpid();
+  int client_pid = getpid();  // client thread runs in the same process
+
+  ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
+  WelcomeResponse expected;
+  expected.set_pool_shm_name(names.pool);
+  expected.set_c2s_shm_name(names.c2s);
+  expected.set_s2c_shm_name(names.s2c);
+
+  std::thread client_thread([&] {
+    auto r = ClientBootstrap(sock, client_pid);
+    REVERB_ASSERT_OK(r.status());
+    WelcomeResponse got = std::move(r).value();
+    // A3: /reverb_shm_pool_<server_pid>
+    EXPECT_EQ(got.pool_shm_name(),
+              "/reverb_shm_pool_" + std::to_string(server_pid));
+    // A3: /reverb_shm_c2s_<server_pid>_<client_pid>
+    EXPECT_EQ(got.c2s_shm_name(), "/reverb_shm_c2s_" +
+                                      std::to_string(server_pid) + "_" +
+                                      std::to_string(client_pid));
+    // A3: /reverb_shm_s2c_<server_pid>_<client_pid>
+    EXPECT_EQ(got.s2c_shm_name(), "/reverb_shm_s2c_" +
+                                      std::to_string(server_pid) + "_" +
+                                      std::to_string(client_pid));
+  });
+
+  auto a = server.Accept();
+  REVERB_ASSERT_OK(a.status());
+  auto [client_fd, accepted_pid] = std::move(a).value();
+  // SO_PEERCRED must report the real client PID (same process here).
+  EXPECT_EQ(accepted_pid, client_pid);
+  // Drain the client's Hello before closing (mirrors HelloWelcomeRoundTrip;
+  // skipping RecvHello races the client's write(Hello) against close() and can
+  // SIGPIPE the process under tight scheduling).
+  auto hello = RecvHello(client_fd);
+  REVERB_ASSERT_OK(hello.status());
+  REVERB_ASSERT_OK(CheckProtocolVersion(hello->protocol_version()));
   REVERB_ASSERT_OK(SendWelcome(client_fd, expected));
   close(client_fd);
   client_thread.join();

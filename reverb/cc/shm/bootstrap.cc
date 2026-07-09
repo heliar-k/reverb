@@ -192,6 +192,14 @@ absl::Status CheckProtocolVersion(uint32_t client_version) {
   return absl::OkStatus();
 }
 
+ShmSegmentNames MakeShmNames(int server_pid, int client_pid) {
+  ShmSegmentNames names;
+  names.pool = absl::StrCat("/reverb_shm_pool_", server_pid);
+  names.c2s = absl::StrCat("/reverb_shm_c2s_", server_pid, "_", client_pid);
+  names.s2c = absl::StrCat("/reverb_shm_s2c_", server_pid, "_", client_pid);
+  return names;
+}
+
 absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
                                                 int client_pid) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);

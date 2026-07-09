@@ -55,6 +55,18 @@ class ShmBootstrapServer {
   std::string socket_path_;
 };
 
+// A3-format SHM segment names for one (server, client) pair. The server owns
+// generation (spec A3): pool is keyed by server PID alone; the two rings carry
+// both PIDs. `/reverb_shm_pool_<server_pid>`,
+// `/reverb_shm_c2s_<server_pid>_<client_pid>`,
+// `/reverb_shm_s2c_<server_pid>_<client_pid>`.
+struct ShmSegmentNames {
+  std::string pool;
+  std::string c2s;
+  std::string s2c;
+};
+ShmSegmentNames MakeShmNames(int server_pid, int client_pid);
+
 // Send a WelcomeResponse (length-delimited: 4-byte big-endian length prefix +
 // proto bytes) over `client_fd`.
 absl::Status SendWelcome(int client_fd, const WelcomeResponse& welcome);
