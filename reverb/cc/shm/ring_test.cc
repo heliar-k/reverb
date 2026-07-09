@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <utility>
@@ -30,6 +31,18 @@ namespace shm {
 namespace {
 
 using ::testing::HasSubstr;
+
+// ponytail: poll a non-blocking Read with sched_yield until it returns OK. The
+// blocking policy lives at the caller layer (spec R5), never on Ring, so tests
+// that need blocking semantics spin here instead of asking Ring to block.
+absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload) {
+  while (true) {
+    absl::Status s = ring->Read(msg_type, payload);
+    if (s.ok()) return absl::OkStatus();
+    if (!absl::IsNotFound(s)) return s;  // real error, surface immediately
+    sched_yield();
+  }
+}
 
 // A unique SHM name per test to avoid collisions across parallel runs.
 std::string UniqueName(const std::string& tag) {
@@ -83,29 +96,39 @@ TEST(RingTest, FullBlocksThenUnblocks) {
     REVERB_ASSERT_OK(ring.Write(RELEASE, absl::MakeSpan(p)));
   });
   // Drain: read until we see the "unblock" message. Each read frees a slot.
+  // The 5th message is written by `writer` only after a slot frees, so its read
+  // may transiently return NOT_READY (now that Read is non-blocking) — poll.
   MsgType type;
   std::string out;
   bool saw_unblock = false;
   for (int i = 0; i < 5; i++) {
-    REVERB_ASSERT_OK(ring.Read(&type, &out));
+    REVERB_ASSERT_OK(ReadBlocking(&ring, &type, &out));
     if (out == "unblock") saw_unblock = true;
   }
   writer.join();
   EXPECT_TRUE(saw_unblock);
 }
 
-TEST(RingTest, EmptyBlocksThenUnblocks) {
+TEST(RingTest, EmptyReadsNonBlockingThenDataArrives) {
   auto s = Ring::Create(UniqueName("empty"), 16, 256);
   REVERB_ASSERT_OK(s.status());
   Ring ring = std::move(s).value();
+  // Read on an empty ring returns NOT_READY immediately (no blocking).
+  MsgType type;
+  std::string out;
+  absl::Status st = ring.Read(&type, &out);
+  EXPECT_FALSE(st.ok());
+  EXPECT_TRUE(absl::IsNotFound(st)) << st;
+  EXPECT_THAT(std::string(st.message()), HasSubstr("NOT_READY"));
+
+  // A reader thread polls until data arrives (R5: blocking is the caller's job).
   std::thread reader([&] {
-    MsgType type;
-    std::string out;
-    REVERB_ASSERT_OK(ring.Read(&type, &out));
-    EXPECT_EQ(type, WELCOME);
-    EXPECT_EQ(out, "ready");
+    MsgType t;
+    std::string o;
+    REVERB_ASSERT_OK(ReadBlocking(&ring, &t, &o));
+    EXPECT_EQ(t, WELCOME);
+    EXPECT_EQ(o, "ready");
   });
-  // Give the reader a chance to block on the empty ring.
   std::string p = "ready";
   REVERB_ASSERT_OK(ring.Write(WELCOME, absl::MakeSpan(p)));
   reader.join();

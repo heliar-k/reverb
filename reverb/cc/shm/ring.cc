@@ -226,11 +226,12 @@ absl::Status Ring::Write(MsgType msg_type, absl::Span<const char> payload) {
 absl::Status Ring::Read(MsgType* msg_type, std::string* payload) {
   uint64_t seq = header_->tail.load(std::memory_order_relaxed);
   SlotHeader* s = Slot(seq);
-  // Wait until the producer has written this slot.
-  while (std::atomic_load_explicit(
-             reinterpret_cast<const std::atomic<uint64_t>*>(&s->seq),
-             std::memory_order_acquire) != seq) {
-    sched_yield();
+  // Non-blocking (spec §3.1): if the next slot hasn't been written yet, return
+  // immediately. Callers needing to block must poll at the call site (R5).
+  if (std::atomic_load_explicit(
+          reinterpret_cast<const std::atomic<uint64_t>*>(&s->seq),
+          std::memory_order_acquire) != seq) {
+    return absl::NotFoundError("NOT_READY");
   }
 
   *msg_type = static_cast<MsgType>(s->msg_type);

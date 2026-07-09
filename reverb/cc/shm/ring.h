@@ -77,7 +77,10 @@ inline constexpr uint16_t kFlagIsContinuation = 0x0002;
 
 // A single-producer single-consumer ring over a POSIX shared-memory segment.
 // One side calls Create (server/owner), the other Open (client). Write blocks
-// (busy-wait sched_yield) when full; Read blocks when empty.
+// (busy-wait sched_yield) when full; Read is NON-BLOCKING and returns
+// NotFoundError("NOT_READY") when no message is ready (spec §3.1). The busy-wait
+// polling policy for callers that need blocking semantics lives in
+// ShmConnection (spec R5), not here.
 class Ring {
  public:
   Ring();
@@ -101,8 +104,12 @@ class Ring {
   // is larger than the whole ring.
   absl::Status Write(MsgType msg_type, absl::Span<const char> payload);
 
-  // Read one message, reassembling cross-slot fragments. Blocks (sched_yield)
-  // until a message is available.
+  // Read one message, reassembling cross-slot fragments. NON-BLOCKING: if no
+  // message is ready (next slot's seq != consumer_seq), returns
+  // absl::NotFoundError("NOT_READY") immediately (spec §3.1). A missing
+  // continuation slot after the first is a corruption signal and returns
+  // InternalError. Callers needing blocking reads must poll at the call site
+  // (per spec R5, that policy belongs to ShmConnection, not Ring).
   absl::Status Read(MsgType* msg_type, std::string* payload);
 
   uint32_t capacity() const { return header_->capacity; }
