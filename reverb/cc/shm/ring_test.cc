@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
 #include <sched.h>
 #include <string>
 #include <thread>
@@ -177,6 +178,51 @@ TEST(RingTest, MessageTooLargeRejected) {
   absl::Status st = ring.Write(INSERT, absl::MakeSpan(payload));
   EXPECT_FALSE(st.ok());
   EXPECT_THAT(std::string(st.message()), HasSubstr("capacity"));
+}
+
+TEST(RingTest, TryWriteOnFullRingReturnsResourceExhaustedWithoutBlocking) {
+  auto s = Ring::Create(UniqueName("tryfull"), 4, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  // Fill all 4 slots.
+  for (int i = 0; i < 4; i++) {
+    std::string p = "m" + std::to_string(i);
+    REVERB_ASSERT_OK(ring.Write(SAMPLE, absl::MakeSpan(p)));
+  }
+  // TryWrite on a full ring must return ResourceExhausted("RING_FULL")
+  // immediately (no blocking), and must NOT advance head (no partial write).
+  std::string p = "overflow";
+  auto start = std::chrono::steady_clock::now();
+  absl::Status st = ring.TryWrite(RELEASE, absl::MakeSpan(p));
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_FALSE(st.ok());
+  EXPECT_TRUE(absl::IsResourceExhausted(st)) << st;
+  EXPECT_THAT(std::string(st.message()), HasSubstr("RING_FULL"));
+  // Must return near-instantly (a blocking Write would spin until a slot
+  // frees, which never happens here -> test would hang). 100ms is generous.
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                .count(),
+            100);
+  // Drain the ring; the overflow TryWrite did not land.
+  for (int i = 0; i < 4; i++) {
+    MsgType type;
+    std::string out;
+    REVERB_ASSERT_OK(ring.Read(&type, &out));
+    EXPECT_EQ(out, "m" + std::to_string(i));
+  }
+}
+
+TEST(RingTest, TryWriteWithSpaceMatchesWrite) {
+  auto s = Ring::Create(UniqueName("tryspace"), 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  std::string payload = "trywrite-payload";
+  REVERB_ASSERT_OK(ring.TryWrite(HELLO, absl::MakeSpan(payload)));
+  MsgType type;
+  std::string out;
+  REVERB_ASSERT_OK(ring.Read(&type, &out));
+  EXPECT_EQ(type, HELLO);
+  EXPECT_EQ(out, payload);
 }
 
 TEST(RingTest, TwoRingsSameSegment) {

@@ -273,9 +273,11 @@ ShmClient::ShmClient(ShmConnection conn) : conn_(std::move(conn)) {}
 absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
     const std::string& socket_path) {
   // Bootstrap handshake (retry briefly while the server binds the socket).
-  absl::StatusOr<WelcomeResponse> w;
+  // ticket ⑥: keep the udsocket fd open as the liveness signal the server
+  // poll()s for crash/close detection (spec §8.8).
+  absl::StatusOr<ClientBootstrapResult> w;
   for (int i = 0; i < 200; i++) {
-    w = ClientBootstrap(socket_path, /*client_pid=*/getpid());
+    w = ClientBootstrapWithFd(socket_path, /*client_pid=*/getpid());
     if (w.ok()) break;
     sched_yield();
   }
@@ -283,15 +285,17 @@ absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
 
   // Open the three segments: pool (RW, C4) + the two rings.
   REVERB_ASSIGN_OR_RETURN(ShmBytePool pool,
-                          ShmBytePool::Open(w->pool_shm_name()));
-  REVERB_ASSIGN_OR_RETURN(Ring c2s, Ring::Open(w->c2s_shm_name()));
-  REVERB_ASSIGN_OR_RETURN(Ring s2c, Ring::Open(w->s2c_shm_name()));
+                          ShmBytePool::Open(w->welcome.pool_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(Ring c2s, Ring::Open(w->welcome.c2s_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(Ring s2c, Ring::Open(w->welcome.s2c_shm_name()));
 
   ShmConnection conn;
   conn.c2s = std::move(c2s);
   conn.s2c = std::move(s2c);
   conn.pool = std::move(pool);
-  conn.pool_shm_name = w->pool_shm_name();
+  conn.pool_shm_name = w->welcome.pool_shm_name();
+  conn.control_fd = w->fd;  // ~ShmConnection closes it
+  w->fd = -1;               // conn owns it now
 
   return absl::WrapUnique(new ShmClient(std::move(conn)));
 }

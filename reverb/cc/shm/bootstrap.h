@@ -83,8 +83,24 @@ absl::StatusOr<HelloRequest> RecvHello(int client_fd);
 // InvalidArgumentError on mismatch (caller should send an error + close).
 absl::Status CheckProtocolVersion(uint32_t client_version);
 
-// Client side: connect to the server's Unix socket and run the Hello/Welcome
-// handshake. On success returns the WelcomeResponse (with the three SHM names).
+// ClientBootstrapResult bundles the handshake response with the open udsocket
+// fd. The caller owns the fd and must keep it open for the connection
+// lifetime (ticket ⑥): the server `poll()`s this fd for POLLHUP/EOF to detect
+// a client crash (spec §8.8). Closing the fd (in ~ShmConnection) is the
+// liveness signal.
+struct ClientBootstrapResult {
+  WelcomeResponse welcome;
+  int fd = -1;  // open udsocket fd; caller owns and closes it
+};
+
+// Connect, send Hello, recv Welcome, and RETURN the open fd (does not close
+// it). Used by ShmClient::Connect, which stores the fd for liveness (ticket ⑥).
+absl::StatusOr<ClientBootstrapResult> ClientBootstrapWithFd(
+    const std::string& socket_path, int client_pid);
+
+// One-shot handshake: connects, exchanges Hello/Welcome, and CLOSES the fd.
+// For callers that do not need a persistent liveness fd (e.g. echo tests).
+// ponytail: retained so existing tests/clients are unchanged.
 absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
                                                 int client_pid);
 

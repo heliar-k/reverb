@@ -200,8 +200,8 @@ ShmSegmentNames MakeShmNames(int server_pid, int client_pid) {
   return names;
 }
 
-absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
-                                                int client_pid) {
+absl::StatusOr<ClientBootstrapResult> ClientBootstrapWithFd(
+    const std::string& socket_path, int client_pid) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return ErrnoStatus("socket", socket_path);
 
@@ -225,26 +225,55 @@ absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
   std::string body;
   hello.SerializeToString(&body);
   uint32_t len = htonl(static_cast<uint32_t>(body.size()));
-  REVERB_RETURN_IF_ERROR(WriteAll(fd, &len, sizeof(len)));
-  REVERB_RETURN_IF_ERROR(WriteAll(fd, body.data(), body.size()));
+  auto write_status = WriteAll(fd, &len, sizeof(len));
+  if (!write_status.ok()) {
+    close(fd);
+    return write_status;
+  }
+  auto send_status = WriteAll(fd, body.data(), body.size());
+  if (!send_status.ok()) {
+    close(fd);
+    return send_status;
+  }
 
   // Read the WelcomeResponse.
   uint32_t resp_len_net = 0;
-  REVERB_RETURN_IF_ERROR(ReadExact(fd, &resp_len_net, sizeof(resp_len_net)));
+  auto read_len = ReadExact(fd, &resp_len_net, sizeof(resp_len_net));
+  if (!read_len.ok()) {
+    close(fd);
+    return read_len;
+  }
   uint32_t resp_len = ntohl(resp_len_net);
   if (resp_len > 64 * 1024 * 1024) {
     close(fd);
     return absl::InvalidArgumentError("WelcomeResponse length too large");
   }
   std::string resp_body(resp_len, '\0');
-  REVERB_RETURN_IF_ERROR(ReadExact(fd, resp_body.data(), resp_len));
-  close(fd);
+  auto read_body = ReadExact(fd, resp_body.data(), resp_len);
+  if (!read_body.ok()) {
+    close(fd);
+    return read_body;
+  }
+  // NOTE: do NOT close `fd` — the caller owns it and keeps it open for the
+  // connection lifetime as the liveness signal (ticket ⑥, spec §8.8).
 
-  WelcomeResponse welcome;
-  if (!welcome.ParseFromString(resp_body)) {
+  ClientBootstrapResult result;
+  if (!result.welcome.ParseFromString(resp_body)) {
+    close(fd);
     return absl::InternalError("failed to parse WelcomeResponse");
   }
-  return welcome;
+  result.fd = fd;
+  return result;
+}
+
+absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
+                                                int client_pid) {
+  auto r = ClientBootstrapWithFd(socket_path, client_pid);
+  if (!r.ok()) return r.status();
+  // One-shot callers don't need the liveness fd: close it and return just the
+  // Welcome. ponytail: retained so existing echo/bootstrap tests are unchanged.
+  close(r->fd);
+  return std::move(r->welcome);
 }
 
 }  // namespace shm

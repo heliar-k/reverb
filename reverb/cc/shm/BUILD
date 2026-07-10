@@ -130,7 +130,15 @@ reverb_cc_test(
 
 reverb_cc_library(
     name = "shm_connection",
+    srcs = ["shm_connection.cc"],
     hdrs = ["shm_connection.h"],
+    # alwayslink: libpybind.so (a Python extension / shared lib) links this
+    # static cc_library and only pulls directly-referenced symbols. The
+    # ShmConnection destructor (added in ticket ⑥ to close the liveness fd) is
+    # needed indirectly via ShmClient/ShmServer member destruction and would
+    # otherwise be an undefined symbol at import time (same reason byte_pool is
+    # alwayslink).
+    alwayslink = 1,
     deps = [
         ":byte_pool",
         ":ring",
@@ -277,6 +285,38 @@ reverb_cc_test(
         "//reverb/cc/platform:status_matchers",
         "//reverb/cc/support:tensor_proxy",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---- Crash recovery + cleanup test (ticket ⑥) ----
+
+# ponytail: links libpython via :shm_client/:shm_server -> :tensor_proxy, same
+# as shm_sample_test. See shm_sample_test.cc header on the libpython/openssl
+# clash that prevents a CPython interpreter here.
+reverb_cc_test(
+    name = "shm_crash_test",
+    srcs = ["shm_crash_test.cc"],
+    deps = [
+        ":bootstrap",
+        ":shm_client",
+        ":shm_server",
+        ":shm_protocol_cc_proto",
+        "//reverb/cc:chunk_store",
+        "//reverb/cc:sampler",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc:tensor_compression",
+        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/support:tensor_proxy",
+        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",

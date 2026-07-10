@@ -34,13 +34,29 @@ namespace shm {
 // `ShmBytePool` (the owner/allocator) inside `ShmServer` and does not share it
 // through this struct. Both sides read sample bytes via `pool.At(offset)`.
 //
-// ponytail: a plain struct, no factory. Move-only (Ring/ShmBytePool are
-// move-only).
+// `control_fd` (ticket ⑥): the open udsocket fd kept for the connection
+// lifetime as a liveness signal. The SERVER stores its accepted fd in
+// `ClientState.fd` (not here) and leaves this -1; the CLIENT stores its
+// bootstrap fd here and ~ShmConnection closes it. When the client process
+// crashes or ~ShmClient runs, the fd closes -> the server's poll() sees
+// POLLHUP/EOF -> HandleDisconnect (spec §8.8).
+//
+// ponytail: a plain struct with a destructor closing control_fd, no factory.
+// Move-only (Ring/ShmBytePool are move-only). The move-ctor must steal
+// control_fd and null the source so ~ShmConnection does not double-close.
 struct ShmConnection {
   Ring c2s;  // client -> server
   Ring s2c;  // server -> client
   ShmBytePool pool;  // client-side RW mapping (C4); server keeps its own
   std::string pool_shm_name;
+  int control_fd = -1;  // client liveness fd (ticket ⑥); -1 = none
+
+  ShmConnection() = default;
+  ~ShmConnection();
+  ShmConnection(ShmConnection&& other) noexcept;
+  ShmConnection& operator=(ShmConnection&& other) noexcept;
+  ShmConnection(const ShmConnection&) = delete;
+  ShmConnection& operator=(const ShmConnection&) = delete;
 };
 
 }  // namespace shm

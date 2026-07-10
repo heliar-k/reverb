@@ -14,10 +14,14 @@
 
 #include "reverb/cc/shm/shm_server.h"
 
+#include <csignal>
 #include <cstring>
+#include <mutex>
 #include <poll.h>
 #include <sched.h>
 #include <string>
+#include <sys/mman.h>  // shm_unlink
+#include <sys/socket.h>  // recv, MSG_PEEK
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -42,6 +46,27 @@ namespace reverb {
 namespace shm {
 
 namespace {
+
+// ticket ⑥ / R12: signal-driven shutdown. A signal handler may only touch
+// async-signal-safe state, so it flips this atomic and the dispatch loop
+// exits on its next pass; cleanup then runs via Stop()/~ShmServer (the owner
+// calls Stop, or the destructor runs at process exit). ponytail: signal()+an
+// atomic, not signalfd/evfd — the minimal correct approach. Ceiling: only one
+// ShmServer per process is signal-driven; if multiple need independent
+// shutdown, switch to a per-instance self-pipe. Upgrade path noted, not built.
+std::atomic<bool> g_signal_stop{false};
+
+void SignalHandler(int) { g_signal_stop.store(true, std::memory_order_relaxed); }
+
+void InstallSignalHandlers() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    // signal() is not async-signal-safe to call from a handler, but we only
+    // call it once at Start; the handler itself only flips an atomic.
+    std::signal(SIGTERM, SignalHandler);
+    std::signal(SIGINT, SignalHandler);
+  });
+}
 
 // Build the ShmColumn spec (proto) from a TensorBuffer.
 ::reverb::tensor::SignatureProto::TensorSpec TensorSpecFromBuffer(
@@ -87,6 +112,7 @@ absl::Status ShmServer::Start() {
   if (running_.exchange(true)) {
     return absl::FailedPreconditionError("ShmServer already started");
   }
+  InstallSignalHandlers();  // R12: SIGTERM/SIGINT -> graceful shutdown
   dispatch_thread_ = std::thread([this] { DispatchLoop(); });
   return absl::OkStatus();
 }
@@ -95,26 +121,97 @@ void ShmServer::Stop() {
   if (!running_.exchange(false)) return;
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
 
-  // Clean up clients: release any outstanding offsets and close fds. The rings
-  // and pool are unlinked by their owners' destructors when `clients_` clears.
+  // Clean up clients: ReleaseAll outstanding offsets (C3), close fds. The
+  // rings are unlinked by their Ring destructors (owner_=true) when
+  // `clients_` clears, so we pass unlink_rings=false to avoid a redundant
+  // shm_unlink (the destructor's unlink is the canonical one).
   for (auto& c : clients_) {
-    if (!c->outstanding_offsets_.empty()) {
-      pool_.ReleaseAll(
-          std::vector<uint64_t>(c->outstanding_offsets_.begin(),
-                                c->outstanding_offsets_.end()));
-      c->outstanding_offsets_.clear();
-    }
-    if (c->fd >= 0) close(c->fd);
+    CleanupClient(*c, /*unlink_rings=*/false);
   }
   clients_.clear();
 }
 
+void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
+  // C3 crash recovery: centrally release every outstanding pool offset the
+  // client never RELEASEd. ReleaseAll decrements refcount and deallocates any
+  // that hit 0 (the sample-path bytes the client never read back).
+  if (!state.outstanding_offsets_.empty()) {
+    pool_.ReleaseAll(
+        std::vector<uint64_t>(state.outstanding_offsets_.begin(),
+                              state.outstanding_offsets_.end()));
+    state.outstanding_offsets_.clear();
+  }
+  if (unlink_rings) {
+    // R6: unlink this client's two ring segments so a restart doesn't see
+    // stale segments. Recompute the names (A3: keyed by server+client PID).
+    // The Ring destructor ALSO unlinks (owner_=true), but explicit unlink here
+    // is safe (second unlink is a harmless ENOENT) and makes the cleanup
+    // intent obvious at the disconnect site.
+    ShmSegmentNames names = MakeShmNames(getpid(), state.client_pid);
+    shm_unlink(names.c2s.c_str());
+    shm_unlink(names.s2c.c_str());
+  }
+  if (state.fd >= 0) {
+    close(state.fd);
+    state.fd = -1;
+  }
+}
+
+void ShmServer::HandleDisconnect(size_t client_id) {
+  ClientState& state = *clients_[client_id];
+  REVERB_LOG(REVERB_INFO)
+      << "ShmServer: disconnecting client " << client_id
+      << " (pid " << state.client_pid
+      << "): fd EOF/HUP or explicit CLOSE";
+  CleanupClient(state, /*unlink_rings=*/true);
+  clients_.erase(clients_.begin() + client_id);
+}
+
+bool ShmServer::IsClientDead(const ClientState& state) {
+  if (state.close_requested) return true;  // explicit CLOSE (ticket ⑥)
+  if (state.fd < 0) return true;  // already closed
+  // poll the udsocket fd with zero timeout. POLLHUP/POLLERR => dead. POLLIN
+  // with a 0-byte read (EOF) => the peer closed cleanly. A healthy idle
+  // client has an empty ring but the fd is open -> poll returns 0 (no event),
+  // so idle clients are NOT mistaken for dead.
+  struct pollfd pfd;
+  pfd.fd = state.fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int n = poll(&pfd, 1, 0);
+  if (n <= 0) return false;  // no event (or EINTR) => alive
+  if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+  if (pfd.revents & POLLIN) {
+    // Data or EOF; peek 1 byte to disambiguate. recv()==0 is EOF; the byte
+    // stays in the socket buffer (MSG_PEEK) so a future read is unaffected.
+    char buf;
+    ssize_t r = recv(state.fd, &buf, 1, MSG_PEEK);
+    if (r == 0) return true;  // clean close
+    // r > 0: stray bytes on the control channel (no protocol uses it after
+    // handshake). Drain and keep the client (don't disconnect on noise).
+    // r < 0: transient; treat as alive.
+  }
+  return false;
+}
+
 void ShmServer::DispatchLoop() {
-  while (running_.load()) {
+  while (running_.load() && !g_signal_stop.load(std::memory_order_relaxed)) {
     TryAccept();
+    // ticket ⑥: detect dead clients (udsocket EOF/HUP) each pass. Collect
+    // dead indices and erase in REVERSE order so earlier indices stay valid
+    // (erasing index i would shift i+1.. down). HandleClientRequests/Flush
+    // a client AFTER confirming it is alive.
+    std::vector<size_t> dead;
     for (size_t i = 0; i < clients_.size(); i++) {
+      if (IsClientDead(*clients_[i])) {
+        dead.push_back(i);
+        continue;  // don't serve a dead client
+      }
       HandleClientRequests(i);
       FlushOutbox(*clients_[i]);
+    }
+    for (auto it = dead.rbegin(); it != dead.rend(); ++it) {
+      HandleDisconnect(*it);
     }
     // ponytail: sched_yield keeps the loop hot without pegging a core. A
     // blocking poll on all ring fds would be cheaper CPU but needs eventfd
@@ -262,7 +359,9 @@ void ShmServer::HandleClientRequests(size_t client_id) {
         break;
       }
       case CLOSE:
-        // ponytail: v1 just stops draining; full disconnect cleanup is ticket ⑥.
+        // ticket ⑥: graceful close. Mark for disconnect; the dispatch loop's
+        // dead-collection erases it next pass (avoid erasing mid-iteration).
+        state.close_requested = true;
         return;
       default:
         // Unknown msg type: ignore (forward-compat).
@@ -276,12 +375,13 @@ void ShmServer::FlushOutbox(ClientState& state) {
   while (!state.outbox.empty()) {
     auto& [type, body] = state.outbox.front();
     absl::Status s =
-        state.conn.s2c.Write(static_cast<MsgType>(type),
-                             absl::MakeSpan(body));
+        state.conn.s2c.TryWrite(static_cast<MsgType>(type),
+                                absl::MakeSpan(body));
     if (!s.ok()) {
-      // Still full — leave the front in place and try again next pass (§8.7).
-      // ponytail: a full outbox eventually backpressures via pool exhaustion;
-      // v1 does not bound the outbox size. Upgrade: ring-buffer + drop policy.
+      // Still full (or oversized) — leave the front in place and try again
+      // next pass (§8.7). ponytail: a full outbox eventually backpressures via
+      // pool exhaustion; v1 does not bound the outbox size. Upgrade:
+      // ring-buffer + drop policy.
       return;
     }
     state.outbox.erase(state.outbox.begin());
@@ -290,25 +390,17 @@ void ShmServer::FlushOutbox(ClientState& state) {
 
 absl::Status ShmServer::EnqueueS2C(ClientState& state, MsgType type,
                                    absl::string_view body) {
-  // Write the response to the S→C ring. Ring::Write busy-yields (blocks) when
-  // the ring is full; it only returns ResourceExhausted for a message larger
-  // than the whole ring (never for "temporarily full").
-  //
-  // ponytail: v1 therefore blocks the dispatch thread on a slow client's full
-  // S→C ring rather than fully implementing the spec §8.7 non-blocking+
-  // outbox scheme (Ring has no try-write API). The outbox is still populated
-  // on the oversized-message path for safety. Ceiling: one slow client stalls
-  // all others until its S→C drains. Upgrade path: add Ring::TryWrite (compare
-  // head-tail free space against slot demand) and route full rings through
-  // FlushOutbox each pass, per spec §8.7. The client drains S→C in a tight
-  // poll, so in practice the ring rarely fills.
-  absl::Status s = state.conn.s2c.Write(type, absl::MakeSpan(body));
+  // Non-blocking S→C write (spec §8.7 / ticket ⑥). TryWrite returns
+  // ResourceExhausted("RING_FULL") immediately when the S→C ring is full —
+  // we stash the message in the client's outbox and FlushOutbox retries each
+  // dispatch pass. A slow client's full S→C ring therefore no longer stalls
+  // the dispatch thread (the ③ deferred debt, now fixed).
+  absl::Status s = state.conn.s2c.TryWrite(type, absl::MakeSpan(body));
   if (s.ok()) return absl::OkStatus();
   if (!absl::IsResourceExhausted(s)) {
     return s;  // genuine error
   }
-  // Oversized for the ring: stash in outbox (FlushOutbox will retry; in
-  // practice this is a config error, not a flow-control path).
+  // Ring full (or oversized for the whole ring): stash for retry.
   {
     absl::MutexLock lock(&state.outbox_mu);
     state.outbox.emplace_back(static_cast<uint16_t>(type),

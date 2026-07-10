@@ -67,6 +67,10 @@ struct ClientState {
   // thread). Mirrors Writer::WritePendingDataLocal's local_pending_callbacks_.
   std::vector<std::shared_ptr<Table::InsertCallback>> pending_insert_callbacks
       ABSL_GUARDED_BY(outbox_mu);
+
+  // ticket ⑥: set when the client sends an explicit CLOSE. The dispatch loop's
+  // IsClientDead check then routes it through HandleDisconnect next pass.
+  bool close_requested = false;
 };
 
 // ShmServer owns ONE real Table (ponytail: multi-table later), a ShmBytePool
@@ -135,6 +139,23 @@ class ShmServer {
   // Enqueue a S→C message: try a non-blocking write, stash in outbox if full.
   absl::Status EnqueueS2C(ClientState& state, MsgType type,
                           absl::string_view body);
+
+  // ticket ⑥: detect a dead client (crash or graceful close) by probing its
+  // udsocket fd for POLLHUP/POLLERR/EOF without blocking. Returns true if the
+  // client's fd is closed. The fd is the liveness signal kept open for the
+  // connection lifetime (ShmConnection::control_fd on the client side).
+  bool IsClientDead(const ClientState& state);
+
+  // ticket ⑥: reclaim a crashed/closed client's resources — centralized offset
+  // release (C3), shm_unlink its two rings, close fd, erase from clients_.
+  // Called from the dispatch loop on EOF/HUP and on an explicit CLOSE.
+  void HandleDisconnect(size_t client_id);
+
+  // Per-client cleanup (shared by HandleDisconnect and Stop): ReleaseAll the
+  // outstanding offsets, shm_unlink the two rings, close the fd. Does NOT
+  // erase from clients_ (the caller does). `unlink_rings` is false on Stop so
+  // Stop is idempotent with the Ring destructor's own owner-unlink.
+  void CleanupClient(ClientState& state, bool unlink_rings);
 
   std::shared_ptr<Table> table_;
   std::string socket_path_;

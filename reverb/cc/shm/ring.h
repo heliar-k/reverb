@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -104,6 +105,13 @@ class Ring {
   // is larger than the whole ring.
   absl::Status Write(MsgType msg_type, absl::Span<const char> payload);
 
+  // Non-blocking write (ticket ⑥ / spec §8.7). Identical slot math to Write,
+  // but when `num_slots` free slots are not available, returns
+  // ResourceExhaustedError("RING_FULL") IMMEDIATELY without touching `head`
+  // — so the caller (ShmServer::EnqueueS2C) can stash the message in an
+  // outbox and retry next pass instead of blocking the dispatch thread.
+  absl::Status TryWrite(MsgType msg_type, absl::Span<const char> payload);
+
   // Read one message, reassembling cross-slot fragments. NON-BLOCKING: if no
   // message is ready (next slot's seq != consumer_seq), returns
   // absl::NotFoundError("NOT_READY") immediately (spec §3.1). A missing
@@ -139,6 +147,11 @@ class Ring {
   }
 
   size_t SlotBodyCap() const { return header_->slot_size - sizeof(SlotHeader); }
+
+  // Shared body of Write/TryWrite: fill `num_slots` slots starting at
+  // `first_seq` and publish head. Caller has already verified free space.
+  void WriteSlots(MsgType msg_type, absl::Span<const char> payload,
+                  uint64_t first_seq, size_t num_slots, size_t body_cap);
 
   void Release();
 };

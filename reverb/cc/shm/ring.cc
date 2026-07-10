@@ -203,7 +203,38 @@ absl::Status Ring::Write(MsgType msg_type, absl::Span<const char> payload) {
     sched_yield();  // ponytail: busy-yield; no semaphore to avoid crash leaks
   }
 
+  WriteSlots(msg_type, payload, first_seq, num_slots, body_cap);
+  return absl::OkStatus();
+}
+
+absl::Status Ring::TryWrite(MsgType msg_type,
+                            absl::Span<const char> payload) {
+  size_t body_cap = SlotBodyCap();
+  size_t len = payload.size();
+  size_t num_slots = (len + body_cap - 1) / body_cap;
+  if (num_slots == 0) num_slots = 1;
+  if (num_slots > header_->capacity) {
+    return absl::ResourceExhaustedError(
+        "message larger than ring capacity");
+  }
+
+  // Non-blocking (spec §8.7): if not enough free slots, return immediately
+  // WITHOUT touching head — the caller stashes the message and retries.
+  uint64_t first_seq = header_->head.load(std::memory_order_relaxed);
+  if (first_seq - header_->tail.load(std::memory_order_acquire) >
+      header_->capacity - num_slots) {
+    return absl::ResourceExhaustedError("RING_FULL");
+  }
+
+  WriteSlots(msg_type, payload, first_seq, num_slots, body_cap);
+  return absl::OkStatus();
+}
+
+void Ring::WriteSlots(MsgType msg_type, absl::Span<const char> payload,
+                      uint64_t first_seq, size_t num_slots,
+                      size_t body_cap) {
   const char* src = payload.data();
+  size_t len = payload.size();
   for (size_t i = 0; i < num_slots; i++) {
     uint64_t seq = first_seq + i;
     SlotHeader* s = Slot(seq);
@@ -220,7 +251,6 @@ absl::Status Ring::Write(MsgType msg_type, absl::Span<const char> payload) {
                                seq, std::memory_order_release);
   }
   header_->head.store(first_seq + num_slots, std::memory_order_release);
-  return absl::OkStatus();
 }
 
 absl::Status Ring::Read(MsgType* msg_type, std::string* payload) {
