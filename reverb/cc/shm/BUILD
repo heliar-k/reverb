@@ -55,6 +55,11 @@ reverb_cc_library(
     name = "byte_pool",
     srcs = ["byte_pool.cc"],
     hdrs = ["byte_pool.h"],
+    # alwayslink: libpybind.so (a Python extension / shared lib) links this
+    # static cc_library and only pulls directly-referenced symbols. ShmBytePool's
+    # dtor is needed indirectly (via ShmServer/ShmClient member destruction) and
+    # otherwise yields an undefined symbol at import time.
+    alwayslink = 1,
     deps = [
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",

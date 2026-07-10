@@ -168,6 +168,15 @@ reverb_py_test(
 )
 
 reverb_py_test(
+    name = "shm_test",
+    srcs = ["shm_test.py"],
+    deps = [
+        "//reverb",
+        "//reverb:errors",
+    ],
+)
+
+reverb_py_test(
     name = "grpc_roundtrip_test",
     srcs = ["grpc_roundtrip_test.py"],
     deps = [

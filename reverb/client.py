@@ -21,6 +21,7 @@ possible.
 """
 
 import logging
+import pickle
 from typing import Any, Dict, Generator, List, Literal, Optional, Union, overload
 
 import numpy as np
@@ -810,3 +811,110 @@ class LocalClient(_BaseClient):
         # PascalCase alias added in pybind.cc to exercise the unified naming.
         timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
         return self._client.NewSampler(table, num_samples, buffer_size, timeout_ms_arg)
+
+
+class ShmClient(_BaseClient):
+    """SHM (POSIX shared memory) client for same-machine cross-process access.
+
+    Connects to a `Server(shm=True)` over a udsocket and mmaps the three SHM
+    segments (pool + two rings). `sample`/`trajectory_writer`/`structured_writer`
+    match `Client`/`LocalClient` exactly, so user code is transport-agnostic.
+
+    v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles only
+    SAMPLE/RELEASE/INSERT/ALLOCATE — there is no `server_info`/
+    `mutate_priorities`/`reset`/`checkpoint` round-trip over SHM, and the plain
+    `Writer` is unimplemented (use `trajectory_writer`/`structured_writer`).
+    `ShmClient` is not picklable: it holds SHM mmap + ring state (R13).
+    """
+
+    def __init__(self, socket_path: str):
+        super().__init__()
+        self._socket_path = socket_path
+        # pybind.ShmClient.__init__ calls ShmClient::Connect (bootstrap + mmap);
+        # raises on connection/handshake failure.
+        self._client = pybind.ShmClient(socket_path)
+
+    def __repr__(self):
+        return f"ShmClient(socket_path={self._socket_path})"
+
+    def __reduce__(self):
+        # Holds SHM mmap + ring state (cross-process pointers); not picklable,
+        # mirroring LocalClient. Upgrade: re-connect by socket_path if needed.
+        raise pickle.PicklingError(
+            "ShmClient is not picklable; it holds shared-memory mmap state. "
+            "Reconnect with ShmClient(socket_path) after unpickling."
+        )
+
+    def _fetch_server_info_proto(self, timeout: Optional[int]):
+        # ponytail: v1 ShmServer has no ServerInfo round-trip (the C++ dispatch
+        # only handles SAMPLE/RELEASE/INSERT/ALLOCATE). Return an empty list so
+        # `server_info()` yields {} rather than failing to import; callers that
+        # need real table metadata should use the gRPC/in_process path. Upgrade:
+        # wire a ServerInfo request/response in ShmServer.
+        return []
+
+    def _new_sampler(
+        self, table: str, num_samples: int, buffer_size: int, timeout_ms: Optional[int]
+    ):
+        timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
+        return self._client.NewSampler(table, num_samples, buffer_size, timeout_ms_arg)
+
+    def trajectory_writer(
+        self, num_keep_alive_refs: int, *, max_chunk_length: Optional[int] = None
+    ):
+        """Constructs a `TrajectoryWriter` in SHM mode.
+
+        The chunker/column/backpressure logic runs client-side; inserts are
+        shipped over SHM to the server's Table (appendix A4). Mirrors
+        `LocalClient.trajectory_writer` exactly — only the underlying transport
+        differs.
+
+        Args:
+          num_keep_alive_refs: Size of the circular buffer of recent data
+            references; the maximum trajectory length.
+          max_chunk_length: Optional constant chunk length. If None, auto-tuned.
+
+        Returns:
+          A `TrajectoryWriter` context manager.
+        """
+        if num_keep_alive_refs < 1:
+            raise ValueError(
+                f"num_keep_alive_refs ({num_keep_alive_refs}) must be a positive "
+                f"integer"
+            )
+        if max_chunk_length is None:
+            chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
+        else:
+            chunker_options = pybind.ConstantChunkerOptions(
+                max_chunk_length=max_chunk_length,
+                num_keep_alive_refs=num_keep_alive_refs,
+            )
+        cpp_writer = self._client.new_trajectory_writer(chunker_options)
+        from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
+
+        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
+
+    def structured_writer(self, configs):
+        """Constructs a `StructuredWriter` in SHM mode.
+
+        Each config's `table` field routes its item to the server-side table
+        (v1: the single table held by `ShmServer`). Mirrors
+        `LocalClient.structured_writer` exactly.
+
+        Args:
+          configs: Configurations describing how the writer should transform the
+            sequence of steps into table insertions.
+
+        Returns:
+          A `StructuredWriter` context manager.
+
+        Raises:
+          ValueError: If `configs` is empty.
+        """
+        if not configs:
+            raise ValueError("At least one config must be provided.")
+        serialized_configs = [config.SerializeToString() for config in configs]
+        cpp_writer = self._client.new_structured_writer(serialized_configs)
+        from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
+
+        return structured_writer_lib.StructuredWriter(cpp_writer)

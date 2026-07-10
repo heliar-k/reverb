@@ -47,6 +47,9 @@
 #include "reverb/cc/selectors/uniform.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/support/tensor_proxy.h"
+#include "reverb/cc/shm/shm_client.h"
+#include "reverb/cc/shm/shm_protocol.pb.h"
+#include "reverb/cc/shm/shm_server.h"
 #include "reverb/cc/structured_writer.h"
 #include "reverb/cc/table.h"
 #include "reverb/cc/table_extensions/interface.h"
@@ -1034,6 +1037,164 @@ PYBIND11_MODULE(libpybind, m) {
            py::arg("path"))
       .def("server_info", server_info_fn)
       .def("ServerInfo", server_info_fn);
+
+  // ---- SHM transport (ticket ⑤) ----
+  // The SHM C++ classes live in `deepmind::reverb::shm`; pull them into this
+  // (deepmind::reverb) namespace so the bindings below read cleanly.
+  using ::deepmind::reverb::shm::ShmClient;
+  using ::deepmind::reverb::shm::ShmSampler;
+  using ::deepmind::reverb::shm::ShmServer;
+  // Mirrors InProcessClient: GIL released around every blocking C++ call,
+  // MaybeRaiseFromStatus converts absl::Status -> Python exception. The
+  // dual PascalCase/snake_case naming (R13) lets `reverb/client.py` share
+  // one code path between Client/LocalClient/ShmClient.
+  //
+  // TrajectoryWriter/StructuredWriter returned from ShmClient are the SAME
+  // C++ types as the gRPC/local paths (just constructed in SHM mode), so the
+  // existing `py::class_<TrajectoryWriter>`/`<StructuredWriter>` bindings
+  // already wrap them — no re-binding needed, just return the pointer.
+  // ponytail: v1 ShmServer has no MutatePriorities/Reset/ServerInfo/Checkpoint
+  // round-trip (the C++ dispatch only handles SAMPLE/RELEASE/INSERT/ALLOCATE).
+  // Those are intentionally NOT bound here; callers needing them should use
+  // the gRPC/in_process path. Upgrade: wire them in ShmServer when needed.
+  auto shm_connect_fn = [](const std::string& socket_path)
+      -> std::shared_ptr<ShmClient> {
+    auto result = ShmClient::Connect(socket_path);
+    MaybeRaiseFromStatus(result.status());
+    return std::shared_ptr<ShmClient>(std::move(*result));
+  };
+  auto shm_new_sampler_fn =
+      [](ShmClient* client, const std::string& table, int64_t max_samples,
+         size_t buffer_size, int64_t rate_limiter_timeout_ms) -> ShmSampler* {
+        Sampler::Options options;
+        options.max_samples = max_samples;
+        options.max_in_flight_samples_per_worker = buffer_size;
+        options.rate_limiter_timeout =
+            Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
+        std::unique_ptr<ShmSampler> sampler;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->NewSampler(table, options, &sampler);
+        }
+        MaybeRaiseFromStatus(status);
+        return sampler.release();
+      };
+  auto shm_new_trajectory_writer_fn =
+      [](ShmClient* client,
+         std::shared_ptr<ChunkerOptions> chunker_options) -> TrajectoryWriter* {
+        TrajectoryWriter::Options options;
+        options.chunker_options = std::move(chunker_options);
+        std::unique_ptr<TrajectoryWriter> writer;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->NewTrajectoryWriter(options, &writer);
+        }
+        MaybeRaiseFromStatus(status);
+        return writer.release();
+      };
+  auto shm_new_structured_writer_fn =
+      [](ShmClient* client,
+         std::vector<std::string> serialized_configs) -> StructuredWriter* {
+        std::vector<StructuredWriterConfig> configs;
+        for (const auto& serialised_config : serialized_configs) {
+          configs.emplace_back();
+          if (!configs.back().ParseFromString(std::string(serialised_config))) {
+            MaybeRaiseFromStatus(absl::InvalidArgumentError(absl::StrCat(
+                "Unable to deserialize StructuredWriterConfig from "
+                "serialized proto bytes: '",
+                std::string(serialised_config), "'")));
+            return nullptr;
+          }
+        }
+        std::unique_ptr<StructuredWriter> writer;
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->NewStructuredWriter(std::move(configs), &writer);
+        }
+        MaybeRaiseFromStatus(status);
+        return writer.release();
+      };
+
+  py::class_<ShmClient, std::shared_ptr<ShmClient>>(m, "ShmClient")
+      .def(py::init(shm_connect_fn), py::arg("socket_path"))
+      // Static-style factory alias: pybind `__init__` already calls Connect;
+      // this static method is kept for callers who prefer `ShmClient.Connect`.
+      .def_static("Connect", shm_connect_fn, py::arg("socket_path"))
+      .def("new_sampler", shm_new_sampler_fn,
+           py::arg("table"), py::arg("max_samples") = 1,
+           py::arg("buffer_size") = 1,
+           py::arg("rate_limiter_timeout_ms") = -1)
+      .def("NewSampler", shm_new_sampler_fn,
+           py::arg("table"), py::arg("max_samples") = 1,
+           py::arg("buffer_size") = 1,
+           py::arg("rate_limiter_timeout_ms") = -1)
+      .def("new_trajectory_writer", shm_new_trajectory_writer_fn,
+           py::arg("chunker_options"))
+      .def("NewTrajectoryWriter", shm_new_trajectory_writer_fn,
+           py::arg("chunker_options"))
+      .def("new_structured_writer", shm_new_structured_writer_fn,
+           py::arg("configs"))
+      .def("NewStructuredWriter", shm_new_structured_writer_fn,
+           py::arg("configs"));
+
+  // ShmSampler mirrors Sampler's GetNextTrajectory: release the GIL for the C++
+  // call, re-acquire to build the info+data tensor vector (GIL needed for the
+  // numpy-backed TensorBuffer -> ndarray cast). The returned sample layout
+  // (kNumInfoTensors info scalars prepended to the column data) is identical
+  // to Sampler's, so `reverb/client.py`'s `_BaseClient.sample` can use either.
+  py::class_<ShmSampler>(m, "ShmSampler")
+      .def("GetNextTrajectory",
+           [](ShmSampler* sampler) {
+             absl::Status status;
+             std::shared_ptr<const SampleInfo> info;
+             std::vector<TensorBuffer> data;
+             {
+               py::gil_scoped_release g;
+               status = sampler->GetNextTrajectory(&data, &info);
+             }
+             MaybeRaiseFromStatus(status);
+             return Sampler::WithInfoTensors(*info, std::move(data));
+           })
+      .def("Close", &ShmSampler::Close,
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly_static(
+          "NUM_INFO_TENSORS", [](py::object) { return Sampler::kNumInfoTensors; });
+
+  // ShmServer: created+held by the Python `Server(shm=True)` object (C1). The
+  // dispatch thread starts on `Start` and is joined on `Stop`; `Stop` is also
+  // called from Server.stop()/__del__. `Create` takes the (single, v1) Table
+  // and a udsocket path; an empty path auto-generates one.
+  py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
+      .def(py::init([](std::shared_ptr<Table> table,
+                      const std::string& socket_path) {
+             auto result = ShmServer::Create(std::move(table), socket_path);
+             MaybeRaiseFromStatus(result.status());
+             return std::shared_ptr<ShmServer>(std::move(*result));
+           }),
+           py::arg("table"), py::arg("socket_path") = "")
+      .def_static(
+          "Create",
+          [](std::shared_ptr<Table> table, const std::string& socket_path) {
+            auto result = ShmServer::Create(std::move(table), socket_path);
+            MaybeRaiseFromStatus(result.status());
+            return std::shared_ptr<ShmServer>(std::move(*result));
+          },
+          py::arg("table"), py::arg("socket_path") = "")
+      .def("Start",
+           [](ShmServer* server) {
+             absl::Status status;
+             {
+               py::gil_scoped_release g;
+               status = server->Start();
+             }
+             MaybeRaiseFromStatus(status);
+           })
+      .def("Stop", &ShmServer::Stop, py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly(
+          "socket_path", [](ShmServer* server) { return server->socket_path(); });
 }  // NOLINT(readability/fn_size)
 
 }  // namespace

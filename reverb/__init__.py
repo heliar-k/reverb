@@ -41,6 +41,7 @@ from reverb import rate_limiters
 
 from reverb.client import Client
 from reverb.client import LocalClient
+from reverb.client import ShmClient
 from reverb.client import Writer
 
 from reverb.errors import DeadlineExceededError
@@ -59,6 +60,7 @@ from reverb.trajectory_writer import TrajectoryWriter
 
 # Expose the in-process C++ client class directly for advanced users.
 from reverb import pybind as _pybind  # noqa: E402
+
 InProcessClient = _pybind.InProcessClient
 del _pybind
 
