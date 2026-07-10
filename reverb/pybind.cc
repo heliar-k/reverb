@@ -1059,7 +1059,11 @@ PYBIND11_MODULE(libpybind, m) {
   // the gRPC/in_process path. Upgrade: wire them in ShmServer when needed.
   auto shm_connect_fn = [](const std::string& socket_path)
       -> std::shared_ptr<ShmClient> {
-    auto result = ShmClient::Connect(socket_path);
+    absl::StatusOr<std::unique_ptr<ShmClient>> result;
+    {
+      py::gil_scoped_release g;
+      result = ShmClient::Connect(socket_path);
+    }
     MaybeRaiseFromStatus(result.status());
     return std::shared_ptr<ShmClient>(std::move(*result));
   };
@@ -1170,7 +1174,11 @@ PYBIND11_MODULE(libpybind, m) {
   py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
       .def(py::init([](std::shared_ptr<Table> table,
                       const std::string& socket_path) {
-             auto result = ShmServer::Create(std::move(table), socket_path);
+             absl::StatusOr<std::unique_ptr<ShmServer>> result;
+             {
+               py::gil_scoped_release g;
+               result = ShmServer::Create(std::move(table), socket_path);
+             }
              MaybeRaiseFromStatus(result.status());
              return std::shared_ptr<ShmServer>(std::move(*result));
            }),
@@ -1178,7 +1186,11 @@ PYBIND11_MODULE(libpybind, m) {
       .def_static(
           "Create",
           [](std::shared_ptr<Table> table, const std::string& socket_path) {
-            auto result = ShmServer::Create(std::move(table), socket_path);
+            absl::StatusOr<std::unique_ptr<ShmServer>> result;
+            {
+              py::gil_scoped_release g;
+              result = ShmServer::Create(std::move(table), socket_path);
+            }
             MaybeRaiseFromStatus(result.status());
             return std::shared_ptr<ShmServer>(std::move(*result));
           },
