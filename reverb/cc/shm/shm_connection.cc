@@ -14,11 +14,36 @@
 
 #include "reverb/cc/shm/shm_connection.h"
 
+#include <poll.h>
+#include <sys/socket.h>  // recv, MSG_PEEK
 #include <unistd.h>
 
 namespace deepmind {
 namespace reverb {
 namespace shm {
+
+bool IsPeerClosed(int fd) {
+  if (fd < 0) return false;
+  // poll with zero timeout: POLLHUP/POLLERR => peer closed. POLLIN then needs
+  // disambiguation (data vs. a clean 0-byte EOF). A healthy idle peer has the
+  // fd open and nothing to send => poll returns 0 (alive).
+  struct pollfd pfd;
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int n = poll(&pfd, 1, 0);
+  if (n <= 0) return false;  // no event (or EINTR) => alive
+  if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
+  if (pfd.revents & POLLIN) {
+    // Data or EOF; peek 1 byte to disambiguate. recv()==0 is EOF (clean
+    // close). r>0 means stray bytes are readable (MSG_PEEK keeps them; they
+    // may re-trigger POLLIN but that is harmless — the peer stays alive).
+    char buf;
+    ssize_t r = recv(fd, &buf, 1, MSG_PEEK);
+    if (r == 0) return true;  // peer closed
+  }
+  return false;
+}
 
 ShmConnection::~ShmConnection() {
   // ticket ⑥: closing the client's liveness fd is the crash/close signal the

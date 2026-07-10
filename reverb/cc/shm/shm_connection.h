@@ -25,6 +25,15 @@ namespace deepmind {
 namespace reverb {
 namespace shm {
 
+// ticket ⑥ (spec §8.8): returns true if the peer on the OTHER end of `fd`
+// has closed the connection (EOF / POLLHUP / POLLERR). Used on BOTH sides:
+//   - server: probe ClientState.fd to detect a crashed/gone client.
+//   - client: probe ShmConnection::control_fd to detect a gone server so a
+//     ReadBlocking poll waiting for an S→C response fails fast instead of
+//     spinning forever.
+// fd < 0 (no fd, e.g. moved-from / server side) => false (nothing to probe).
+bool IsPeerClosed(int fd);
+
 // The two SPSC rings wired between a server and one client, plus the shared
 // byte pool. Server side owns/creates the segments; client side opens them.
 // C2S is written by the client and read by the server; S2C the reverse.

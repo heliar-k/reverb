@@ -21,7 +21,6 @@
 #include <sched.h>
 #include <string>
 #include <sys/mman.h>  // shm_unlink
-#include <sys/socket.h>  // recv, MSG_PEEK
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -131,6 +130,19 @@ void ShmServer::Stop() {
   clients_.clear();
 }
 
+void ShmServer::CloseClientFdForTest() {
+  // ticket ⑥ test-only (see header). Close client 0's accepted fd from the
+  // caller thread, NOT the dispatch thread. The dispatch thread keeps running
+  // (it does not own this fd-close); the client's control_fd peer is now gone
+  // -> the client's ReadBlocking sees EOF via IsPeerClosed. The dispatch
+  // thread's own IsClientDead will also see EOF next pass and run
+  // HandleDisconnect, but that races harmlessly with the test's assertions.
+  if (!clients_.empty() && clients_[0]->fd >= 0) {
+    close(clients_[0]->fd);
+    clients_[0]->fd = -1;
+  }
+}
+
 void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
   // C3 crash recovery: centrally release every outstanding pool offset the
   // client never RELEASEd. ReleaseAll decrements refcount and deallocates any
@@ -170,28 +182,11 @@ void ShmServer::HandleDisconnect(size_t client_id) {
 bool ShmServer::IsClientDead(const ClientState& state) {
   if (state.close_requested) return true;  // explicit CLOSE (ticket ⑥)
   if (state.fd < 0) return true;  // already closed
-  // poll the udsocket fd with zero timeout. POLLHUP/POLLERR => dead. POLLIN
-  // with a 0-byte read (EOF) => the peer closed cleanly. A healthy idle
-  // client has an empty ring but the fd is open -> poll returns 0 (no event),
-  // so idle clients are NOT mistaken for dead.
-  struct pollfd pfd;
-  pfd.fd = state.fd;
-  pfd.events = POLLIN;
-  pfd.revents = 0;
-  int n = poll(&pfd, 1, 0);
-  if (n <= 0) return false;  // no event (or EINTR) => alive
-  if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return true;
-  if (pfd.revents & POLLIN) {
-    // Data or EOF; peek 1 byte to disambiguate. recv()==0 is EOF; the byte
-    // stays in the socket buffer (MSG_PEEK) so a future read is unaffected.
-    char buf;
-    ssize_t r = recv(state.fd, &buf, 1, MSG_PEEK);
-    if (r == 0) return true;  // clean close
-    // r > 0: stray bytes on the control channel (no protocol uses it after
-    // handshake). Drain and keep the client (don't disconnect on noise).
-    // r < 0: transient; treat as alive.
-  }
-  return false;
+  // probe the udsocket fd for EOF/HUP. Shares the poll/recv logic with the
+  // client-side server-death check (IsPeerClosed, ticket ⑥ spec §8.8): a
+  // healthy idle client has the fd open and nothing to send -> poll returns 0
+  // (alive); POLLHUP/POLLERR or a 0-byte recv (EOF) => the client is gone.
+  return IsPeerClosed(state.fd);
 }
 
 void ShmServer::DispatchLoop() {

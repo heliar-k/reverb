@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -403,6 +404,79 @@ TEST(ShmCrashTest, OtherClientUnaffectedByChildCrash) {
   ASSERT_THAT(data1, SizeIs(1));
 
   parent_sampler->Close();
+  (*server)->Stop();
+}
+
+// ── Client-side EOF: server gone while a sample is in flight (ticket ⑥) ──
+
+// ticket ⑥ spec §8.8: if the server dies/closes while the client is waiting
+// for an S→C response, the client must detect it via the liveness control_fd
+// and fail fast (UnavailableError -> reverb.errors.ConnectionError on the
+// Python side) instead of spinning forever on the ring. A regression that
+// reverts the control_fd probe would hang ReadBlocking indefinitely.
+//
+// Setup: one seeded item, sampler max_samples=2. The worker pre-fetches the
+// first sample, then sends a second SAMPLE and blocks in ReadBlocking on the
+// S→C ring (no second item exists, so no response is forthcoming). We then
+// close the SERVER's accepted fd (CloseClientFdForTest) — the peer of the
+// client's control_fd — which is exactly "the server side of the connection
+// dropped" (spec §8.8 client path). ReadBlocking's IsPeerClosed(control_fd)
+// must see the EOF and return UnavailableError, closing the sampler's queue so
+// GetNextTrajectory unblocks with a non-OK status. The wait is bounded by a
+// std::future so a regression hang fails the TEST (timeout) not the harness.
+//
+// We do NOT use server->Stop() to drop the fd: Stop() joins the dispatch
+// thread, which may be blocked in Table::Sample on the second request. Instead
+// we close the fd directly, then Close()+Stop() for cleanup (Close unblocks any
+// in-flight Table::Sample via stop_worker_ so Stop()'s join completes).
+TEST(ShmCrashTest, ClientFailsFastWhenServerStops) {
+  auto table = MakeTable();
+  // One item: the worker fetches it, then blocks in ReadBlocking on the
+  // second sample (no item to serve -> no response -> pure EOF path).
+  InsertItem(table.get(), /*key=*/1, /*priority=*/1.0,
+             /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
+
+  std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("eof") + ".sock";
+  auto server = ShmServer::Create(table, sock);
+  REVERB_ASSERT_OK(server.status());
+  REVERB_ASSERT_OK((*server)->Start());
+
+  auto client = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(client.status());
+  std::unique_ptr<ShmSampler> sampler;
+  REVERB_ASSERT_OK((*client)->NewSampler("queue", {2}, &sampler));
+
+  // First sample succeeds (pre-fetched by the worker).
+  std::vector<TensorBuffer> data;
+  REVERB_EXPECT_OK(sampler->GetNextTrajectory(&data));
+  ASSERT_THAT(data, SizeIs(1));
+
+  // Give the worker a moment to send the second SAMPLE and enter ReadBlocking.
+  // (A brief sleep is fine: the worker sends the request then spins in
+  // ReadBlocking; we just need it to be waiting before we drop the fd.)
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Drop the server side of the connection ("server closed/crashed"). The
+  // client's control_fd peer is now gone.
+  (*server)->CloseClientFdForTest();
+
+  // The second GetNextTrajectory must return a non-OK status (the worker's
+  // ReadBlocking saw control_fd EOF) within a BOUNDED time. Run it on a
+  // separate thread + future so a hang fails the test instead of hanging it.
+  auto fut = std::async(std::launch::async, [&] {
+    std::vector<TensorBuffer> d;
+    return sampler->GetNextTrajectory(&d).code();
+  });
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+      << "client hung waiting for a response after the server closed "
+      << "(control_fd EOF probe missing in ReadBlocking?)";
+  EXPECT_EQ(fut.get(), absl::StatusCode::kUnavailable)
+      << "expected UnavailableError (server closed), got a different status";
+
+  sampler->Close();
+  // Cleanup: Close unblocks any in-flight server-side Table::Sample so the
+  // dispatch thread's join in Stop() completes.
+  table->Close();
   (*server)->Stop();
 }
 

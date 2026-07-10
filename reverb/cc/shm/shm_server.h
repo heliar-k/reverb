@@ -100,6 +100,15 @@ class ShmServer {
 
   const std::string& socket_path() const { return socket_path_; }
 
+  // ticket ⑥ test-only: close the accepted udsocket fd of client 0 WITHOUT
+  // running HandleDisconnect on the dispatch thread. This simulates the server
+  // side of the connection dropping (server crash / fd close) so the CLIENT's
+  // liveness control_fd sees EOF — the path ReadBlocking must detect to fail
+  // fast. Stop() can't be used for this because it joins the dispatch thread,
+  // which may be blocked in Table::Sample; closing the fd here lets the test
+  // observe the client's EOF reaction deterministically. No-op if no client.
+  void CloseClientFdForTest();
+
  private:
   ShmServer(std::shared_ptr<Table> table, std::string socket_path,
             ShmBytePool pool, ShmBootstrapServer bootstrap);

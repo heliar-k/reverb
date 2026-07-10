@@ -73,6 +73,19 @@ PyObject* DeadlineExceededPyExc() {
   return cls;
 }
 
+// Lazily fetches and caches reverb.errors.ConnectionError so SHM statuses with
+// kUnavailable (server closed/crashed, ticket ⑥) surface as the project's own
+// exception type rather than the builtin ConnectionError. Same lazy +
+// magic-static pattern as DeadlineExceededPyExc.
+PyObject* ConnectionErrorPyExc() {
+  static PyObject* cls = []() -> PyObject* {
+    pybind11::object obj = pybind11::module::import("reverb.errors")
+                               .attr("ConnectionError");
+    return obj.inc_ref().ptr();
+  }();
+  return cls;
+}
+
 // Converts non OK statuses to Python exceptions and throws. Does nothing for
 // OK statuses.
 inline void MaybeRaiseFromStatus(const absl::Status& status) {
@@ -87,6 +100,8 @@ inline void MaybeRaiseFromStatus(const absl::Status& status) {
     CODE_TO_PY_EXC(absl::StatusCode::kInvalidArgument, PyExc_ValueError)
     CODE_TO_PY_EXC(absl::StatusCode::kResourceExhausted, PyExc_IndexError)
     CODE_TO_PY_EXC(absl::StatusCode::kDeadlineExceeded, DeadlineExceededPyExc())
+    // ticket ⑥: SHM server closed/crashed -> reverb.errors.ConnectionError.
+    CODE_TO_PY_EXC(absl::StatusCode::kUnavailable, ConnectionErrorPyExc())
     CODE_TO_PY_EXC(absl::StatusCode::kNotFound, PyExc_FileNotFoundError)
     CODE_TO_PY_EXC(absl::StatusCode::kUnimplemented, PyExc_NotImplementedError)
     CODE_TO_PY_EXC(absl::StatusCode::kInternal, PyExc_RuntimeError)

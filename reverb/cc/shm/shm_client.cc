@@ -49,13 +49,24 @@ namespace {
 // ponytail: poll a non-blocking Ring::Read with sched_yield until a message is
 // ready (spec §3.1 / R5: the blocking policy is the caller's job, not Ring's).
 // Mirrors the helper used in echo_test / byte_pool_echo_test.
+//
+// ticket ⑥ (spec §8.8): if `control_fd` >= 0, ALSO probe it each pass for
+// server death. The liveness udsocket fd is kept open for the connection
+// lifetime; when the server dies/closes it becomes EOF/HUP. Without this the
+// poll below would spin forever on a dead server, leaving in-flight sample /
+// insert requests hanging. On server death return UnavailableError so the
+// caller surfaces a Python-raisable status instead of hanging.
 absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload,
+                          int control_fd = -1,
                           absl::Duration timeout = absl::InfiniteDuration()) {
   absl::Time deadline = absl::Now() + timeout;
   while (true) {
     absl::Status s = ring->Read(msg_type, payload);
     if (s.ok()) return absl::OkStatus();
     if (!absl::IsNotFound(s)) return s;  // real error
+    if (control_fd >= 0 && IsPeerClosed(control_fd)) {
+      return absl::UnavailableError("SHM server closed connection");
+    }
     if (absl::Now() >= deadline) {
       return absl::DeadlineExceededError("ShmClient: response timed out");
     }
@@ -190,7 +201,8 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
   //    with DEADLINE_EXCEEDED; surface it so the worker/sampler maps it.
   MsgType resp_type;
   std::string resp_body;
-  REVERB_RETURN_IF_ERROR(ReadBlocking(&conn_->s2c, &resp_type, &resp_body));
+  REVERB_RETURN_IF_ERROR(
+      ReadBlocking(&conn_->s2c, &resp_type, &resp_body, conn_->control_fd));
 
   if (resp_type == ERROR) {
     ShmError err;

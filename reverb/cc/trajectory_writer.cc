@@ -849,13 +849,20 @@ absl::Status TrajectoryWriter::RunShmWorker() {
   using namespace ::deepmind::reverb::shm;
 
   auto read_blocking = [](Ring* ring, MsgType* type,
-                          std::string* payload) -> absl::Status {
+                          std::string* payload,
+                          int control_fd) -> absl::Status {
     // poll non-blocking Read + sched_yield (spec R5: blocking policy is the
     // caller's job, not Ring's). Same helper as ShmSampler/ShmClient.
+    // ticket ⑥ (spec §8.8): if the liveness fd (control_fd) shows EOF/HUP the
+    // server is gone — return UnavailableError so in-flight inserts fail fast
+    // instead of spinning forever on a dead server.
     while (true) {
       absl::Status s = ring->Read(type, payload);
       if (s.ok()) return absl::OkStatus();
       if (!absl::IsNotFound(s)) return s;
+      if (control_fd >= 0 && IsPeerClosed(control_fd)) {
+        return absl::UnavailableError("SHM server closed connection");
+      }
       sched_yield();
     }
   };
@@ -974,7 +981,8 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       }
       MsgType atype;
       std::string aresp_body;
-      absl::Status rs = read_blocking(&shm_conn_->s2c, &atype, &aresp_body);
+      absl::Status rs = read_blocking(&shm_conn_->s2c, &atype, &aresp_body,
+                                       shm_conn_->control_fd);
       if (!rs.ok()) {
         alloc_failed = true;
         absl::MutexLock l(&mu_);
@@ -1068,7 +1076,8 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     // offsets_to_release arrives). The ACK is the completion signal.
     MsgType ack_type;
     std::string ack_body;
-    absl::Status as = read_blocking(&shm_conn_->s2c, &ack_type, &ack_body);
+    absl::Status as = read_blocking(&shm_conn_->s2c, &ack_type, &ack_body,
+                                     shm_conn_->control_fd);
     if (!as.ok()) {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);

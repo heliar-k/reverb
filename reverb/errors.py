@@ -17,9 +17,11 @@
 
 class ReverbError(Exception):
   """Base class for Reverb errors."""
-  pass
 
 
 class DeadlineExceededError(ReverbError):
   """A call to the server timed out."""
-  pass
+
+
+class ConnectionError(ReverbError):
+  """The connection to the server was lost (server closed/crashed)."""
