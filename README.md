@@ -112,6 +112,14 @@ numpy-only walkthrough of the embedded (`in_process=True`) path. The gRPC
 `Client`/`Writer` path shown above is also supported over a networked
 `Server(in_process=False)`.
 
+Minimal standalone scripts for each transport and writer path:
+
+| Example | Path | Demonstrates |
+|---|---|---|
+| gRPC client | [examples/grpc_client.py](examples/grpc_client.py) | `Server(in_process=False)` + networked `Client` insert/sample |
+| SHM client | [examples/shm_client.py](examples/shm_client.py) | `Server(shm=True)` + `ShmClient` same-machine zero-copy transport |
+| StructuredWriter | [examples/structured_writer.py](examples/structured_writer.py) | Pattern-based conditional insertion into multiple tables |
+
 ## 内嵌模式(纯 numpy,无 TensorFlow)
 
 Reverb 支持纯 numpy 的进程内模式,无需 TensorFlow,零网络开销,适合单机训练内嵌使用。
@@ -135,8 +143,9 @@ server = reverb.Server(
 
 client = server.in_process_client
 
-# 写入数据(纯 numpy)
-with client.trajectory_writer(table='my_table', num_keep_alive_refs=10) as w:
+# 写入数据(纯 numpy)。LocalClient 的 trajectory_writer 不绑定 table,
+# 由 create_item 的 table 参数路由(与 gRPC Client 一致)。
+with client.trajectory_writer(num_keep_alive_refs=10) as w:
     w.append({'obs': np.zeros(4, dtype=np.float32)})
     w.create_item(table='my_table', priority=1.0,
                   trajectory={'obs': w.history['obs'][:]})
@@ -153,7 +162,54 @@ for sample in client.sample('my_table', num_samples=4):
 - 内嵌模式使用 numpy 作为数据载体,不依赖 TensorFlow。
 - 内嵌路径支持 `TrajectoryWriter`（进程内直连）；gRPC `Client`/`Writer`/
   `StructuredWriter` 在 `Server(in_process=False)` 下同样可用。
+- 同机跨进程场景可用 SHM 传输（见下节[SHM 模式](#shm-模式同机跨进程)),
+  比 gRPC loopback 快约 9-11×。
 - 旧版本(基于 TF)的 checkpoint 不兼容,需重新生成。
+
+## SHM 模式(同机跨进程)
+
+当 server 与 client 在同一台机器、不同进程时,可启用 POSIX 共享内存传输:
+零拷贝、无序列化,比 gRPC loopback 快约 9-11×(基准见
+[docs/shm-benchmark.md](docs/shm-benchmark.md))。API 与 `Client`/
+`LocalClient` 完全一致,仅传输层不同,用户代码无需改动即可切换。
+
+```python
+import reverb
+import numpy as np
+
+server = reverb.Server(
+    tables=[reverb.Table(
+        name='my_table',
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        max_size=1000,
+        rate_limiter=reverb.rate_limiters.MinSize(100),
+    )],
+    in_process=True,  # 拥有 Table;可与 shm=True 共存
+    shm=True,          # 额外启动 SHM 传输层
+)
+
+client = reverb.ShmClient(server.shm_socket_path)
+
+# 用法与 LocalClient / gRPC Client 一致
+with client.trajectory_writer(num_keep_alive_refs=10) as w:
+    w.append({'obs': np.zeros(4, dtype=np.float32)})
+    w.create_item(table='my_table', priority=1.0,
+                  trajectory={'obs': w.history['obs'][:]})
+    w.flush()
+
+for sample in client.sample('my_table', num_samples=4):
+    print(sample.data[0])  # numpy array
+```
+
+**注意:**
+
+- SHM 是**附加**传输层,可与 `in_process` 或 gRPC 共存,`shm=True` 不隐含
+  `in_process=True`。
+- v1 限制:`ShmServer` 只持有**一个 table**(`tables[0]`),且 `server_info`/
+  `mutate_priorities`/`reset`/checkpoint 暂不支持 SHM 回环(用 gRPC/
+  in_process 路径);`ShmClient` 不可 pickle(持有 mmap 状态)。
+- `shm_socket_path` 默认生成 `/tmp/reverb_shm_<pid>.sock`,`stop()` 时清理。
 
 ## Detailed overview
 
