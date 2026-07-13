@@ -550,6 +550,134 @@ class TrajectoryColumnTest(parameterized.TestCase):
     column = trajectory_writer.TrajectoryColumn([FakeWeakCellRef(data)])
     self.assertEqual(column.dtype, expected_dtype)
 
+  def test_numpy_stacks_multiple_refs(self):
+    # Non-squeezed path: np.stack along a new leading axis.
+    col = trajectory_writer.TrajectoryColumn([
+        FakeWeakCellRef(np.array([1.0, 2.0])),
+        FakeWeakCellRef(np.array([3.0, 4.0])),
+    ])
+    result = col.numpy()
+    self.assertIsInstance(result, np.ndarray)
+    np.testing.assert_array_equal(result, [[1.0, 2.0], [3.0, 4.0]])
+    self.assertEqual(result.shape, (2, 2))
+
+  def test_numpy_raises_on_expired_ref(self):
+    class _ExpiredRef:
+      expired = True
+
+      def numpy(self):
+        return None
+
+    col = trajectory_writer.TrajectoryColumn([_ExpiredRef()])
+    with self.assertRaisesRegex(RuntimeError, 'expired data references'):
+      col.numpy()
+
+  def test_is_squeezed_attribute(self):
+    squeezed = trajectory_writer.TrajectoryColumn(
+        [FakeWeakCellRef(1)], squeeze=True)
+    self.assertTrue(squeezed.is_squeezed)
+    not_squeezed = trajectory_writer.TrajectoryColumn(
+        [FakeWeakCellRef(1), FakeWeakCellRef(2)])
+    self.assertFalse(not_squeezed.is_squeezed)
+
+  def test_getitem_int_returns_squeezed(self):
+    col = trajectory_writer.TrajectoryColumn(
+        [FakeWeakCellRef(10), FakeWeakCellRef(20), FakeWeakCellRef(30)])
+    sub = col[0]
+    self.assertTrue(sub.is_squeezed)
+    self.assertEqual(sub.numpy(), 10)
+
+  def test_getitem_slice_returns_non_squeezed(self):
+    col = trajectory_writer.TrajectoryColumn(
+        [FakeWeakCellRef(10), FakeWeakCellRef(20), FakeWeakCellRef(30)])
+    sub = col[:2]
+    self.assertFalse(sub.is_squeezed)
+    self.assertLen(sub, 2)
+    np.testing.assert_array_equal(sub.numpy(), [10, 20])
+
+  def test_getitem_list_reorders(self):
+    col = trajectory_writer.TrajectoryColumn(
+        [FakeWeakCellRef(10), FakeWeakCellRef(20), FakeWeakCellRef(30)])
+    sub = col[[2, 0]]
+    self.assertFalse(sub.is_squeezed)
+    self.assertLen(sub, 2)
+    np.testing.assert_array_equal(sub.numpy(), [30, 10])
+
+  def test_getitem_invalid_type_raises(self):
+    col = trajectory_writer.TrajectoryColumn([FakeWeakCellRef(1)])
+    with self.assertRaises(TypeError):
+      col['bad']
+
+  def test_iter_yields_refs(self):
+    refs = [FakeWeakCellRef(1), FakeWeakCellRef(2)]
+    col = trajectory_writer.TrajectoryColumn(refs)
+    self.assertEqual(list(col), refs)
+
+
+class ColumnHistoryTest(parameterized.TestCase):
+  """Direct tests for the private _ColumnHistory buffer/offset/set_last logic.
+
+  _ColumnHistory is exercised indirectly via TrajectoryWriter.append, but the
+  buffer-overflow offset accounting, set_last state machine, and reset have no
+  direct regression guard.
+  """
+
+  def test_append_drops_oldest_and_advances_offset(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=2)
+    col.append(FakeWeakCellRef(1))
+    col.append(FakeWeakCellRef(2))
+    self.assertLen(col, 2)
+    # Overflow: ref 1 dropped, offset advances to 1 (one None front-padding).
+    col.append(FakeWeakCellRef(3))
+    self.assertLen(col, 3)
+    self.assertEqual(extract_data(col), [None, 2, 3])
+
+  def test_can_set_last_three_states(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=10)
+    self.assertFalse(col.can_set_last)  # empty
+    col.append(None)  # open slot
+    self.assertTrue(col.can_set_last)  # last is None
+    col.set_last(FakeWeakCellRef(42))
+    self.assertFalse(col.can_set_last)  # last is set
+
+  def test_set_last_on_empty_raises(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=10)
+    with self.assertRaisesRegex(RuntimeError, 'set_last called on empty'):
+      col.set_last(FakeWeakCellRef(1))
+
+  def test_set_last_on_already_set_raises(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=10)
+    col.append(None)
+    col.set_last(FakeWeakCellRef(1))
+    with self.assertRaisesRegex(RuntimeError, 'already set cell'):
+      col.set_last(FakeWeakCellRef(99))
+
+  def test_reset_clears_buffer_and_offset(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=10)
+    col.append(FakeWeakCellRef(1))
+    col.append(FakeWeakCellRef(2))
+    self.assertLen(col, 2)
+    col.reset()
+    self.assertLen(col, 0)
+    self.assertEqual(list(col), [])
+
+  def test_path_returns_constructor_tuple(self):
+    col = trajectory_writer._ColumnHistory(path=('a', 'b'), buffer_size=10)
+    self.assertEqual(col.path(), ('a', 'b'))
+
+  def test_len_and_iter_with_history_padding(self):
+    # history_padding front-loads Nones: offset=2, 0 refs in buffer.
+    col = trajectory_writer._ColumnHistory(
+        path=('x',), buffer_size=10, history_padding=2)
+    self.assertLen(col, 2)
+    self.assertEqual(list(col), [None, None])
+
+  def test_getitem_invalid_type_raises(self):
+    col = trajectory_writer._ColumnHistory(path=('x',), buffer_size=10)
+    col.append(FakeWeakCellRef(1))
+    with self.assertRaises(TypeError):
+      col['bad']
+
 
 if __name__ == '__main__':
   absltest.main()

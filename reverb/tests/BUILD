@@ -197,3 +197,13 @@ reverb_py_test(
         "//reverb",
     ],
 )
+
+# Three-transport parity: gRPC Client vs LocalClient vs ShmClient agree on
+# the shared trajectory_writer/sample surface.
+reverb_py_test(
+    name = "transport_parity_test",
+    srcs = ["transport_parity_test.py"],
+    deps = [
+        "//reverb",
+    ],
+)

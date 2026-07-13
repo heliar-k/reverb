@@ -267,17 +267,46 @@ class ShmServerLifecycleTest(absltest.TestCase):
 class ShmClientNotPicklableTest(absltest.TestCase):
     """R13: ShmClient holds SHM mmap + ring state -> not picklable."""
 
-    def test_pickle_raises(self):
+    def test_pickle_raises_pickling_error(self):
         server, client = _make_shm_server()
-        with self.assertRaises((pickle.PicklingError, TypeError, ValueError)):
+        # ShmClient.__reduce__ raises pickle.PicklingError specifically (not
+        # the looser TypeError/ValueError union): the SHM mmap + ring state
+        # can't survive a pickle round-trip. Reconnect by socket_path instead.
+        with self.assertRaises(pickle.PicklingError):
+            pickle.dumps(client)
+
+    def test_pickle_error_message_guides_recovery(self):
+        server, client = _make_shm_server()
+        with self.assertRaisesRegex(
+            pickle.PicklingError, r"Reconnect with ShmClient\(socket_path\)"
+        ):
             pickle.dumps(client)
 
 
 class ShmClientReprTest(absltest.TestCase):
-    def test_repr(self):
+    def test_repr_contains_socket_path(self):
         server, client = _make_shm_server()
-        s = repr(client)
-        self.assertIn("ShmClient", s)
+        # repr mirrors Client/LocalClient: f"ShmClient(socket_path={path})".
+        self.assertEqual(repr(client), f"ShmClient(socket_path={client._socket_path})")
+
+
+class ShmClientServerInfoStubTest(absltest.TestCase):
+    """v1 ShmServer has no ServerInfo round-trip (C++ dispatch handles only
+    SAMPLE/RELEASE/INSERT/ALLOCATE). ShmClient._fetch_server_info_proto returns
+    [] so server_info() yields {} rather than failing. Callers needing real
+    table metadata must use the gRPC/in_process path."""
+
+    def test_server_info_returns_empty_dict(self):
+        server, client = _make_shm_server()
+        info = client.server_info()
+        self.assertIsInstance(info, dict)
+        self.assertEqual(info, {})
+
+    def test_server_info_does_not_raise_on_timeout(self):
+        server, client = _make_shm_server()
+        # The stub ignores the timeout arg entirely; must not raise.
+        info = client.server_info(timeout=1)
+        self.assertEqual(info, {})
 
 
 if __name__ == "__main__":
