@@ -10,4 +10,10 @@ exports_files([
     "grpc_client.py",
     "shm_client.py",
     "structured_writer.py",
+    "demo.py",
+    "training_loop.py",
+    "production_patterns.py",
+    "structured_writer_advanced.py",
+    "table_signature.py",
+    "multi_server.py",
 ])

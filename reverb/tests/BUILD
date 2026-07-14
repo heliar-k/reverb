@@ -35,14 +35,20 @@ reverb_py_test(
     ],
 )
 
-# Runs the standalone example scripts (grpc/shm/structured_writer) end-to-end.
+# Runs the standalone example scripts (all examples/*.py) end-to-end.
 reverb_py_test(
     name = "examples_script_test",
     srcs = ["examples_script_test.py"],
     data = [
+        "//examples:demo.py",
         "//examples:grpc_client.py",
+        "//examples:multi_server.py",
+        "//examples:production_patterns.py",
         "//examples:shm_client.py",
         "//examples:structured_writer.py",
+        "//examples:structured_writer_advanced.py",
+        "//examples:table_signature.py",
+        "//examples:training_loop.py",
     ],
     deps = [
         "//reverb",

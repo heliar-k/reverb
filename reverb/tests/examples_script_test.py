@@ -14,10 +14,9 @@
 
 """Regression test: runs the standalone example scripts end-to-end.
 
-Executes `examples/grpc_client.py`, `examples/shm_client.py`, and
-`examples/structured_writer.py` (each script's `main()` carries assertions, so
-a regression surfaces as an exception). Mirrors `examples_notebook_test.py`'s
-exec-the-source approach.
+Executes every self-contained `examples/*.py` script; each carries assertions
+or prints expected output, so a regression surfaces as an exception.
+Mirrors `examples_notebook_test.py`'s exec-the-source approach.
 """
 
 import os
@@ -25,13 +24,20 @@ from absl.testing import absltest, parameterized
 
 import numpy as np  # pylint: disable=unused-import
 import reverb
+import tree
 
 _EXAMPLES_DIR = os.path.join(os.environ['TEST_SRCDIR'], 'reverb', 'examples')
 
 _EXAMPLES = [
+    'demo.py',
     'grpc_client.py',
+    'multi_server.py',
+    'production_patterns.py',
     'shm_client.py',
     'structured_writer.py',
+    'structured_writer_advanced.py',
+    'table_signature.py',
+    'training_loop.py',
 ]
 
 
@@ -46,7 +52,7 @@ class ExamplesScriptTest(parameterized.TestCase):
     # Execute the module body (imports + def main) in a fresh namespace, then
     # call main(). __name__ is set so the `if __name__ == '__main__'` guard does
     # not auto-run main (we invoke it explicitly afterwards).
-    g = {'__name__': 'examples_script', 'np': np, 'reverb': reverb}
+    g = {'__name__': 'examples_script', 'np': np, 'reverb': reverb, 'tree': tree}
     exec(compile(src, path, 'exec'), g)  # pylint: disable=exec-used
     g['main']()
 
