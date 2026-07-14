@@ -195,8 +195,14 @@ absl::Status CheckProtocolVersion(uint32_t client_version) {
 ShmSegmentNames MakeShmNames(int server_pid, int client_pid) {
   ShmSegmentNames names;
   names.pool = absl::StrCat("/reverb_shm_pool_", server_pid);
-  names.c2s = absl::StrCat("/reverb_shm_c2s_", server_pid, "_", client_pid);
-  names.s2c = absl::StrCat("/reverb_shm_s2c_", server_pid, "_", client_pid);
+  names.insert_c2s =
+      absl::StrCat("/reverb_shm_insert_c2s_", server_pid, "_", client_pid);
+  names.insert_s2c =
+      absl::StrCat("/reverb_shm_insert_s2c_", server_pid, "_", client_pid);
+  names.sample_c2s =
+      absl::StrCat("/reverb_shm_sample_c2s_", server_pid, "_", client_pid);
+  names.sample_s2c =
+      absl::StrCat("/reverb_shm_sample_s2c_", server_pid, "_", client_pid);
   return names;
 }
 

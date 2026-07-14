@@ -34,9 +34,15 @@ namespace shm {
 // fd < 0 (no fd, e.g. moved-from / server side) => false (nothing to probe).
 bool IsPeerClosed(int fd);
 
-// The two SPSC rings wired between a server and one client, plus the shared
-// byte pool. Server side owns/creates the segments; client side opens them.
-// C2S is written by the client and read by the server; S2C the reverse.
+// The SPSC rings wired between a server and one client, plus the shared
+// byte pool. Decision D (per-flow rings): there are TWO ring PAIRS, one for
+// the insert flow (TrajectoryWriter's RunShmWorker) and one for the sample
+// flow (ShmSampler's worker). Each pair is strict SPSC: the flow's single
+// client worker thread is the sole producer on its c2s ring and sole consumer
+// on its s2c ring. Splitting the pairs lets the two worker threads run
+// concurrently WITHOUT a mutex — the single-pair design violated the SPSC
+// invariant once both writers started background threads (two producers on one
+// c2s `head`, no CAS => data corruption).
 //
 // The `pool` handle is only meaningful on the client side (where it is
 // `ShmBytePool::Open`'d read/write per decision C4); the server keeps its own
@@ -54,8 +60,10 @@ bool IsPeerClosed(int fd);
 // Move-only (Ring/ShmBytePool are move-only). The move-ctor must steal
 // control_fd and null the source so ~ShmConnection does not double-close.
 struct ShmConnection {
-  Ring c2s;  // client -> server
-  Ring s2c;  // server -> client
+  Ring insert_c2s;  // client insert worker -> server (ALLOCATE/INSERT/RELEASE)
+  Ring insert_s2c;  // server -> client insert worker (ALLOCATE_RESP/INSERT_ACK)
+  Ring sample_c2s;  // client sample worker -> server (SAMPLE/RELEASE)
+  Ring sample_s2c;  // server -> client sample worker (SAMPLE_RESP)
   ShmBytePool pool;  // client-side RW mapping (C4); server keeps its own
   std::string pool_shm_name;
   int control_fd = -1;  // client liveness fd (ticket ⑥); -1 = none

@@ -28,6 +28,8 @@ v1 SHM scope (per spec §6 + ticket ⑤):
 import os
 import pickle
 import tempfile
+import threading
+import time
 
 from absl.testing import absltest
 import numpy as np
@@ -307,6 +309,98 @@ class ShmClientServerInfoStubTest(absltest.TestCase):
         # The stub ignores the timeout arg entirely; must not raise.
         info = client.server_info(timeout=1)
         self.assertEqual(info, {})
+
+
+class ShmConcurrentWriterSamplerTest(absltest.TestCase):
+    """Decision D regression: a writer worker thread and a sampler worker
+    thread on ONE ShmClient must run concurrently without corrupting the
+    shared transport.
+
+    Pre-D the client had a single SPSC c2s/s2c ring pair, and both
+    TrajectoryWriter (RunShmWorker) and ShmSampler start background worker
+    threads that wrote that ring as producers. Two producers on one SPSC
+    `head` (no CAS) corrupted the ring and hung both workers in
+    ReadBlocking. Decision D gives each flow its own ring pair, restoring the
+    single-producer invariant. This test would hang/corrupt before D.
+    """
+
+    def test_concurrent_writer_and_sampler_on_one_client(self):
+        server, client = _make_shm_server(
+            table_name="t", max_size=10000, min_size=1
+        )
+        stop = threading.Event()
+        errs = []
+        items_written = []
+        samples_seen = []
+
+        def writer_loop():
+            try:
+                i = 0
+                while not stop.is_set():
+                    # One writer per item (mirrors the passing write/sample
+                    # tests' with-block). Reusing a single writer across many
+                    # create_item calls leaves rolled-off None refs in
+                    # history[:], which CreateItem rejects; a fresh writer per
+                    # item sidesteps that. The point is concurrent transport
+                    # progress, not writer reuse throughput.
+                    with client.trajectory_writer(num_keep_alive_refs=1) as w:
+                        w.append({"obs": np.array([float(i)], dtype=np.float32)})
+                        w.create_item(
+                            table="t",
+                            priority=1.0,
+                            trajectory={"obs": w.history["obs"][:]},
+                        )
+                        w.flush()
+                    items_written.append(i)
+                    i += 1
+            except Exception as e:  # noqa: BLE001
+                errs.append(("writer", repr(e)))
+
+        def sampler_loop():
+            try:
+                # A short rate-limiter timeout keeps the sampler from blocking
+                # forever when the writer hasn't flushed yet; a timeout is a
+                # normal "no item right now" signal, so we retry. The point of
+                # the test is that the sampler's worker thread and the writer's
+                # worker thread make concurrent progress WITHOUT corrupting the
+                # transport — not that a sample is always available.
+                while not stop.is_set():
+                    try:
+                        for s in client.sample(
+                            "t",
+                            num_samples=1,
+                            emit_timesteps=False,
+                            timeout_ms=200,
+                        ):
+                            samples_seen.append(s)
+                            break
+                    except errors.DeadlineExceededError:
+                        continue  # table momentarily empty; retry
+            except Exception as e:  # noqa: BLE001
+                errs.append(("sampler", repr(e)))
+
+        t_w = threading.Thread(target=writer_loop)
+        t_s = threading.Thread(target=sampler_loop)
+        t_w.start()
+        t_s.start()
+        # Run concurrently for a few seconds. Pre-D this hangs inside the
+        # first flush/sample (two producers on one SPSC ring); post-D both
+        # threads make progress.
+        time.sleep(3.0)
+        stop.set()
+        t_w.join(timeout=15)
+        t_s.join(timeout=15)
+
+        # Both threads must have exited (not hung on a corrupted ring).
+        self.assertFalse(t_w.is_alive(), "writer thread hung")
+        self.assertFalse(t_s.is_alive(), "sampler thread hung")
+        # No errors surfaced from either worker.
+        self.assertEqual(errs, [])
+        # And real work happened in BOTH flows concurrently.
+        self.assertGreater(len(items_written), 0, "writer made no progress")
+        self.assertGreater(len(samples_seen), 0, "sampler made no progress")
+
+        server.stop()
 
 
 if __name__ == "__main__":

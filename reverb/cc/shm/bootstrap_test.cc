@@ -42,8 +42,10 @@ std::string UniqueSocket(const std::string& tag) {
 WelcomeResponse MakeWelcome() {
   WelcomeResponse w;
   w.set_pool_shm_name("/reverb_shm_pool_12345");
-  w.set_c2s_shm_name("/reverb_shm_c2s_12345_67890");
-  w.set_s2c_shm_name("/reverb_shm_s2c_12345_67890");
+  w.set_insert_c2s_shm_name("/reverb_shm_insert_c2s_12345_67890");
+  w.set_insert_s2c_shm_name("/reverb_shm_insert_s2c_12345_67890");
+  w.set_sample_c2s_shm_name("/reverb_shm_sample_c2s_12345_67890");
+  w.set_sample_s2c_shm_name("/reverb_shm_sample_s2c_12345_67890");
   return w;
 }
 
@@ -59,8 +61,10 @@ TEST(BootstrapTest, HelloWelcomeRoundTrip) {
     REVERB_ASSERT_OK(r.status());
     WelcomeResponse got = std::move(r).value();
     EXPECT_EQ(got.pool_shm_name(), expected.pool_shm_name());
-    EXPECT_EQ(got.c2s_shm_name(), expected.c2s_shm_name());
-    EXPECT_EQ(got.s2c_shm_name(), expected.s2c_shm_name());
+    EXPECT_EQ(got.insert_c2s_shm_name(), expected.insert_c2s_shm_name());
+    EXPECT_EQ(got.insert_s2c_shm_name(), expected.insert_s2c_shm_name());
+    EXPECT_EQ(got.sample_c2s_shm_name(), expected.sample_c2s_shm_name());
+    EXPECT_EQ(got.sample_s2c_shm_name(), expected.sample_s2c_shm_name());
   });
 
   auto a = server.Accept();
@@ -89,8 +93,10 @@ TEST(BootstrapTest, NamesAreNonEmpty) {
     REVERB_ASSERT_OK(r.status());
     WelcomeResponse got = std::move(r).value();
     EXPECT_FALSE(got.pool_shm_name().empty());
-    EXPECT_FALSE(got.c2s_shm_name().empty());
-    EXPECT_FALSE(got.s2c_shm_name().empty());
+    EXPECT_FALSE(got.insert_c2s_shm_name().empty());
+    EXPECT_FALSE(got.insert_s2c_shm_name().empty());
+    EXPECT_FALSE(got.sample_c2s_shm_name().empty());
+    EXPECT_FALSE(got.sample_s2c_shm_name().empty());
   });
 
   auto a = server.Accept();
@@ -119,8 +125,10 @@ TEST(BootstrapTest, SegmentNamesMatchA3Format) {
   ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
   WelcomeResponse expected;
   expected.set_pool_shm_name(names.pool);
-  expected.set_c2s_shm_name(names.c2s);
-  expected.set_s2c_shm_name(names.s2c);
+  expected.set_insert_c2s_shm_name(names.insert_c2s);
+  expected.set_insert_s2c_shm_name(names.insert_s2c);
+  expected.set_sample_c2s_shm_name(names.sample_c2s);
+  expected.set_sample_s2c_shm_name(names.sample_s2c);
 
   std::thread client_thread([&] {
     auto r = ClientBootstrap(sock, client_pid);
@@ -129,14 +137,23 @@ TEST(BootstrapTest, SegmentNamesMatchA3Format) {
     // A3: /reverb_shm_pool_<server_pid>
     EXPECT_EQ(got.pool_shm_name(),
               "/reverb_shm_pool_" + std::to_string(server_pid));
-    // A3: /reverb_shm_c2s_<server_pid>_<client_pid>
-    EXPECT_EQ(got.c2s_shm_name(), "/reverb_shm_c2s_" +
-                                      std::to_string(server_pid) + "_" +
-                                      std::to_string(client_pid));
-    // A3: /reverb_shm_s2c_<server_pid>_<client_pid>
-    EXPECT_EQ(got.s2c_shm_name(), "/reverb_shm_s2c_" +
-                                      std::to_string(server_pid) + "_" +
-                                      std::to_string(client_pid));
+    // A3/D: /reverb_shm_insert_c2s_<server_pid>_<client_pid>
+    EXPECT_EQ(got.insert_c2s_shm_name(), "/reverb_shm_insert_c2s_" +
+                                            std::to_string(server_pid) +
+                                            "_" +
+                                            std::to_string(client_pid));
+    EXPECT_EQ(got.insert_s2c_shm_name(), "/reverb_shm_insert_s2c_" +
+                                            std::to_string(server_pid) +
+                                            "_" +
+                                            std::to_string(client_pid));
+    EXPECT_EQ(got.sample_c2s_shm_name(), "/reverb_shm_sample_c2s_" +
+                                            std::to_string(server_pid) +
+                                            "_" +
+                                            std::to_string(client_pid));
+    EXPECT_EQ(got.sample_s2c_shm_name(), "/reverb_shm_sample_s2c_" +
+                                            std::to_string(server_pid) +
+                                            "_" +
+                                            std::to_string(client_pid));
   });
 
   auto a = server.Accept();

@@ -251,21 +251,27 @@ TEST(ShmCrashTest, ClientFdCloseReclaimsOffsetsAndUnlinksRings) {
   // Recompute this client's ring names to assert unlink later. The client sent
   // getpid() as its PID; the server's PID is also getpid() (same process).
   ShmSegmentNames names = MakeShmNames(getpid(), getpid());
-  // Sanity: the rings exist while the client is connected.
-  ASSERT_TRUE(ShmSegmentExists(names.c2s));
-  ASSERT_TRUE(ShmSegmentExists(names.s2c));
+  // Sanity: all four rings exist while the client is connected (decision D).
+  ASSERT_TRUE(ShmSegmentExists(names.insert_c2s));
+  ASSERT_TRUE(ShmSegmentExists(names.insert_s2c));
+  ASSERT_TRUE(ShmSegmentExists(names.sample_c2s));
+  ASSERT_TRUE(ShmSegmentExists(names.sample_s2c));
 
   // Simulate crash: close the control fd. The server's dispatch loop poll()s
   // it next pass, sees EOF, and calls HandleDisconnect.
   close(conn->control_fd);
   conn->control_fd = -1;  // prevent ~ShmConnection double-close
 
-  // Wait for the server to unlink the rings (HandleDisconnect ran).
-  ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.c2s); },
+  // Wait for the server to unlink all four rings (HandleDisconnect ran).
+  ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
                       absl::Seconds(5)))
-      << "server did not unlink c2s ring after client fd close";
-  EXPECT_FALSE(ShmSegmentExists(names.s2c))
-      << "server did not unlink s2c ring after client fd close";
+      << "server did not unlink insert c2s ring after client fd close";
+  EXPECT_FALSE(ShmSegmentExists(names.insert_s2c))
+      << "server did not unlink insert s2c ring after client fd close";
+  EXPECT_FALSE(ShmSegmentExists(names.sample_c2s))
+      << "server did not unlink sample c2s ring after client fd close";
+  EXPECT_FALSE(ShmSegmentExists(names.sample_s2c))
+      << "server did not unlink sample s2c ring after client fd close";
 
   // Drop the client objects. The rings are already unlinked by the server;
   // ~Ring's owner-unlink is a harmless ENOENT.
@@ -327,9 +333,9 @@ TEST(ShmCrashTest, RepeatedCrashDoesNotExhaustPool) {
     // would fail/block if the server were wedged. Poll the ring unlink as the
     // reclamation-completed signal: ring names are getpid()/getpid() each
     // round (same process), so the server must unlink before the next round's
-    // Ring::Create(names.c2s) can succeed with O_EXCL.
+    // Ring::Create(names.insert_c2s) can succeed with O_EXCL.
     ShmSegmentNames names = MakeShmNames(getpid(), getpid());
-    ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.c2s); },
+    ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
                         absl::Seconds(5)))
         << "round " << i << ": server did not reclaim after crash";
     sampler->Close();
@@ -393,9 +399,9 @@ TEST(ShmCrashTest, OtherClientUnaffectedByChildCrash) {
 
   // Give the server a moment to detect the child's fd EOF + reclaim.
   ShmSegmentNames child_names = MakeShmNames(getpid(), pid);
-  ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(child_names.c2s); },
+  ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(child_names.insert_c2s); },
                       absl::Seconds(5)))
-      << "server did not unlink crashed child's c2s ring";
+      << "server did not unlink crashed child's insert c2s ring";
 
   // The parent client must STILL be able to sample (unaffected by the crash).
   std::vector<TensorBuffer> data1;

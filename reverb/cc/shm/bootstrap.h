@@ -60,15 +60,23 @@ class ShmBootstrapServer {
   std::string socket_path_;
 };
 
-// A3-format SHM segment names for one (server, client) pair. The server owns
-// generation (spec A3): pool is keyed by server PID alone; the two rings carry
-// both PIDs. `/reverb_shm_pool_<server_pid>`,
-// `/reverb_shm_c2s_<server_pid>_<client_pid>`,
-// `/reverb_shm_s2c_<server_pid>_<client_pid>`.
+// A3/D-format SHM segment names for one (server, client) pair. The server owns
+// generation (spec A3): pool is keyed by server PID alone; decision D splits
+// the control rings into a per-flow SPSC pair — insert and sample each get
+// their OWN two rings so the two background worker threads (TrajectoryWriter's
+// RunShmWorker + ShmSampler's worker) never contend as producers/consumers on
+// one SPSC ring. Names carry the flow tag + both PIDs.
+//   /reverb_shm_pool_<server_pid>
+//   /reverb_shm_insert_c2s_<server_pid>_<client_pid>
+//   /reverb_shm_insert_s2c_<server_pid>_<client_pid>
+//   /reverb_shm_sample_c2s_<server_pid>_<client_pid>
+//   /reverb_shm_sample_s2c_<server_pid>_<client_pid>
 struct ShmSegmentNames {
   std::string pool;
-  std::string c2s;
-  std::string s2c;
+  std::string insert_c2s;
+  std::string insert_s2c;
+  std::string sample_c2s;
+  std::string sample_s2c;
 };
 ShmSegmentNames MakeShmNames(int server_pid, int client_pid);
 

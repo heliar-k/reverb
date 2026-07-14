@@ -79,15 +79,15 @@ TEST(ShmEchoTest, DataCrossesRingBoundary) {
     REVERB_ASSERT_OK(CheckProtocolVersion(hello->protocol_version()));
 
     ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
-    auto c2s_server = Ring::Create(names.c2s, 16, 256);
+    auto c2s_server = Ring::Create(names.sample_c2s, 16, 256);
     REVERB_ASSERT_OK(c2s_server.status());
-    auto s2c_server = Ring::Create(names.s2c, 16, 256);
+    auto s2c_server = Ring::Create(names.sample_s2c, 16, 256);
     REVERB_ASSERT_OK(s2c_server.status());
 
     WelcomeResponse welcome;
     welcome.set_pool_shm_name(names.pool);
-    welcome.set_c2s_shm_name(names.c2s);
-    welcome.set_s2c_shm_name(names.s2c);
+    welcome.set_sample_c2s_shm_name(names.sample_c2s);
+    welcome.set_sample_s2c_shm_name(names.sample_s2c);
     REVERB_ASSERT_OK(SendWelcome(client_fd, welcome));
     close(client_fd);
 
@@ -110,16 +110,16 @@ TEST(ShmEchoTest, DataCrossesRingBoundary) {
   int client_pid = getpid();
   EXPECT_EQ(welcome.pool_shm_name(),
             "/reverb_shm_pool_" + std::to_string(server_pid));
-  EXPECT_EQ(welcome.c2s_shm_name(), "/reverb_shm_c2s_" +
-                                        std::to_string(server_pid) + "_" +
-                                        std::to_string(client_pid));
-  EXPECT_EQ(welcome.s2c_shm_name(), "/reverb_shm_s2c_" +
-                                        std::to_string(server_pid) + "_" +
-                                        std::to_string(client_pid));
+  EXPECT_EQ(welcome.sample_c2s_shm_name(), "/reverb_shm_sample_c2s_" +
+                                            std::to_string(server_pid) + "_" +
+                                            std::to_string(client_pid));
+  EXPECT_EQ(welcome.sample_s2c_shm_name(), "/reverb_shm_sample_s2c_" +
+                                            std::to_string(server_pid) + "_" +
+                                            std::to_string(client_pid));
 
-  auto c2s_client = Ring::Open(welcome.c2s_shm_name());
+  auto c2s_client = Ring::Open(welcome.sample_c2s_shm_name());
   REVERB_ASSERT_OK(c2s_client.status());
-  auto s2c_client = Ring::Open(welcome.s2c_shm_name());
+  auto s2c_client = Ring::Open(welcome.sample_s2c_shm_name());
   REVERB_ASSERT_OK(s2c_client.status());
 
   // Client writes the request on C2S, reads the reply off S2C.
@@ -155,14 +155,14 @@ TEST(ShmEchoTest, CrossSlotMessageAcrossBoundary) {
     auto [client_fd, client_pid] = std::move(a).value();
     // A3: server generates the segment names from the real PIDs.
     ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
-    auto c2s_server = Ring::Create(names.c2s, 16, 256);
+    auto c2s_server = Ring::Create(names.sample_c2s, 16, 256);
     REVERB_ASSERT_OK(c2s_server.status());
-    auto s2c_server = Ring::Create(names.s2c, 16, 256);
+    auto s2c_server = Ring::Create(names.sample_s2c, 16, 256);
     REVERB_ASSERT_OK(s2c_server.status());
     WelcomeResponse w;
     w.set_pool_shm_name(names.pool);
-    w.set_c2s_shm_name(names.c2s);
-    w.set_s2c_shm_name(names.s2c);
+    w.set_sample_c2s_shm_name(names.sample_c2s);
+    w.set_sample_s2c_shm_name(names.sample_s2c);
     REVERB_ASSERT_OK(SendWelcome(client_fd, w));
     close(client_fd);
 
@@ -175,9 +175,9 @@ TEST(ShmEchoTest, CrossSlotMessageAcrossBoundary) {
 
   auto r = ClientBootstrap(sock, getpid());
   REVERB_ASSERT_OK(r.status());
-  auto c2s_client = Ring::Open(r->c2s_shm_name());
+  auto c2s_client = Ring::Open(r->sample_c2s_shm_name());
   REVERB_ASSERT_OK(c2s_client.status());
-  auto s2c_client = Ring::Open(r->s2c_shm_name());
+  auto s2c_client = Ring::Open(r->sample_s2c_shm_name());
   REVERB_ASSERT_OK(s2c_client.status());
 
   REVERB_ASSERT_OK(c2s_client->Write(SAMPLE, absl::MakeSpan(request)));

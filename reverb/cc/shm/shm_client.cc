@@ -185,8 +185,10 @@ void ShmSampler::RunWorker() {
 }
 
 absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
-  // 1. Send SAMPLE request on C→S (blocks if the ring is full — natural
-  //    backpressure, §8.7).
+  // 1. Send SAMPLE request on the sample C→S ring (blocks if the ring is
+  //    full — natural backpressure, §8.7). Decision D: the sample flow has
+  //    its OWN ring pair, so this write never races the insert worker's
+  //    writes on a shared c2s ring.
   ShmSampleRequest req;
   req.set_table(table_name_);
   req.set_num_samples(1);
@@ -195,14 +197,15 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
   std::string req_body;
   req.SerializeToString(&req_body);
   REVERB_RETURN_IF_ERROR(
-      conn_->c2s.Write(SAMPLE, absl::MakeSpan(req_body)));
+      conn_->sample_c2s.Write(SAMPLE, absl::MakeSpan(req_body)));
 
-  // 2. Poll S→C for the response. A server-side timeout comes back as ERROR
-  //    with DEADLINE_EXCEEDED; surface it so the worker/sampler maps it.
+  // 2. Poll the sample S→C ring for the response. A server-side timeout comes
+  //    back as ERROR with DEADLINE_EXCEEDED; surface it so the worker/sampler
+  //    maps it.
   MsgType resp_type;
   std::string resp_body;
   REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_->s2c, &resp_type, &resp_body, conn_->control_fd));
+      ReadBlocking(&conn_->sample_s2c, &resp_type, &resp_body, conn_->control_fd));
 
   if (resp_type == ERROR) {
     ShmError err;
@@ -245,7 +248,7 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
     // AsTrajectory applies the squeeze using squeeze_columns, exactly as the
     // local AsSample path does.
     TensorSpec spec;
-    spec.dtype = *DataTypeFromProto(col.spec().dtype());
+    REVERB_ASSIGN_OR_RETURN(spec.dtype, DataTypeFromProto(col.spec().dtype()));
     spec.shape.reserve(col.spec().shape().dim_size());
     for (int64_t d : col.spec().shape().dim()) spec.shape.push_back(d);
     std::string bytes(col.length(), '\0');
@@ -264,13 +267,14 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
                                          std::move(column_chunks),
                                          std::move(squeeze_columns));
 
-  // 5. RELEASE the pool offsets now that bytes are copied out (C3).
+  // 5. RELEASE the pool offsets now that bytes are copied out (C3), on the
+  //    sample C→S ring (decision D).
   ShmReleaseRequest rel;
   for (uint64_t off : offsets) rel.add_offsets(off);
   std::string rel_body;
   rel.SerializeToString(&rel_body);
   REVERB_RETURN_IF_ERROR(
-      conn_->c2s.Write(RELEASE, absl::MakeSpan(rel_body)));
+      conn_->sample_c2s.Write(RELEASE, absl::MakeSpan(rel_body)));
 
   return sample;
 }
@@ -287,27 +291,45 @@ absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
   // Bootstrap handshake (retry briefly while the server binds the socket).
   // ticket ⑥: keep the udsocket fd open as the liveness signal the server
   // poll()s for crash/close detection (spec §8.8).
+  // Retry briefly while the server binds the udsocket (up to 10s). Without a
+  // wall-clock deadline a server that never starts would busy-wait forever.
+  absl::Time deadline = absl::Now() + absl::Seconds(10);
   absl::StatusOr<ClientBootstrapResult> w;
-  for (int i = 0; i < 200; i++) {
+  while (absl::Now() < deadline) {
     w = ClientBootstrapWithFd(socket_path, /*client_pid=*/getpid());
     if (w.ok()) break;
     sched_yield();
   }
   REVERB_RETURN_IF_ERROR(w.status());
 
-  // Open the three segments: pool (RW, C4) + the two rings.
+  // Open the four per-flow rings (decision D: insert + sample each get their
+  // own SPSC pair) + the pool (RW, C4). RAII guard closes the bootstrap fd if
+  // any Open fails — otherwise the moved-from `w->fd` would leak (its struct
+  // dtor does not close fds).
+  struct FdGuard {
+    int fd = -1;
+    ~FdGuard() { if (fd >= 0) close(fd); }
+  } fd_guard{w->fd};
   REVERB_ASSIGN_OR_RETURN(ShmBytePool pool,
                           ShmBytePool::Open(w->welcome.pool_shm_name()));
-  REVERB_ASSIGN_OR_RETURN(Ring c2s, Ring::Open(w->welcome.c2s_shm_name()));
-  REVERB_ASSIGN_OR_RETURN(Ring s2c, Ring::Open(w->welcome.s2c_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(
+      Ring insert_c2s, Ring::Open(w->welcome.insert_c2s_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(
+      Ring insert_s2c, Ring::Open(w->welcome.insert_s2c_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(
+      Ring sample_c2s, Ring::Open(w->welcome.sample_c2s_shm_name()));
+  REVERB_ASSIGN_OR_RETURN(
+      Ring sample_s2c, Ring::Open(w->welcome.sample_s2c_shm_name()));
 
   ShmConnection conn;
-  conn.c2s = std::move(c2s);
-  conn.s2c = std::move(s2c);
+  conn.insert_c2s = std::move(insert_c2s);
+  conn.insert_s2c = std::move(insert_s2c);
+  conn.sample_c2s = std::move(sample_c2s);
+  conn.sample_s2c = std::move(sample_s2c);
   conn.pool = std::move(pool);
   conn.pool_shm_name = w->welcome.pool_shm_name();
-  conn.control_fd = w->fd;  // ~ShmConnection closes it
-  w->fd = -1;               // conn owns it now
+  conn.control_fd = fd_guard.fd;  // ~ShmConnection closes it
+  fd_guard.fd = -1;               // conn owns it now
 
   return absl::WrapUnique(new ShmClient(std::move(conn)));
 }

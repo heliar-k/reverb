@@ -53,8 +53,10 @@ ShmConnection::~ShmConnection() {
 }
 
 ShmConnection::ShmConnection(ShmConnection&& other) noexcept
-    : c2s(std::move(other.c2s)),
-      s2c(std::move(other.s2c)),
+    : insert_c2s(std::move(other.insert_c2s)),
+      insert_s2c(std::move(other.insert_s2c)),
+      sample_c2s(std::move(other.sample_c2s)),
+      sample_s2c(std::move(other.sample_s2c)),
       pool(std::move(other.pool)),
       pool_shm_name(std::move(other.pool_shm_name)),
       control_fd(other.control_fd) {
@@ -63,8 +65,10 @@ ShmConnection::ShmConnection(ShmConnection&& other) noexcept
 
 ShmConnection& ShmConnection::operator=(ShmConnection&& other) noexcept {
   if (this != &other) {
-    c2s = std::move(other.c2s);
-    s2c = std::move(other.s2c);
+    insert_c2s = std::move(other.insert_c2s);
+    insert_s2c = std::move(other.insert_s2c);
+    sample_c2s = std::move(other.sample_c2s);
+    sample_s2c = std::move(other.sample_s2c);
     pool = std::move(other.pool);
     pool_shm_name = std::move(other.pool_shm_name);
     if (control_fd >= 0) close(control_fd);

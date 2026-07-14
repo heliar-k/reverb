@@ -40,33 +40,41 @@ namespace reverb {
 namespace shm {
 
 // Per-client state held by ShmServer. The dispatch thread is the sole mutator
-// of `outstanding_offsets_` and `outbox` (single-threaded dispatch, decision
-// A1/R11), so they need no lock in practice; `outbox_mu` is retained to match
-// the spec §3.4 declaration and to future-proof a per-client dispatch split.
+// of `outstanding_offsets_` and the outboxes (single-threaded dispatch,
+// decision A1/R11), so they need no lock in practice; the mutexes are retained
+// to match the spec §3.4 declaration and to future-proof a per-client dispatch
+// split. Decision D: outboxes are per-flow (insert/sample) so each s2c ring's
+// retry queue stays homogeneous.
 //
-// ponytail: v1 dispatch is single-threaded; the mutex is uncontended. Upgrade
-// path: per-client dispatch threads (spec §8.7 note) would contend here.
+// ponytail: v1 dispatch is single-threaded; the mutexes are uncontended.
+// Upgrade path: per-client dispatch threads (spec §8.7 note) would contend.
 struct ClientState {
   int fd = -1;                       // udsocket fd (closed on disconnect)
   int client_pid = 0;
-  ShmConnection conn;                // c2s, s2c rings; pool unused server-side
+  ShmConnection conn;  // 4 rings (insert+sample c2s/s2c); pool unused server-side
   internal::flat_hash_set<uint64_t> outstanding_offsets_;  // C3: crash recovery (⑥)
 
   // Stashed S→C messages that did not fit (ring full). Flushed each dispatch
-  // pass via a non-blocking Write. ponytail: vector, upgrade to ring-buffer.
-  absl::Mutex outbox_mu;
-  std::vector<std::pair<uint16_t, std::string>> outbox
-      ABSL_GUARDED_BY(outbox_mu);
+  // pass via a non-blocking Write. Decision D: separate per-flow outboxes so
+  // a full insert s2c ring does not block sample responses (and vice versa).
+  // ponytail: vector, upgrade to ring-buffer.
+  absl::Mutex insert_outbox_mu;
+  std::vector<std::pair<uint16_t, std::string>> insert_outbox
+      ABSL_GUARDED_BY(insert_outbox_mu);
+  absl::Mutex sample_outbox_mu;
+  std::vector<std::pair<uint16_t, std::string>> sample_outbox
+      ABSL_GUARDED_BY(sample_outbox_mu);
 
   // Insert-callback keepalive (ticket ④): InsertOrAssignAsync stores a
   // weak_ptr to the callback; the table worker fires it asynchronously, AFTER
   // HandleInsert returns. The shared_ptr must therefore outlive HandleInsert.
   // We stash them here and clear them once the aggregate InsertAck is enqueued
-  // (i.e. the last item's callback has fired). Guarded by outbox_mu (the
-  // callback fires on the table callback-executor thread, not the dispatch
-  // thread). Mirrors Writer::WritePendingDataLocal's local_pending_callbacks_.
+  // (i.e. the last item's callback has fired). Guarded by insert_outbox_mu
+  // (the callback fires on the table callback-executor thread, not the
+  // dispatch thread). Mirrors Writer::WritePendingDataLocal's
+  // local_pending_callbacks_.
   std::vector<std::shared_ptr<Table::InsertCallback>> pending_insert_callbacks
-      ABSL_GUARDED_BY(outbox_mu);
+      ABSL_GUARDED_BY(insert_outbox_mu);
 
   // ticket ⑥: set when the client sends an explicit CLOSE. The dispatch loop's
   // IsClientDead check then routes it through HandleDisconnect next pass.
@@ -120,10 +128,16 @@ class ShmServer {
   // if a client was accepted.
   bool TryAccept();
 
-  // Drain one client's C→S ring (non-blocking Read), dispatching each request.
-  void HandleClientRequests(size_t client_id);
+  // Drain one client's insert C→S ring (non-blocking Read), dispatching each
+  // request (ALLOCATE/INSERT/RELEASE).
+  void HandleInsertRequests(size_t client_id);
 
-  // Flush the client's outbox with non-blocking S→C writes (§8.7).
+  // Drain one client's sample C→S ring (non-blocking Read), dispatching each
+  // request (SAMPLE/RELEASE). Decision D: insert and sample flows have
+  // separate c2s rings, drained independently so neither blocks the other.
+  void HandleSampleRequests(size_t client_id);
+
+  // Flush both per-flow outboxes with non-blocking S→C writes (§8.7).
   void FlushOutbox(ClientState& state);
 
   // Sample path: Table::Sample → unpack (A1) → pool memcpy (C3) → SAMPLE_RESP.
@@ -145,9 +159,13 @@ class ShmServer {
   absl::Status HandleAllocate(ClientState& state,
                               const ShmAllocateRequest& req);
 
-  // Enqueue a S→C message: try a non-blocking write, stash in outbox if full.
-  absl::Status EnqueueS2C(ClientState& state, MsgType type,
-                          absl::string_view body);
+  // Enqueue a S→C message on the INSERT flow's s2c ring: try a non-blocking
+  // write, stash in insert_outbox if full.
+  absl::Status EnqueueInsertS2C(ClientState& state, MsgType type,
+                                absl::string_view body);
+  // Enqueue a S→C message on the SAMPLE flow's s2c ring.
+  absl::Status EnqueueSampleS2C(ClientState& state, MsgType type,
+                                absl::string_view body);
 
   // ticket ⑥: detect a dead client (crash or graceful close) by probing its
   // udsocket fd for POLLHUP/POLLERR/EOF without blocking. Returns true if the

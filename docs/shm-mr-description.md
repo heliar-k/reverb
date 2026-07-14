@@ -15,7 +15,8 @@
 │  ShmClient(socket_path) ─────────────────────┘           │
 │    └ TrajectoryWriter / Sampler / StructuredWriter       │
 └───────────────────────────────────────────────────────────┘
-        │  C→S ring (SPSC)        S→C ring (SPSC)
+        │  C→S ring (SPSC) x2     S→C ring (SPSC) x2
+        │  (insert 流 / sample 流)  (insert 流 / sample 流)
         │  (client 写请求)         (server 写响应)
         ▼                          ▼
 ┌─ C++ reverb/cc/shm/ ─────────────────────────────────────┐
@@ -35,6 +36,7 @@
 - **C3** — sample 的 SHM 偏移引用计数起点=1,client RELEASE 后归零回收
 - **C4** — pool 读写权限:client RW mmap,但分配权独占在 server(无跨进程锁);client 经 ALLOCATE 请求向 server 申请偏移
 - **C5** — SHM Sampler 复用现有 worker 线程 + samples_ 队列架构(非调用者线程内联)
+- **D** — per-flow 独立 ring(insert + sample 各一对 SPSC)。原 v1 每客户端一对 c2s/s2c ring,但 `TrajectoryWriter::RunShmWorker` 与 `ShmSampler` 都起后台 worker 线程,两者同时往同一 c2s ring 写(两个 producer)会损坏无 CAS 的 SPSC `head`。D 给 insert 流和 sample 流各开一对 ring,恢复 SPSC 单 producer 契约,writer/sampler 线程真正并发无锁。`ShmConnection` 持 4 条 ring;`WelcomeResponse` 带 4 个 ring 名;`MakeShmNames` 产 4 个名;`ShmServer` 建 4 条 ring + per-flow outbox;client 侧 sampler 用 sample_*、writer 用 insert_*。
 
 ## 交付内容(7 tickets)
 

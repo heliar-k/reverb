@@ -154,14 +154,17 @@ void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
     state.outstanding_offsets_.clear();
   }
   if (unlink_rings) {
-    // R6: unlink this client's two ring segments so a restart doesn't see
-    // stale segments. Recompute the names (A3: keyed by server+client PID).
-    // The Ring destructor ALSO unlinks (owner_=true), but explicit unlink here
-    // is safe (second unlink is a harmless ENOENT) and makes the cleanup
-    // intent obvious at the disconnect site.
+    // R6: unlink this client's FOUR ring segments so a restart doesn't see
+    // stale segments (decision D: insert + sample pairs). Recompute the names
+    // (A3: keyed by server+client PID). The Ring destructor ALSO unlinks
+    // (owner_=true), but explicit unlink here is safe (second unlink is a
+    // harmless ENOENT) and makes the cleanup intent obvious at the disconnect
+    // site.
     ShmSegmentNames names = MakeShmNames(getpid(), state.client_pid);
-    shm_unlink(names.c2s.c_str());
-    shm_unlink(names.s2c.c_str());
+    shm_unlink(names.insert_c2s.c_str());
+    shm_unlink(names.insert_s2c.c_str());
+    shm_unlink(names.sample_c2s.c_str());
+    shm_unlink(names.sample_s2c.c_str());
   }
   if (state.fd >= 0) {
     close(state.fd);
@@ -202,7 +205,11 @@ void ShmServer::DispatchLoop() {
         dead.push_back(i);
         continue;  // don't serve a dead client
       }
-      HandleClientRequests(i);
+      // Decision D: drain insert and sample c2s rings independently so a
+      // stalled insert request (e.g. waiting on the table worker) does not
+      // block sample responses, and vice versa.
+      HandleInsertRequests(i);
+      HandleSampleRequests(i);
       FlushOutbox(*clients_[i]);
     }
     for (auto it = dead.rbegin(); it != dead.rend(); ++it) {
@@ -239,23 +246,41 @@ bool ShmServer::TryAccept() {
   }
 
   ShmSegmentNames names = MakeShmNames(getpid(), client_pid);
-  // Create this client's two rings. (The pool was created once at server init;
-  // its name is shared with all clients.)
-  auto c2s = Ring::Create(names.c2s);
-  if (!c2s.ok()) {
+  // Decision D: create FOUR rings per client — one SPSC pair for the insert
+  // flow (TrajectoryWriter) and one for the sample flow (ShmSampler). Each
+  // pair keeps the SPSC invariant intact (one client-thread producer per c2s)
+  // so the two background workers never race a shared ring. (The pool was
+  // created once at server init; its name is shared with all clients.)
+  auto ins_c2s = Ring::Create(names.insert_c2s);
+  if (!ins_c2s.ok()) {
     close(client_fd);
     return false;
   }
-  auto s2c = Ring::Create(names.s2c);
-  if (!s2c.ok()) {
+  auto ins_s2c = Ring::Create(names.insert_s2c);
+  if (!ins_s2c.ok()) {
+    close(client_fd);
+    return false;
+  }
+  auto smp_c2s = Ring::Create(names.sample_c2s);
+  if (!smp_c2s.ok()) {
+    close(client_fd);
+    return false;
+  }
+  auto smp_s2c = Ring::Create(names.sample_s2c);
+  if (!smp_s2c.ok()) {
     close(client_fd);
     return false;
   }
 
   WelcomeResponse welcome;
   welcome.set_pool_shm_name(pool_.name());
-  welcome.set_c2s_shm_name(names.c2s);
-  welcome.set_s2c_shm_name(names.s2c);
+  // Deprecated aliases mirror the sample flow for legacy readers.
+  welcome.set_c2s_shm_name(names.sample_c2s);
+  welcome.set_s2c_shm_name(names.sample_s2c);
+  welcome.set_insert_c2s_shm_name(names.insert_c2s);
+  welcome.set_insert_s2c_shm_name(names.insert_s2c);
+  welcome.set_sample_c2s_shm_name(names.sample_c2s);
+  welcome.set_sample_s2c_shm_name(names.sample_s2c);
   auto send = SendWelcome(client_fd, welcome);
   if (!send.ok()) {
     close(client_fd);
@@ -265,8 +290,10 @@ bool ShmServer::TryAccept() {
   auto state = std::make_unique<ClientState>();
   state->fd = client_fd;
   state->client_pid = client_pid;
-  state->conn.c2s = std::move(*c2s);
-  state->conn.s2c = std::move(*s2c);
+  state->conn.insert_c2s = std::move(*ins_c2s);
+  state->conn.insert_s2c = std::move(*ins_s2c);
+  state->conn.sample_c2s = std::move(*smp_c2s);
+  state->conn.sample_s2c = std::move(*smp_s2c);
   state->conn.pool_shm_name = pool_.name();
   // The server keeps its own owner pool (`pool_`); the client-side pool handle
   // in `conn` is left default (the server never reads sample bytes via it).
@@ -274,53 +301,24 @@ bool ShmServer::TryAccept() {
   return true;
 }
 
-void ShmServer::HandleClientRequests(size_t client_id) {
+void ShmServer::HandleInsertRequests(size_t client_id) {
   ClientState& state = *clients_[client_id];
-  // Drain everything currently readable (non-blocking). Ring::Read returns
-  // NotFound("NOT_READY") when empty (spec §3.1) — that is the normal "no work"
-  // signal, not an error.
+  // Drain everything currently readable from the INSERT flow's c2s ring
+  // (non-blocking). Ring::Read returns NotFound("NOT_READY") when empty
+  // (spec §3.1) — that is the normal "no work" signal, not an error.
   while (running_.load()) {
     MsgType type;
     std::string payload;
-    absl::Status s = state.conn.c2s.Read(&type, &payload);
+    absl::Status s = state.conn.insert_c2s.Read(&type, &payload);
     if (!s.ok()) {
-      // NOT_READY => ring empty, move on. Anything else is logged and we stop
-      // draining this client this pass (a corrupted continuation would spam).
       if (!absl::IsNotFound(s)) {
         REVERB_LOG(REVERB_WARNING)
-            << "ShmServer: C2S read error for client " << client_id << ": "
-            << s;
+            << "ShmServer: insert c2s read error for client " << client_id
+            << ": " << s;
       }
       return;
     }
     switch (type) {
-      case SAMPLE: {
-        ShmSampleRequest req;
-        if (!req.ParseFromString(payload)) {
-          REVERB_LOG(REVERB_WARNING)
-              << "ShmServer: malformed ShmSampleRequest from client "
-              << client_id;
-          break;
-        }
-        auto st = HandleSample(state, req);
-        if (!st.ok()) {
-          REVERB_LOG(REVERB_WARNING)
-              << "ShmServer: HandleSample failed for client " << client_id
-              << ": " << st;
-        }
-        break;
-      }
-      case RELEASE: {
-        ShmReleaseRequest req;
-        if (!req.ParseFromString(payload)) break;
-        auto st = HandleRelease(state, req);
-        if (!st.ok()) {
-          REVERB_LOG(REVERB_WARNING)
-              << "ShmServer: HandleRelease failed for client " << client_id
-              << ": " << st;
-        }
-        break;
-      }
       case INSERT: {
         ShmInsertRequest req;
         if (!req.ParseFromString(payload)) {
@@ -353,53 +351,145 @@ void ShmServer::HandleClientRequests(size_t client_id) {
         }
         break;
       }
+      case RELEASE: {
+        // RELEASE may arrive on either flow (insert chunks vs sample bytes).
+        // HandleRelease is offset-keyed, flow-agnostic.
+        ShmReleaseRequest req;
+        if (!req.ParseFromString(payload)) break;
+        auto st = HandleRelease(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleRelease failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
       case CLOSE:
         // ticket ⑥: graceful close. Mark for disconnect; the dispatch loop's
         // dead-collection erases it next pass (avoid erasing mid-iteration).
         state.close_requested = true;
         return;
       default:
-        // Unknown msg type: ignore (forward-compat).
+        // Unknown msg type on this flow: ignore (forward-compat).
+        break;
+    }
+  }
+}
+
+void ShmServer::HandleSampleRequests(size_t client_id) {
+  ClientState& state = *clients_[client_id];
+  // Drain the SAMPLE flow's c2s ring (non-blocking). Decision D: separate
+  // from the insert ring so a slow insert does not delay samples.
+  while (running_.load()) {
+    MsgType type;
+    std::string payload;
+    absl::Status s = state.conn.sample_c2s.Read(&type, &payload);
+    if (!s.ok()) {
+      if (!absl::IsNotFound(s)) {
+        REVERB_LOG(REVERB_WARNING)
+            << "ShmServer: sample c2s read error for client " << client_id
+            << ": " << s;
+      }
+      return;
+    }
+    switch (type) {
+      case SAMPLE: {
+        ShmSampleRequest req;
+        if (!req.ParseFromString(payload)) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: malformed ShmSampleRequest from client "
+              << client_id;
+          break;
+        }
+        auto st = HandleSample(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleSample failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
+      case RELEASE: {
+        ShmReleaseRequest req;
+        if (!req.ParseFromString(payload)) break;
+        auto st = HandleRelease(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleRelease failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
+      case CLOSE:
+        state.close_requested = true;
+        return;
+      default:
         break;
     }
   }
 }
 
 void ShmServer::FlushOutbox(ClientState& state) {
-  absl::MutexLock lock(&state.outbox_mu);
-  while (!state.outbox.empty()) {
-    auto& [type, body] = state.outbox.front();
+  // Decision D: flush each flow's outbox to its own s2c ring so a full insert
+  // ring does not block sample responses (and vice versa).
+  absl::MutexLock ins_lock(&state.insert_outbox_mu);
+  while (!state.insert_outbox.empty()) {
+    auto& [type, body] = state.insert_outbox.front();
     absl::Status s =
-        state.conn.s2c.TryWrite(static_cast<MsgType>(type),
-                                absl::MakeSpan(body));
+        state.conn.insert_s2c.TryWrite(static_cast<MsgType>(type),
+                                       absl::MakeSpan(body));
     if (!s.ok()) {
       // Still full (or oversized) — leave the front in place and try again
       // next pass (§8.7). ponytail: a full outbox eventually backpressures via
       // pool exhaustion; v1 does not bound the outbox size. Upgrade:
       // ring-buffer + drop policy.
-      return;
+      break;
     }
-    state.outbox.erase(state.outbox.begin());
+    state.insert_outbox.erase(state.insert_outbox.begin());
+  }
+  absl::MutexLock smp_lock(&state.sample_outbox_mu);
+  while (!state.sample_outbox.empty()) {
+    auto& [type, body] = state.sample_outbox.front();
+    absl::Status s =
+        state.conn.sample_s2c.TryWrite(static_cast<MsgType>(type),
+                                       absl::MakeSpan(body));
+    if (!s.ok()) {
+      break;
+    }
+    state.sample_outbox.erase(state.sample_outbox.begin());
   }
 }
 
-absl::Status ShmServer::EnqueueS2C(ClientState& state, MsgType type,
-                                   absl::string_view body) {
-  // Non-blocking S→C write (spec §8.7 / ticket ⑥). TryWrite returns
-  // ResourceExhausted("RING_FULL") immediately when the S→C ring is full —
-  // we stash the message in the client's outbox and FlushOutbox retries each
-  // dispatch pass. A slow client's full S→C ring therefore no longer stalls
-  // the dispatch thread (the ③ deferred debt, now fixed).
-  absl::Status s = state.conn.s2c.TryWrite(type, absl::MakeSpan(body));
+absl::Status ShmServer::EnqueueInsertS2C(ClientState& state, MsgType type,
+                                         absl::string_view body) {
+  // Non-blocking write on the INSERT flow's s2c ring (spec §8.7). TryWrite
+  // returns ResourceExhausted("RING_FULL") immediately when full — we stash
+  // in insert_outbox and FlushOutbox retries each dispatch pass.
+  absl::Status s = state.conn.insert_s2c.TryWrite(type, absl::MakeSpan(body));
   if (s.ok()) return absl::OkStatus();
   if (!absl::IsResourceExhausted(s)) {
     return s;  // genuine error
   }
-  // Ring full (or oversized for the whole ring): stash for retry.
   {
-    absl::MutexLock lock(&state.outbox_mu);
-    state.outbox.emplace_back(static_cast<uint16_t>(type),
-                              std::string(body));
+    absl::MutexLock lock(&state.insert_outbox_mu);
+    state.insert_outbox.emplace_back(static_cast<uint16_t>(type),
+                                     std::string(body));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ShmServer::EnqueueSampleS2C(ClientState& state, MsgType type,
+                                         absl::string_view body) {
+  // Non-blocking write on the SAMPLE flow's s2c ring.
+  absl::Status s = state.conn.sample_s2c.TryWrite(type, absl::MakeSpan(body));
+  if (s.ok()) return absl::OkStatus();
+  if (!absl::IsResourceExhausted(s)) {
+    return s;
+  }
+  {
+    absl::MutexLock lock(&state.sample_outbox_mu);
+    state.sample_outbox.emplace_back(static_cast<uint16_t>(type),
+                                     std::string(body));
   }
   return absl::OkStatus();
 }
@@ -423,7 +513,7 @@ absl::Status ShmServer::HandleSample(ClientState& state,
     err.set_message(std::string(sample_status.message()));
     std::string body;
     err.SerializeToString(&body);
-    return EnqueueS2C(state, ERROR, body);
+    return EnqueueSampleS2C(state, ERROR, body);
   }
 
   // 2. Unpack each column on the dispatch thread (A1: single-threaded alloc).
@@ -498,7 +588,7 @@ absl::Status ShmServer::HandleSample(ClientState& state,
 
   std::string body;
   resp.SerializeToString(&body);
-  return EnqueueS2C(state, SAMPLE_RESP, body);
+  return EnqueueSampleS2C(state, SAMPLE_RESP, body);
 }
 
 absl::Status ShmServer::HandleRelease(ClientState& state,
@@ -525,7 +615,7 @@ absl::Status ShmServer::HandleAllocate(ClientState& state,
   resp.set_shm_offset(offset);
   std::string body;
   resp.SerializeToString(&body);
-  return EnqueueS2C(state, ALLOCATE_RESP, body);
+  return EnqueueInsertS2C(state, ALLOCATE_RESP, body);
 }
 
 absl::Status ShmServer::HandleInsert(ClientState& state,
@@ -586,8 +676,8 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
   for (uint64_t off : chunk_offsets) ack_template.add_offsets_to_release(off);
 
   // Collect the keys to ACK. We count outstanding items; when all complete,
-  // enqueue the aggregate ACK. ponytail: atomic counter + outbox push under
-  // outbox_mu; the dispatch thread is the sole reader/drainer.
+  // enqueue the aggregate ACK. ponytail: atomic counter + insert_outbox push
+  // under insert_outbox_mu; the dispatch thread is the sole reader/drainer.
   int num_items = req.items_size();
   if (num_items == 0) {
     // No items: still ack so the client can release the chunk offsets it
@@ -596,7 +686,7 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     InsertAck ack = ack_template;
     std::string body;
     ack.SerializeToString(&body);
-    return EnqueueS2C(state, INSERT_ACK, body);
+    return EnqueueInsertS2C(state, INSERT_ACK, body);
   }
 
   auto remaining = std::make_shared<std::atomic<int>>(num_items);
@@ -621,7 +711,7 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
         for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
         std::string body;
         ack.SerializeToString(&body);
-        REVERB_RETURN_IF_ERROR(EnqueueS2C(*state_ptr, INSERT_ACK, body));
+        REVERB_RETURN_IF_ERROR(EnqueueInsertS2C(*state_ptr, INSERT_ACK, body));
       }
       continue;
     }
@@ -654,12 +744,13 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
             for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
             std::string body;
             ack.SerializeToString(&body);
-            // EnqueueS2C writes to the ring directly (dispatch thread) or
-            // stashes in outbox on ResourceExhausted. Called off the dispatch
-            // thread, the direct write would race the dispatch thread's S→C
-            // producer. Route through the outbox unconditionally instead.
-            absl::MutexLock lock(&state_ptr->outbox_mu);
-            state_ptr->outbox.emplace_back(
+            // EnqueueInsertS2C writes to the ring directly (dispatch thread)
+            // or stashes in insert_outbox on ResourceExhausted. Called off the
+            // dispatch thread, the direct write would race the dispatch
+            // thread's S→C producer. Route through the outbox unconditionally
+            // instead.
+            absl::MutexLock lock(&state_ptr->insert_outbox_mu);
+            state_ptr->insert_outbox.emplace_back(
                 static_cast<uint16_t>(INSERT_ACK), std::move(body));
             // All inserts confirmed: drop the keepalive so the callbacks (and
             // what they capture) are reclaimed. This breaks the would-be
@@ -671,7 +762,7 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     // the callback AFTER HandleInsert returns, so the shared_ptr must outlive
     // this function. Stash it on the client; cleared by the last callback.
     {
-      absl::MutexLock lock(&state.outbox_mu);
+      absl::MutexLock lock(&state.insert_outbox_mu);
       state.pending_insert_callbacks.push_back(cb);
     }
 

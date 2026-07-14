@@ -81,9 +81,22 @@ message ShmAllocateRequest {
 
 message WelcomeResponse {
   string pool_shm_name = 1;
-  string c2s_shm_name = 2;
-  string s2c_shm_name = 3;
+  // Deprecated single-pair aliases (kept for external readers). v2 per-flow
+  // transport (decision D) splits into insert_* / sample_* below; these now
+  // mirror the SAMPLE flow rings so a legacy client still finds its rings.
+  string c2s_shm_name = 2 [deprecated = true];
+  string s2c_shm_name = 3 [deprecated = true];
   .deepmind.reverb.ServerInfoResponse server_info = 4;
+  // Per-flow rings (decision D): the insert flow (TrajectoryWriter) and the
+  // sample flow (ShmSampler) each get their OWN SPSC pair so their worker
+  // threads never share a producer/consumer on one ring. Each pair is still
+  // strict SPSC (single client-thread producer, single server-thread consumer
+  // and back) — restoring the invariant the single-pair design violated when
+  // both writers started background worker threads.
+  string insert_c2s_shm_name = 5;
+  string insert_s2c_shm_name = 6;
+  string sample_c2s_shm_name = 7;
+  string sample_s2c_shm_name = 8;
 }
 
 message InsertAck {

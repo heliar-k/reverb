@@ -92,15 +92,15 @@ TEST(ShmBytePoolEchoTest, ClientAllocatesViaRingThenReleases) {
     auto pool_s = ShmBytePool::Create(names.pool, kSlabs, kBlocksPerSlab);
     REVERB_ASSERT_OK(pool_s.status());
     ShmBytePool pool = std::move(pool_s).value();
-    auto c2s = Ring::Create(names.c2s, 16, 256);
+    auto c2s = Ring::Create(names.insert_c2s, 16, 256);
     REVERB_ASSERT_OK(c2s.status());
-    auto s2c = Ring::Create(names.s2c, 16, 256);
+    auto s2c = Ring::Create(names.insert_s2c, 16, 256);
     REVERB_ASSERT_OK(s2c.status());
 
     WelcomeResponse welcome;
     welcome.set_pool_shm_name(names.pool);
-    welcome.set_c2s_shm_name(names.c2s);
-    welcome.set_s2c_shm_name(names.s2c);
+    welcome.set_insert_c2s_shm_name(names.insert_c2s);
+    welcome.set_insert_s2c_shm_name(names.insert_s2c);
     REVERB_ASSERT_OK(SendWelcome(client_fd, welcome));
     close(client_fd);
 
@@ -164,9 +164,9 @@ TEST(ShmBytePoolEchoTest, ClientAllocatesViaRingThenReleases) {
   auto pool_co = ShmBytePool::Open(welcome.pool_shm_name());
   REVERB_ASSERT_OK(pool_co.status());
   ShmBytePool client_pool = std::move(pool_co).value();
-  auto c2s = Ring::Open(welcome.c2s_shm_name());
+  auto c2s = Ring::Open(welcome.insert_c2s_shm_name());
   REVERB_ASSERT_OK(c2s.status());
-  auto s2c = Ring::Open(welcome.s2c_shm_name());
+  auto s2c = Ring::Open(welcome.insert_s2c_shm_name());
   REVERB_ASSERT_OK(s2c.status());
 
   // 1. Ask the server for an offset (C4: client never self-allocates).
