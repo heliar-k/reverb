@@ -1,4 +1,4 @@
-# Description: Reverb SHM transport benchmarks (ticket ⑦).
+# Description: Reverb client benchmarks.
 
 load(
     "//reverb/cc/platform:build_rules.bzl",
@@ -13,13 +13,12 @@ package(
 
 licenses(["notice"])
 
-# ponytail: plain py_binary (not reverb_py_test) so `bazel run` produces a
-# runnable script. Mirrors the shm_test deps (//reverb pulls pybind + the full
-# client/server surface); portpicker is needed for the gRPC loopback transport.
+# Unified benchmark: sample, insert, and pipeline paths across all transports.
+# Usage: bazel run //reverb/benchmarks:client_benchmark -- --quick
 py_binary(
-    name = "shm_benchmark",
-    srcs = ["shm_benchmark.py"],
-    main = "shm_benchmark.py",
+    name = "client_benchmark",
+    srcs = ["client_benchmark.py"],
+    main = "client_benchmark.py",
     deps = reverb_py_standard_imports() + [
         "//reverb",
     ],
