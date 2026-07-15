@@ -558,7 +558,15 @@ void TrajectoryWriter::OnReadDone(bool ok) {
   absl::MutexLock lock(mu_);
   data_cv_.Signal();
   if (!ok) {
+    // BUGFIX: a failed gRPC read kills the stream but previously left both
+    // unrecoverable_status_ and stream_status_ as OK, so FlushLocked's await
+    // condition (which only checked unrecoverable_status_) never became true
+    // -> permanent deadlock. Record the failure so FlushLocked can return a
+    // real error and wake up.
     stream_ok_ = false;
+    if (stream_status_.ok()) {
+      stream_status_ = absl::InternalError("TrajectoryWriter stream read failed");
+    }
     return;
   }
   for (uint64_t key : response_.keys()) {
@@ -572,7 +580,12 @@ void TrajectoryWriter::OnWriteDone(bool ok) {
   if (ok) {
     write_inflight_ = false;
   } else {
+    // BUGFIX: same deadlock class as OnReadDone — a failed write kills the
+    // stream but left no status behind for FlushLocked to return.
     stream_ok_ = false;
+    if (stream_status_.ok()) {
+      stream_status_ = absl::InternalError("TrajectoryWriter stream write failed");
+    }
   }
 }
 
@@ -1347,9 +1360,20 @@ absl::Status TrajectoryWriter::FlushLocked(int ignore_last_num_items,
   // The write worker is now able to send  (at least) all but the last
   // `ignore_last_num_items` items to the server. We release the mutex and wait
   // for the items to be confirmed or the TrajectoryWriter to be closed.
+  //
+  // BUGFIX: also break out when the worker has died (stream_ok_ == false).
+  // The SHM/local worker can exit with items still in write_queue_/
+  // in_flight_items_ (e.g. an unhandled error path that sets stream_ok_=false
+  // without surfacing via unrecoverable_status_, or a transport close). Without
+  // this check, Flush would wait forever for a worker that no longer exists —
+  // the 4.5h hang. stream_ok_ stays true on the normal closed_&&empty path, so
+  // this does not fire on graceful shutdown.
   auto cond = [ignore_last_num_items, this]()
                   ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) -> bool {
     if (!unrecoverable_status_.ok()) {
+      return true;
+    }
+    if (!stream_ok_) {
       return true;
     }
     return write_queue_.size() + in_flight_items_.size() <=
@@ -1363,6 +1387,12 @@ absl::Status TrajectoryWriter::FlushLocked(int ignore_last_num_items,
                      in_flight_items_.size(), " items awaiting confirmation."));
   }
 
+  // If the worker died without setting unrecoverable_status_, surface the
+  // stream_status_ (the per-error reason) so callers see a real error instead
+  // of a silent OK.
+  if (!stream_ok_) {
+    return stream_status_;
+  }
   return unrecoverable_status_;
 }
 

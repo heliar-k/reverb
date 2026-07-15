@@ -215,10 +215,15 @@ void ShmServer::DispatchLoop() {
     for (auto it = dead.rbegin(); it != dead.rend(); ++it) {
       HandleDisconnect(*it);
     }
-    // ponytail: sched_yield keeps the loop hot without pegging a core. A
-    // blocking poll on all ring fds would be cheaper CPU but needs eventfd
-    // plumbing per ring; not worth it for v1 dispatch throughput.
+    // ponytail: yield + short sleep instead of bare sched_yield. A bare
+    // sched_yield does NOT release the core when no other thread is runnable
+    // (the common idle case), so the dispatch loop pegged a core at ~100% CPU
+    // spinning on poll(timeout=0) — this was the 98% CPU seen in the hang.
+    // The 50us sleep releases the core; vs ring ops costing hundreds of us the
+    // latency cost is negligible. A blocking poll on all ring fds would be
+    // cheaper still but needs eventfd plumbing per ring (upgrade).
     sched_yield();
+    usleep(50);
   }
 }
 
