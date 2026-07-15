@@ -1,12 +1,8 @@
-[tool.ruff]
 line-length = 88
 target-version = "py38"
-exclude = [
-    "bazel-*",
-    "third_party",
-]
+exclude = ["bazel-*", "third_party"]
 
-[tool.ruff.lint]
+[lint]
 # E/W  = pycodestyle (flake8 defaults)
 # F    = pyflakes (unused imports, undefined names)
 # I    = isort (import ordering)
@@ -15,14 +11,14 @@ exclude = [
 # (UP/pyupgrade excluded: its PEP 604 annotations `X | None` require py3.10+, but this project targets py3.8 — see target-version above.)
 select = ["E", "W", "F", "I", "B", "SIM"]
 ignore = [
-    "E501",  # line too long — formatter handles wrapping; lint flagging is noise
-    "E731",  # lambda assignment — readable, common in this codebase
-    "SIM112", # env var capitalization — build scripts read externally-defined names
-    "B017",   # assertRaises(Exception) — tests intentionally assert any exception
-    "B024",   # abstract base class without abstract methods — existing RateLimiter design
+  "E501",   # line too long — formatter handles wrapping; lint flagging is noise
+  "E731",   # lambda assignment — readable, common in this codebase
+  "SIM112", # env var capitalization — build scripts read externally-defined names
+  "B017",   # assertRaises(Exception) — tests intentionally assert any exception
+  "B024",   # abstract base class without abstract methods — existing RateLimiter design
 ]
 
-[tool.ruff.lint.per-file-ignores]
+[lint.per-file-ignores]
 # Test/example files may legitimately use unused imports or assertions.
 "**/test_*.py" = ["F401", "F841"]
 "examples/**/*.py" = ["B007", "F401", "E402"]
@@ -38,6 +34,6 @@ ignore = [
 # configure.py is a legacy setup script using cross-scope file handles.
 "configure.py" = ["SIM115"]
 
-[tool.ruff.format]
+[format]
 quote-style = "double"
 indent-style = "space"

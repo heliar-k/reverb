@@ -6,5 +6,11 @@ repos:
     rev: v0.15.20
     hooks:
       - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
+        args: [--fix, --exit-non-zero-on-fix, --config, ruff.toml]
       - id: ruff-format
+        args: [--config, ruff.toml]
+
+  - repo: https://github.com/ComPWA/taplo-pre-commit
+    rev: v0.9.3
+    hooks:
+      - id: taplo-format
