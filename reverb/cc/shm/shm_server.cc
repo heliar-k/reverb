@@ -645,7 +645,14 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     }
     // ChunkStore::Chunk owns a copy of the ChunkData proto. Multiple items
     // may reference the same chunk_key; dedup so storage is shared.
-    chunks.try_emplace(cd.chunk_key(),
+    // ponytail: 必须先取 key 再 std::move(cd)。try_emplace(key, factory)
+    // 的实参求值顺序未指定(unspecified): gcc 可能先求值
+    // make_shared<Chunk>(std::move(cd)) 移动掉 cd,再求值 key 参数,此时
+    // cd.chunk_key() 读到被移动后的默认值 0,导致 map 以 0 为键插入,
+    // 随后 items.flat_trajectory 的真实 chunk_key 查不到 -> "unknown chunk"。
+    // clang(lld 链路的旧 hermetic cc)恰好先求值 key 故不触发。系统 gcc 必修。
+    uint64_t map_key = cd.chunk_key();
+    chunks.try_emplace(map_key,
                        std::make_shared<ChunkStore::Chunk>(std::move(cd)));
   }
 
