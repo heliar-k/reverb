@@ -4,19 +4,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 # ponytail: bzlmod Step 3-4. 删除 @org_tensorflow(453MB)+ tf_workspace0-3 +
 # @local_xla,原生 http_archive 注册 reverb 闭包实际需要的 C++ 依赖。
-# rules_ml_toolchain 提供 hermetic C++ 工具链(.bazelrc
-# --@rules_ml_toolchain//common:enable_hermetic_cc=True),保留其 cc_toolchain_deps
-# + toolchain 注册 + cuda/nccl/nvshmem 初始化链(reverb 不用 GPU 但工具链 BUILD
-# 可能引用 @cuda_redist_json,故保留)。
-
-http_archive(
-    name = "rules_ml_toolchain",
-    sha256 = "fc1292463a0ae26bd4b3dc8ffda6e12dc5fc68b432005fb97d2c4cbfe2fa6cea",
-    strip_prefix = "rules_ml_toolchain-96700b0ef73efb569ecb2509d15ea3d341bd53fd",
-    urls = [
-        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/96700b0ef73efb569ecb2509d15ea3d341bd53fd.tar.gz",
-    ],
-)
+# ponytail: @rules_ml_toolchain(hermetic C++ 工具链 + CUDA/NCCL/NVSHMEM 链)已移除
+# ——reverb 纯 CPU C++,改用 Bazel 内置 @local_config_cc(系统 gcc/clang)。
+# 见 .bazelrc 的 noincompatible_enable_cc_toolchain_resolution。
 
 http_archive(
     name = "rules_shell",
@@ -314,87 +304,7 @@ load("@com_github_grpc_grpc//bazel:grpc_extra_deps.bzl", "grpc_extra_deps")
 
 grpc_extra_deps()
 
-# rules_ml_toolchain hermetic C++ 工具链:cc_toolchain_deps 下载 sysroot/llvm,
-# register_toolchains 注册各平台工具链。table_test/sampler_test linkopts 引用
-# external/sysroot_linux_x86_64_glibc_2_27,故必须运行。
-load("@rules_ml_toolchain//cc/deps:cc_toolchain_deps.bzl", "cc_toolchain_deps")
-
-cc_toolchain_deps()
-
-register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64")
-
-register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
-
-register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
-
-register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64_cuda")
-
-# CUDA/NCCL/NVSHMEM 初始化:reverb 不用 GPU,但 rules_ml_toolchain 的 cuda 工具链
-# BUILD 可能引用 @cuda_redist_json,且 .bazelrc enable_hermetic_cc=True,保留以避免
-# 分析期 missing-repo 错误。
-load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_json_init_repository.bzl",
-    "cuda_json_init_repository",
-)
-
-cuda_json_init_repository()
-
-load(
-    "@cuda_redist_json//:distributions.bzl",
-    "CUDA_REDISTRIBUTIONS",
-    "CUDNN_REDISTRIBUTIONS",
-)
-load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_redist_init_repositories.bzl",
-    "cuda_redist_init_repositories",
-    "cudnn_redist_init_repository",
-)
-
-cuda_redist_init_repositories(
-    cuda_redistributions = CUDA_REDISTRIBUTIONS,
-)
-
-cudnn_redist_init_repository(
-    cudnn_redistributions = CUDNN_REDISTRIBUTIONS,
-)
-
-load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_configure.bzl",
-    "cuda_configure",
-)
-
-cuda_configure(name = "local_config_cuda")
-
-load(
-    "@rules_ml_toolchain//third_party/nccl/hermetic:nccl_redist_init_repository.bzl",
-    "nccl_redist_init_repository",
-)
-
-nccl_redist_init_repository()
-
-load(
-    "@rules_ml_toolchain//third_party/nccl/hermetic:nccl_configure.bzl",
-    "nccl_configure",
-)
-
-nccl_configure(name = "local_config_nccl")
-
-load(
-    "@rules_ml_toolchain//third_party/nvshmem/hermetic:nvshmem_json_init_repository.bzl",
-    "nvshmem_json_init_repository",
-)
-
-nvshmem_json_init_repository()
-
-load(
-    "@nvshmem_redist_json//:distributions.bzl",
-    "NVSHMEM_REDISTRIBUTIONS",
-)
-load(
-    "@rules_ml_toolchain//third_party/nvshmem/hermetic:nvshmem_redist_init_repository.bzl",
-    "nvshmem_redist_init_repository",
-)
-
-nvshmem_redist_init_repository(
-    nvshmem_redistributions = NVSHMEM_REDISTRIBUTIONS,
-)
+# ponytail: @rules_ml_toolchain hermetic C++ 工具链 + CUDA/NCCL/NVSHMEM 初始化链
+# 已移除。reverb 纯 CPU C++,改用 Bazel 内置 @local_config_cc(系统 gcc/clang)。
+# 原 table_test/sampler_test linkopts 引用的 external/sysroot_linux_x86_64_glibc_2_27
+# libc_nonshared.a 已改为系统路径(见 reverb/cc/BUILD)。

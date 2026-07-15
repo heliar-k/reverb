@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 生成 reverb C++ 行覆盖率报告(clang source-based coverage)。
 #
-# 背景:bazel coverage 在 hermetic cc toolchain 下遇 rules_ml_toolchain 的
-# startup_libs 缺失 bug,故手动用 -fprofile-instr-generate/-fcoverage-mapping
-# 插桩,跑测试拿 profraw,再 llvm-profdata merge + llvm-cov export。
+# 背景:reverb 用 clang source-based coverage(-fprofile-instr-generate/
+# -fcoverage-mapping)而非 `bazel coverage`。手动插桩构建→跑测试拿 profraw→
+# llvm-profdata merge + llvm-cov export。
 #
 # 用法:
 #   scripts/coverage.sh                  # 跑全量 C++ 测试,生成 lcov
@@ -11,7 +11,9 @@
 #   scripts/coverage.sh --html           # 额外生成 HTML 报告
 #
 # 产出:/tmp/reverb_cov/coverage.lcov (+ coverage.html/ 若 --html)
-# 依赖:hermetic clang 自带的 llvm-profdata/llvm-cov(bazel external 里)
+# 依赖:系统 llvm 的 llvm-profdata/llvm-cov(`apt install llvm`)。
+# ponytail: 原依赖 hermetic llvm18(bazel external,随 rules_ml_toolchain 拉入),
+# 去 rules_ml_toolchain 后改用系统 llvm。
 
 set -euo pipefail
 
@@ -22,12 +24,17 @@ GEN_HTML=false
 OUTDIR=/tmp/reverb_cov
 rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
 
-# 定位 hermetic clang 的 llvm 工具(在 bazel external 缓存里)
-LLVMBIN=$(find /home/guankai1/.cache/bazel/_bazel_guankai1/*/external \
-  -name llvm-cov -type f -path "*llvm18*bin*" 2>/dev/null | head -1 | xargs dirname)
+# 定位 llvm 工具:优先系统 PATH,其次 /usr/lib/llvm-*/bin
+# ponytail: 去 rules_ml_toolchain 后不再有 bazel external llvm18。
+LLVMBIN=""
+if command -v llvm-profdata >/dev/null 2>&1; then
+  LLVMBIN=$(dirname $(command -v llvm-profdata))
+elif ls /usr/lib/llvm-*/bin/llvm-profdata >/dev/null 2>&1; then
+  LLVMBIN=$(ls -d /usr/lib/llvm-*/bin | tail -1)
+fi
 if [[ -z "$LLVMBIN" || ! -x "$LLVMBIN/llvm-profdata" ]]; then
-  echo "ERROR: 找不到 hermetic llvm-profdata/llvm-cov" >&2
-  echo "先跑一次 bazel build 让 bazel 解压 llvm18 external" >&2
+  echo "ERROR: 找不到 llvm-profdata/llvm-cov" >&2
+  echo "装系统 llvm: apt install llvm" >&2
   exit 1
 fi
 export PATH="$LLVMBIN:$PATH"

@@ -56,7 +56,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunk_store",
@@ -91,7 +91,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":tensor_compression",
@@ -116,7 +116,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunk_store",
@@ -257,7 +257,7 @@ cc_library(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunk_store",
@@ -458,7 +458,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",
@@ -484,11 +484,11 @@ cc_test(
     name = "trajectory_writer_test",
     srcs = ["trajectory_writer_test.cc"],
     # ponytail: :trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy
-    # C-API), 需链接 libpython 解析 Py* 符号。host libpython 依赖 sysroot libc_nonshared。
+    # C-API), 需链接 libpython 解析 Py* 符号。host libpython 需链接 libc_nonshared.a(atexit 等非共享符号)。
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",
@@ -520,7 +520,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",
@@ -563,7 +563,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",
@@ -602,7 +602,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":reverb_service_impl",
@@ -664,11 +664,11 @@ cc_test(
     srcs = ["chunker_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :chunker -> :tensor_proxy(pybind11/numpy C-API),
-    # 需链接 libpython 解析 Py* 符号。host libpython 依赖 sysroot libc_nonshared。
+    # 需链接 libpython 解析 Py* 符号。host libpython 需链接 libc_nonshared.a(atexit 等非共享符号)。
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",
@@ -861,7 +861,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":chunker",

@@ -151,7 +151,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":signature",
@@ -249,7 +249,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":trajectory_util",
@@ -295,13 +295,13 @@ cc_test(
     srcs = ["tensor_proxy_test.cc"],
     copts = ["-Wno-sign-compare"],
     # 嵌入解释器需链接 libpython;系统 Python 3.10(numpy 1.23.5 基于此构建)
-    # ponytail: host libpython 依赖 host libc,但 bazel sysroot(glibc 2.27) 的
-    # Scrt1.o 需 __libc_csu_init(在 sysroot libc_nonshared.a 内)。host -L 会错误地
-    # 解析到 host libc_nonshared.a(无 csu 符号),故用 sysroot 绝对路径显式提供。
+    # ponytail: 去 hermetic sysroot 后用系统 libc_nonshared.a(glibc 2.35 的
+    # Scrt1.o 已不再引用 __libc_csu_init,但保留 libc_nonshared.a 供 atexit/
+    # pthread_atfork 等非共享符号)。
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":tensor_proxy",

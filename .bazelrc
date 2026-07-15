@@ -27,19 +27,27 @@ common --define tsl_protobuf_header_only=true
 common --incompatible_default_to_explicit_init_py
 common --enable_platform_specific_config
 
-common --incompatible_enable_cc_toolchain_resolution
-common --@rules_ml_toolchain//common:enable_hermetic_cc=True
-common --repo_env USE_HERMETIC_CC_TOOLCHAIN=1
+# ponytail: 去 rules_ml_toolchain hermetic C++ 工具链(7.1G llvm18 + sysroot +
+# CUDA/NCCL/NVSHMEM 链,reverb 纯 CPU C++ 不需要,且是 TF 遗产)。改用 Bazel 内置
+# @local_config_cc(系统 gcc/clang)——即原 --config=clang_local 的工具链路径。
+# incompatible_enable_cc_toolchain_resolution=False 让 Bazel 回退到 autoconf 的
+# local_config_cc,不再走 platform-based 工具链解析(那需要 rules_ml_toolchain 注册)。
+common --noincompatible_enable_cc_toolchain_resolution
+
+# ponytail: cc_test 默认静态链接。系统 gcc/ld.gold 在 cc_shared_library(libreverb)
+# 的动态依赖路径下会丢失符号(tensor_proxy.o 不被拉入 test binary,lld 不受影响)。
+# --dynamic_mode=off 强制 cc_test 静态链依赖,规避该 gold bug。libreverb/pybind
+# 仍按 cc_shared_library 正常产出 .so。
+test --dynamic_mode=off
 
 # Print a stacktrace when a test is killed
 test --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1"
 test --test_output=errors
 
-# Coverage: 用 scripts/coverage.sh 而非 `bazel coverage`。原因:hermetic cc
-# toolchain (@rules_ml_toolchain) 在 coverage 模式下缺失 startup_libs 输入,
-# 导致 `bazel coverage` 报 "missing input file" 错误。脚本改用手动 clang
-# source-based coverage(-fprofile-instr-generate/-fcoverage-mapping)+
-# llvm-profdata/llvm-cov(复用 bazel external 里的 llvm18 工具)绕开。
+# Coverage: 用 scripts/coverage.sh 而非 `bazel coverage`。原 hermetic cc 工具链
+# 已移除,但 scripts/coverage.sh 仍用手动 clang source-based coverage
+# (-fprofile-instr-generate/-fcoverage-mapping)+ llvm-profdata/llvm-cov
+# (现用系统 llvm,路径见 scripts/coverage.sh)。
 common:coverage --experimental_use_llvm_covmap
 common:coverage --copt=-fprofile-instr-generate
 common:coverage --copt=-fcoverage-mapping
@@ -61,16 +69,17 @@ test --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1"
 # of defines when using tf's headers.  In particular in refcount.h.
 # common --cxxopt="-DNDEBUG"
 
+# ponytail: clang_local 原本用来切回系统工具链(关闭 hermetic cc)。现在默认
+# 已是系统工具链(noincompatible_enable_cc_toolchain_resolution),此 config 保留
+# 仅为兼容既有调用(oss_build / macos config),flags 与默认一致。
 common:clang_local --noincompatible_enable_cc_toolchain_resolution
 common:clang_local --noincompatible_enable_android_toolchain_resolution
-common:clang_local --@rules_ml_toolchain//common:enable_hermetic_cc=False
-common:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 
 common:apple-toolchain --apple_crosstool_top=@local_config_apple_cc//:toolchain
 common:apple-toolchain --crosstool_top=@local_config_apple_cc//:toolchain
 common:apple-toolchain --host_crosstool_top=@local_config_apple_cc//:toolchain
 
-common:linux --linkopt="-lrt -lm"
+common:linux --linkopt=-lrt --linkopt=-lm
 
 common:macos --linkopt="-Wl,-undefined,dynamic_lookup"
 common:macos --config=clang_local

@@ -206,7 +206,7 @@ cc_test(
     linkopts = [
         "-L/usr/lib/x86_64-linux-gnu",
         "-lpython3.10",
-        "external/sysroot_linux_x86_64_glibc_2_27/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
+        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
     ],
     deps = [
         ":simple_checkpointer",
