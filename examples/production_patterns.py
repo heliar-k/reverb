@@ -53,10 +53,10 @@ def example_1_queue_and_buffer():
     server = reverb.Server(
         tables=[
             # A FIFO queue: sample once, then remove.
-            reverb.Table.queue(name='my_queue', max_size=1000),
+            reverb.Table.queue(name="my_queue", max_size=1000),
             # A circular buffer: uniform sample, FIFO remove, resampleable.
             reverb.Table(
-                name='my_buffer',
+                name="my_buffer",
                 sampler=reverb.selectors.Uniform(),
                 remover=reverb.selectors.Fifo(),
                 max_size=1000,
@@ -73,34 +73,40 @@ def example_1_queue_and_buffer():
         # Insert into both tables.
         with client.trajectory_writer(num_keep_alive_refs=3) as writer:
             for i in range(3):
-                writer.append({'v': np.array([i], dtype=np.float32)})
+                writer.append({"v": np.array([i], dtype=np.float32)})
 
             # Queue: item will be removed after one sample.
             writer.create_item(
-                table='my_queue', priority=1.0,
-                trajectory={'v': writer.history['v'][-1:]},
+                table="my_queue",
+                priority=1.0,
+                trajectory={"v": writer.history["v"][-1:]},
             )
             # Buffer: items can be sampled multiple times.
             writer.create_item(
-                table='my_buffer', priority=1.0,
-                trajectory={'v': writer.history['v'][-1:]},
+                table="my_buffer",
+                priority=1.0,
+                trajectory={"v": writer.history["v"][-1:]},
             )
             writer.flush()
 
         # Sample from queue: items removed after sampling.
-        q_samples = list(client.sample('my_queue', num_samples=1,
-                                        emit_timesteps=False))
+        q_samples = list(client.sample("my_queue", num_samples=1, emit_timesteps=False))
         print(f"  Queue sampled: {np.asarray(q_samples[0].data[0])}")
-        print(f"  Queue size after sample: "
-              f"{client.server_info()['my_queue'].current_size}")
+        print(
+            f"  Queue size after sample: "
+            f"{client.server_info()['my_queue'].current_size}"
+        )
 
         # Circular buffer: items remain.
         for _ in range(2):
-            b_samples = list(client.sample('my_buffer', num_samples=1,
-                                           emit_timesteps=False))
+            b_samples = list(
+                client.sample("my_buffer", num_samples=1, emit_timesteps=False)
+            )
             print(f"  Buffer sampled: {np.asarray(b_samples[0].data[0])}")
-        print(f"  Buffer size after 2 samples: "
-              f"{client.server_info()['my_buffer'].current_size}")
+        print(
+            f"  Buffer size after 2 samples: "
+            f"{client.server_info()['my_buffer'].current_size}"
+        )
 
     finally:
         server.stop()
@@ -119,7 +125,7 @@ def example_2_stack():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.stack(name='my_stack', max_size=100)],
+        tables=[reverb.Table.stack(name="my_stack", max_size=100)],
         in_process=True,
     )
 
@@ -128,17 +134,19 @@ def example_2_stack():
 
         with client.trajectory_writer(num_keep_alive_refs=3) as writer:
             for i in range(3):
-                writer.append({'v': np.array([i], dtype=np.float32)})
+                writer.append({"v": np.array([i], dtype=np.float32)})
                 writer.create_item(
-                    table='my_stack', priority=1.0,
-                    trajectory={'v': writer.history['v'][-1:]},
+                    table="my_stack",
+                    priority=1.0,
+                    trajectory={"v": writer.history["v"][-1:]},
                 )
             writer.flush()
 
         # LIFO: newest first.
         for _ in range(3):
-            sample = next(client.sample('my_stack', num_samples=1,
-                                        emit_timesteps=False))
+            sample = next(
+                client.sample("my_stack", num_samples=1, emit_timesteps=False)
+            )
             print(f"  Popped: {np.asarray(sample.data[0]).reshape(-1)[0]:.0f}")
 
     finally:
@@ -161,7 +169,7 @@ def example_3_sample_to_insert_ratio():
     server = reverb.Server(
         tables=[
             reverb.Table(
-                name='my_table',
+                name="my_table",
                 sampler=reverb.selectors.Uniform(),
                 remover=reverb.selectors.Fifo(),
                 max_size=1000,
@@ -180,19 +188,30 @@ def example_3_sample_to_insert_ratio():
 
         # Sampling before min_size_to_sample is reached blocks, then times out.
         try:
-            next(client.sample('my_table', num_samples=1, timeout_ms=200,
-                               emit_timesteps=False))
+            next(
+                client.sample(
+                    "my_table", num_samples=1, timeout_ms=200, emit_timesteps=False
+                )
+            )
         except reverb.errors.DeadlineExceededError:
-            print('  Blocked as expected: not enough items yet')
+            print("  Blocked as expected: not enough items yet")
 
         # Now insert enough items and sample successfully.
         with client.trajectory_writer(num_keep_alive_refs=3) as writer:
             for i in range(3):
-                writer.append({'v': np.array([i], dtype=np.float32)})
-                writer.create_item(table='my_table', priority=1.0, trajectory={'v': writer.history['v'][-1:]})
+                writer.append({"v": np.array([i], dtype=np.float32)})
+                writer.create_item(
+                    table="my_table",
+                    priority=1.0,
+                    trajectory={"v": writer.history["v"][-1:]},
+                )
             writer.flush()
-        sample = next(client.sample('my_table', num_samples=1, emit_timesteps=False, timeout_ms=500))
-        print(f'  Sampled successfully after inserts: {np.asarray(sample.data[0])}')
+        sample = next(
+            client.sample(
+                "my_table", num_samples=1, emit_timesteps=False, timeout_ms=500
+            )
+        )
+        print(f"  Sampled successfully after inserts: {np.asarray(sample.data[0])}")
 
     finally:
         server.stop()
@@ -213,7 +232,7 @@ def example_4_backpressure():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='q', max_size=100)],
+        tables=[reverb.Table.queue(name="q", max_size=100)],
         in_process=True,
     )
 
@@ -222,10 +241,11 @@ def example_4_backpressure():
 
         with client.trajectory_writer(num_keep_alive_refs=10) as writer:
             for i in range(20):
-                writer.append({'v': np.array([i], dtype=np.float32)})
+                writer.append({"v": np.array([i], dtype=np.float32)})
                 writer.create_item(
-                    table='q', priority=1.0,
-                    trajectory={'v': writer.history['v'][-1:]},
+                    table="q",
+                    priority=1.0,
+                    trajectory={"v": writer.history["v"][-1:]},
                 )
 
                 # Block if more than 5 items are still in-flight.
@@ -261,7 +281,7 @@ def example_5_append_sequence():
     # performance is critical.
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='q', max_size=100)],
+        tables=[reverb.Table.queue(name="q", max_size=100)],
         in_process=True,
     )
 
@@ -272,25 +292,30 @@ def example_5_append_sequence():
         # is also available on the gRPC Client's Writer).
         with client.writer(max_sequence_length=10) as writer:
             # Batch of 5 observations, each shape (4,).
-            batch_obs = np.array([
-                [1.0, 2.0, 3.0, 4.0],
-                [5.0, 6.0, 7.0, 8.0],
-                [9.0, 10.0, 11.0, 12.0],
-                [13.0, 14.0, 15.0, 16.0],
-                [17.0, 18.0, 19.0, 20.0],
-            ], dtype=np.float32)
+            batch_obs = np.array(
+                [
+                    [1.0, 2.0, 3.0, 4.0],
+                    [5.0, 6.0, 7.0, 8.0],
+                    [9.0, 10.0, 11.0, 12.0],
+                    [13.0, 14.0, 15.0, 16.0],
+                    [17.0, 18.0, 19.0, 20.0],
+                ],
+                dtype=np.float32,
+            )
             batch_act = np.array([[0], [1], [0], [1], [0]], dtype=np.int64)
 
             # Append all 5 steps at once.
             writer.append_sequence([batch_obs, batch_act])
 
             # Create items referencing slices of the buffer.
-            writer.create_item('q', num_timesteps=3, priority=1.0)
-            writer.create_item('q', num_timesteps=5, priority=1.0)
+            writer.create_item("q", num_timesteps=3, priority=1.0)
+            writer.create_item("q", num_timesteps=5, priority=1.0)
             writer.flush()
 
-        for sample in client.sample('q', num_samples=2, emit_timesteps=False):
-            obs = np.asarray(sample.data[1])  # Columns returned in alphabetical order by key name: 'action' (index 0), 'obs' (index 1).
+        for sample in client.sample("q", num_samples=2, emit_timesteps=False):
+            obs = np.asarray(
+                sample.data[1]
+            )  # Columns returned in alphabetical order by key name: 'action' (index 0), 'obs' (index 1).
             print(f"  obs shape: {obs.shape}")
 
     finally:
@@ -314,7 +339,7 @@ def example_6_delta_encoding():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='q', max_size=100)],
+        tables=[reverb.Table.queue(name="q", max_size=100)],
         in_process=True,
     )
 
@@ -334,10 +359,10 @@ def example_6_delta_encoding():
                 frame = base_frame.copy()
                 frame[i, i] = 200  # small change
                 writer.append([frame])
-                writer.create_item('q', num_timesteps=1, priority=1.0)
+                writer.create_item("q", num_timesteps=1, priority=1.0)
             writer.flush()
 
-        for sample in client.sample('q', num_samples=3, emit_timesteps=False):
+        for sample in client.sample("q", num_samples=3, emit_timesteps=False):
             print(f"  frame shape: {np.asarray(sample.data[0]).shape}")
 
     finally:
@@ -358,17 +383,17 @@ def example_7_direct_insert():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='q', max_size=100)],
+        tables=[reverb.Table.queue(name="q", max_size=100)],
         in_process=True,
     )
 
     try:
         client = server.in_process_client
         client.insert(
-            {'obs': np.zeros(4, dtype=np.float32)},
-            priorities={'q': 1.0},
+            {"obs": np.zeros(4, dtype=np.float32)},
+            priorities={"q": 1.0},
         )
-        sample = next(client.sample('q', num_samples=1, emit_timesteps=False))
+        sample = next(client.sample("q", num_samples=1, emit_timesteps=False))
         print(f"  Sampled: {np.asarray(sample.data[0])}")
 
     finally:
@@ -388,7 +413,7 @@ def example_8_reset():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='q', max_size=100)],
+        tables=[reverb.Table.queue(name="q", max_size=100)],
         in_process=True,
     )
 
@@ -396,10 +421,10 @@ def example_8_reset():
         client = server.in_process_client
 
         # Insert some data.
-        client.insert(np.zeros(4, dtype=np.float32), priorities={'q': 1.0})
+        client.insert(np.zeros(4, dtype=np.float32), priorities={"q": 1.0})
         print(f"  Before reset: {client.server_info()['q'].current_size}")
 
-        client.reset('q')
+        client.reset("q")
         print(f"  After reset:  {client.server_info()['q'].current_size}")
 
     finally:
@@ -420,7 +445,7 @@ def example_9_rate_limiter_queries():
 
     # Using a standalone Table for demonstration (no Server needed).
     table = reverb.Table(
-        name='test',
+        name="test",
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
         max_size=10,
@@ -444,7 +469,7 @@ def example_10_table_replace():
     print("=" * 60)
 
     original = reverb.Table(
-        name='original',
+        name="original",
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
         max_size=100,
@@ -453,7 +478,7 @@ def example_10_table_replace():
 
     # Override only the sampler and name.
     cloned = original.replace(
-        name='cloned',
+        name="cloned",
         sampler=reverb.selectors.Prioritized(0.8),
     )
 
@@ -479,5 +504,5 @@ def main():
     print("All examples passed.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

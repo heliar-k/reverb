@@ -20,30 +20,29 @@ from reverb import errors
 
 
 class ErrorsTest(absltest.TestCase):
+    def test_reverb_error_is_exception(self):
+        self.assertTrue(issubclass(errors.ReverbError, Exception))
 
-  def test_reverb_error_is_exception(self):
-    self.assertTrue(issubclass(errors.ReverbError, Exception))
+    def test_deadline_exceeded_is_reverb_error(self):
+        self.assertTrue(issubclass(errors.DeadlineExceededError, errors.ReverbError))
 
-  def test_deadline_exceeded_is_reverb_error(self):
-    self.assertTrue(issubclass(errors.DeadlineExceededError, errors.ReverbError))
+    def test_reverb_error_raisable(self):
+        with self.assertRaises(errors.ReverbError):
+            raise errors.ReverbError("boom")
 
-  def test_reverb_error_raisable(self):
-    with self.assertRaises(errors.ReverbError):
-      raise errors.ReverbError('boom')
+    def test_deadline_exceeded_raisable_as_reverb_error(self):
+        # DeadlineExceededError must be catchable as the base ReverbError.
+        with self.assertRaises(errors.ReverbError):
+            raise errors.DeadlineExceededError("timeout")
 
-  def test_deadline_exceeded_raisable_as_reverb_error(self):
-    # DeadlineExceededError must be catchable as the base ReverbError.
-    with self.assertRaises(errors.ReverbError):
-      raise errors.DeadlineExceededError('timeout')
+    def test_deadline_exceeded_raisable_as_itself(self):
+        with self.assertRaises(errors.DeadlineExceededError):
+            raise errors.DeadlineExceededError("timeout")
 
-  def test_deadline_exceeded_raisable_as_itself(self):
-    with self.assertRaises(errors.DeadlineExceededError):
-      raise errors.DeadlineExceededError('timeout')
-
-  def test_message_preserved(self):
-    err = errors.DeadlineExceededError('timed out after 5s')
-    self.assertIn('timed out', str(err))
+    def test_message_preserved(self):
+        err = errors.DeadlineExceededError("timed out after 5s")
+        self.assertIn("timed out", str(err))
 
 
-if __name__ == '__main__':
-  absltest.main()
+if __name__ == "__main__":
+    absltest.main()

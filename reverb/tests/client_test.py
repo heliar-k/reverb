@@ -19,16 +19,19 @@ import multiprocessing.dummy as multithreading
 import pickle
 import time
 
-from absl.testing import absltest
 import numpy as np
 import portpicker
-from reverb import client
-from reverb import errors
-from reverb import item_selectors
-from reverb import rate_limiters
-from reverb import server
-from reverb import signature_codec
 import tree
+from absl.testing import absltest
+
+from reverb import (
+    client,
+    errors,
+    item_selectors,
+    rate_limiters,
+    server,
+    signature_codec,
+)
 
 TABLE_NAME = "table"
 NESTED_SIGNATURE_TABLE_NAME = "nested_signature_table"
@@ -595,9 +598,8 @@ class WriterBoundaryTest(absltest.TestCase):
         with self.client.writer(2) as w:
             w.append([1])
         # Reusing a closed writer via the context manager protocol raises.
-        with self.assertRaises(ValueError):
-            with w:
-                pass
+        with self.assertRaises(ValueError), w:
+            pass
 
     def test_flush_is_idempotent(self):
         w = self.client.writer(2)

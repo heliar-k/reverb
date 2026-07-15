@@ -34,7 +34,6 @@ import numpy as np
 import reverb
 from reverb import signature_codec
 
-
 # ---------------------------------------------------------------------------
 # Dummy RL environment
 # ---------------------------------------------------------------------------
@@ -70,7 +69,10 @@ def compute_q_values(obs: np.ndarray) -> np.ndarray:
 
 
 def compute_td_error(
-    obs: np.ndarray, action: np.ndarray, reward: np.ndarray, next_obs: np.ndarray,
+    obs: np.ndarray,
+    action: np.ndarray,
+    reward: np.ndarray,
+    next_obs: np.ndarray,
     done: np.ndarray,
     gamma: float = 0.99,
 ) -> np.ndarray:
@@ -103,16 +105,21 @@ def build_table_signature():
     is returned in this exact nested structure.
     """
     return {
-        'observation': signature_codec.TensorSpec(
-            shape=(None,) + OBS_SHAPE, dtype=np.float32, name='observation'),
-        'action': signature_codec.TensorSpec(
-            shape=(None,) + ACT_SHAPE, dtype=np.float32, name='action'),
-        'reward': signature_codec.TensorSpec(
-            shape=(None,), dtype=np.float32, name='reward'),
-        'next_observation': signature_codec.TensorSpec(
-            shape=(None,) + OBS_SHAPE, dtype=np.float32, name='next_observation'),
-        'done': signature_codec.TensorSpec(
-            shape=(None,), dtype=np.float32, name='done'),
+        "observation": signature_codec.TensorSpec(
+            shape=(None,) + OBS_SHAPE, dtype=np.float32, name="observation"
+        ),
+        "action": signature_codec.TensorSpec(
+            shape=(None,) + ACT_SHAPE, dtype=np.float32, name="action"
+        ),
+        "reward": signature_codec.TensorSpec(
+            shape=(None,), dtype=np.float32, name="reward"
+        ),
+        "next_observation": signature_codec.TensorSpec(
+            shape=(None,) + OBS_SHAPE, dtype=np.float32, name="next_observation"
+        ),
+        "done": signature_codec.TensorSpec(
+            shape=(None,), dtype=np.float32, name="done"
+        ),
     }
 
 
@@ -124,7 +131,7 @@ def main():
     server = reverb.Server(
         tables=[
             reverb.Table(
-                name='replay',
+                name="replay",
                 sampler=reverb.selectors.Prioritized(priority_exponent=0.6),
                 remover=reverb.selectors.Fifo(),
                 max_size=1000,
@@ -148,25 +155,27 @@ def main():
                 while not done:
                     action = np.array([0, 1], dtype=np.float32)
                     next_obs, reward, done = env.step(action)
-                    writer.append({
-                        'observation': obs,
-                        'action': action,
-                        'reward': np.float32(reward),
-                        'next_observation': next_obs,
-                        'done': np.float32(done),
-                    })
+                    writer.append(
+                        {
+                            "observation": obs,
+                            "action": action,
+                            "reward": np.float32(reward),
+                            "next_observation": next_obs,
+                            "done": np.float32(done),
+                        }
+                    )
 
                     # Insert every step as a SARS transition (length-1 trajectory).
                     # For single-step items, use history[-1] for each column.
                     writer.create_item(
-                        table='replay',
+                        table="replay",
                         priority=1.0,
                         trajectory={
-                            'observation': writer.history['observation'][-1:],
-                            'action': writer.history['action'][-1:],
-                            'reward': writer.history['reward'][-1:],
-                            'next_observation': writer.history['next_observation'][-1:],
-                            'done': writer.history['done'][-1:],
+                            "observation": writer.history["observation"][-1:],
+                            "action": writer.history["action"][-1:],
+                            "reward": writer.history["reward"][-1:],
+                            "next_observation": writer.history["next_observation"][-1:],
+                            "done": writer.history["done"][-1:],
                         },
                     )
                     obs = next_obs
@@ -188,9 +197,9 @@ def main():
             # here we set it explicitly for clarity.
             samples = list(
                 client.sample(
-                    'replay',
+                    "replay",
                     num_samples=8,
-                    emit_timesteps=True,            # per-timestep lists
+                    emit_timesteps=True,  # per-timestep lists
                     unpack_as_table_signature=True,  # nested dict structure
                 )
             )
@@ -206,42 +215,46 @@ def main():
 
                     # Extract data as numpy arrays for processing.
                     # (See TrajectoryColumn demo at bottom of file.)
-                    obs_arr = np.asarray(data['observation'])
-                    act_arr = np.asarray(data['action'])
-                    rew_arr = np.asarray(data['reward'])
-                    nobs_arr = np.asarray(data['next_observation'])
-                    don_arr = np.asarray(data['done'])
+                    obs_arr = np.asarray(data["observation"])
+                    act_arr = np.asarray(data["action"])
+                    rew_arr = np.asarray(data["reward"])
+                    nobs_arr = np.asarray(data["next_observation"])
+                    don_arr = np.asarray(data["done"])
 
                     # Compute TD error.
-                    td = compute_td_error(
-                        obs_arr, act_arr, rew_arr, nobs_arr, don_arr)
+                    td = compute_td_error(obs_arr, act_arr, rew_arr, nobs_arr, don_arr)
 
                     # Store for priority update.
                     updates[key] = float(per_priority(td))
                     td_errors.append(float(td))
 
             # Update priorities for all sampled items.
-            client.mutate_priorities('replay', updates=updates)
+            client.mutate_priorities("replay", updates=updates)
 
-            print(f"  iteration {iteration + 1}: "
-                  f"mean TD error = {np.mean(td_errors):.4f}, "
-                  f"updated {len(updates)} items")
+            print(
+                f"  iteration {iteration + 1}: "
+                f"mean TD error = {np.mean(td_errors):.4f}, "
+                f"updated {len(updates)} items"
+            )
 
         # -- TrajectoryColumn API demo on a freshly inserted item ------------
         print()
         print("TrajectoryColumn API demo:")
         with client.trajectory_writer(num_keep_alive_refs=3) as writer:
             for i in range(3):
-                writer.append({
-                    'observation': np.ones(OBS_SHAPE, dtype=np.float32) * i,
-                    'action': np.zeros(ACT_SHAPE, dtype=np.float32),
-                    'reward': np.float32(i),
-                    'next_observation': np.ones(OBS_SHAPE, dtype=np.float32) * (i + 1),
-                    'done': np.float32(0),
-                })
+                writer.append(
+                    {
+                        "observation": np.ones(OBS_SHAPE, dtype=np.float32) * i,
+                        "action": np.zeros(ACT_SHAPE, dtype=np.float32),
+                        "reward": np.float32(i),
+                        "next_observation": np.ones(OBS_SHAPE, dtype=np.float32)
+                        * (i + 1),
+                        "done": np.float32(0),
+                    }
+                )
 
             # Access a TrajectoryColumn before creating an item.
-            col = writer.history['observation'][:]
+            col = writer.history["observation"][:]
             print(f"  observation column shape: {col.shape}")
             print(f"  observation column dtype:  {col.dtype}")
             arr = col.numpy()
@@ -249,26 +262,30 @@ def main():
             print(f"  observation numpy():\n{arr}")
 
             writer.create_item(
-                table='replay',
+                table="replay",
                 priority=1.0,
                 trajectory={
-                    'observation': writer.history['observation'][:],
-                    'action': writer.history['action'][:],
-                    'reward': writer.history['reward'][:],
-                    'next_observation': writer.history['next_observation'][:],
-                    'done': writer.history['done'][:],
+                    "observation": writer.history["observation"][:],
+                    "action": writer.history["action"][:],
+                    "reward": writer.history["reward"][:],
+                    "next_observation": writer.history["next_observation"][:],
+                    "done": writer.history["done"][:],
                 },
             )
             writer.flush()
 
         # Sample back to verify.
         for sample in client.sample(
-            'replay', num_samples=1, emit_timesteps=False,
+            "replay",
+            num_samples=1,
+            emit_timesteps=False,
             unpack_as_table_signature=True,
         ):
             data = sample.data
-            print(f"\n  Sampled back: obs={np.asarray(data['observation']).shape}, "
-                  f"act={np.asarray(data['action']).shape}")
+            print(
+                f"\n  Sampled back: obs={np.asarray(data['observation']).shape}, "
+                f"act={np.asarray(data['action']).shape}"
+            )
 
     finally:
         server.stop()
@@ -276,5 +293,5 @@ def main():
     print("\nDone.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

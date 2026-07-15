@@ -50,11 +50,11 @@ def make_step(step_id: int) -> dict:
     """A single RL step with observation, action, reward, and a per-step
     TD error used for priority calculation."""
     return {
-        'obs': np.zeros(4, dtype=np.float32) + step_id,
-        'action': np.array([step_id % 2], dtype=np.int64),
-        'reward': np.float32(0.1 * step_id),
-        'td_error': np.float32(0.5 - step_id * 0.05),  # mock TD error
-        'done': np.bool_(step_id >= 8),
+        "obs": np.zeros(4, dtype=np.float32) + step_id,
+        "action": np.array([step_id % 2], dtype=np.int64),
+        "reward": np.float32(0.1 * step_id),
+        "td_error": np.float32(0.5 - step_id * 0.05),  # mock TD error
+        "done": np.bool_(step_id >= 8),
     }
 
 
@@ -77,7 +77,7 @@ def example_1_td_error_priority():
     print("Example 1: td_error() priority")
     print("=" * 60)
 
-    table = reverb.Table.queue(name='replay', max_size=100)
+    table = reverb.Table.queue(name="replay", max_size=100)
     server = reverb.Server(tables=[table], in_process=True)
 
     try:
@@ -87,8 +87,8 @@ def example_1_td_error_priority():
 
         # Pattern: last 3 obs + action, with a td_error field for priority.
         pattern = {
-            'obs': ref['obs'][-3:],
-            'action': ref['action'][-3:],
+            "obs": ref["obs"][-3:],
+            "action": ref["action"][-3:],
         }
 
         # Priority = f(td_error over the trajectory).
@@ -98,12 +98,12 @@ def example_1_td_error_priority():
         priority_fn = sw.td_error(
             max_priority_weight=0.9,
             step_structure=STEP_STRUCTURE,
-            get_field_from_step_fn=lambda s: s['td_error'],
+            get_field_from_step_fn=lambda s: s["td_error"],
         )
 
         config = sw.create_config(
             pattern=pattern,
-            table='replay',
+            table="replay",
             conditions=[sw.Condition.step_index() >= 2],
             priority=priority_fn,
         )
@@ -115,10 +115,11 @@ def example_1_td_error_priority():
         # Items were inserted with td_error-based priorities.
         info = client.server_info()
         print(f"  Table size: {info['replay'].current_size}")
-        for sample in client.sample('replay', num_samples=2,
-                                    emit_timesteps=False):
-            print(f"  Priority: {sample.info.priority:.4f}, "
-                  f"obs mean: {np.asarray(sample.data[0]).mean():.1f}")
+        for sample in client.sample("replay", num_samples=2, emit_timesteps=False):
+            print(
+                f"  Priority: {sample.info.priority:.4f}, "
+                f"obs mean: {np.asarray(sample.data[0]).mean():.1f}"
+            )
 
     finally:
         server.stop()
@@ -140,7 +141,7 @@ def example_2_steps_since_applied():
     print("Example 2: steps_since_applied() throttle")
     print("=" * 60)
 
-    table = reverb.Table.queue(name='replay', max_size=100)
+    table = reverb.Table.queue(name="replay", max_size=100)
     server = reverb.Server(tables=[table], in_process=True)
 
     try:
@@ -148,8 +149,8 @@ def example_2_steps_since_applied():
         ref = sw.create_reference_step(STEP_STRUCTURE)
 
         config = sw.create_config(
-            pattern={'obs': ref['obs'][-2:]},
-            table='replay',
+            pattern={"obs": ref["obs"][-2:]},
+            table="replay",
             conditions=[
                 # Emit when step index is odd AND at least 3 steps since last.
                 # Multiple conditions are AND-ed: both must be true for an item to be emitted.
@@ -190,7 +191,7 @@ def example_3_condition_on_data():
     print("Example 3: Condition.data()")
     print("=" * 60)
 
-    table = reverb.Table.queue(name='replay', max_size=100)
+    table = reverb.Table.queue(name="replay", max_size=100)
     server = reverb.Server(tables=[table], in_process=True)
 
     try:
@@ -198,11 +199,11 @@ def example_3_condition_on_data():
         ref = sw.create_reference_step(STEP_STRUCTURE)
 
         # Build a condition on the 'done' field: emit when done == 1.
-        done_condition = sw.Condition.data(STEP_STRUCTURE)['done'] == 1
+        done_condition = sw.Condition.data(STEP_STRUCTURE)["done"] == 1
 
         config = sw.create_config(
-            pattern={'obs': ref['obs'][-3:]},
-            table='replay',
+            pattern={"obs": ref["obs"][-3:]},
+            table="replay",
             conditions=[done_condition],
         )
 
@@ -235,7 +236,7 @@ def example_4_modulo_conditions():
     print("Example 4: Modulo conditions")
     print("=" * 60)
 
-    table = reverb.Table.queue(name='replay', max_size=100)
+    table = reverb.Table.queue(name="replay", max_size=100)
     server = reverb.Server(tables=[table], in_process=True)
 
     try:
@@ -244,8 +245,8 @@ def example_4_modulo_conditions():
 
         # Emit every 3rd step, starting from index 2.
         config = sw.create_config(
-            pattern={'obs': ref['obs'][-2:]},      # 2-step window
-            table='replay',
+            pattern={"obs": ref["obs"][-2:]},  # 2-step window
+            table="replay",
             conditions=[sw.Condition.step_index() % 3 == 2],
         )
 
@@ -274,7 +275,7 @@ def example_5_pattern_from_transform():
     print("Example 5: pattern_from_transform()")
     print("=" * 60)
 
-    table = reverb.Table.queue(name='replay', max_size=100)
+    table = reverb.Table.queue(name="replay", max_size=100)
     server = reverb.Server(tables=[table], in_process=True)
 
     try:
@@ -283,16 +284,16 @@ def example_5_pattern_from_transform():
         def my_transform(step: sw.ReferenceStep) -> Any:
             """Build a SARS trajectory: last 3 states, 2 actions, 2 rewards."""
             return {
-                'states': step['obs'][-3:],
-                'actions': step['action'][-2:],
-                'rewards': step['reward'][-2:],
+                "states": step["obs"][-3:],
+                "actions": step["action"][-2:],
+                "rewards": step["reward"][-2:],
             }
 
         pattern = sw.pattern_from_transform(STEP_STRUCTURE, my_transform)
 
         config = sw.create_config(
             pattern=pattern,
-            table='replay',
+            table="replay",
             conditions=[sw.Condition.step_index() >= 2],
         )
 
@@ -303,13 +304,14 @@ def example_5_pattern_from_transform():
         info = client.server_info()
         print(f"  Table size: {info['replay'].current_size}")
 
-        for sample in client.sample('replay', num_samples=1,
-                                    emit_timesteps=False):
+        for sample in client.sample("replay", num_samples=1, emit_timesteps=False):
             states = np.asarray(sample.data[2])
             actions = np.asarray(sample.data[0])
             rewards = np.asarray(sample.data[1])
-            print(f"  states: {states.shape}, actions: {actions.shape}, "
-                  f"rewards: {rewards.shape}")
+            print(
+                f"  states: {states.shape}, actions: {actions.shape}, "
+                f"rewards: {rewards.shape}"
+            )
 
     finally:
         server.stop()
@@ -332,7 +334,7 @@ def example_6_partial_step():
     print("=" * 60)
 
     table = reverb.Table(
-        name='replay',
+        name="replay",
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
         max_size=100,
@@ -347,11 +349,11 @@ def example_6_partial_step():
         # Pattern: a 2-step SARS trajectory (obs + action + reward).
         config = sw.create_config(
             pattern={
-                'obs': ref['obs'][-2:],
-                'action': ref['action'][-2:],
-                'reward': ref['reward'][-2:],
+                "obs": ref["obs"][-2:],
+                "action": ref["action"][-2:],
+                "reward": ref["reward"][-2:],
             },
-            table='replay',
+            table="replay",
             conditions=[sw.Condition.step_index() >= 1],
         )
 
@@ -361,51 +363,68 @@ def example_6_partial_step():
         # StructuredWriter requires ALL fields in every append call, even
         # partial ones. Missing fields must be passed as None.
         step0 = make_step(0)
-        writer.append({
-            'obs': step0['obs'],
-            'action': None,
-            'reward': None,
-            'td_error': None,
-            'done': None,
-        }, partial_step=True)
+        writer.append(
+            {
+                "obs": step0["obs"],
+                "action": None,
+                "reward": None,
+                "td_error": None,
+                "done": None,
+            },
+            partial_step=True,
+        )
         # In a real agent: sample from replay, compute policy, pick action.
         # Here we just close the step with the remaining fields.
-        writer.append({
-            'obs': None,
-            'action': step0['action'],
-            'reward': step0['reward'],
-            'td_error': step0['td_error'],
-            'done': step0['done'],
-        }, partial_step=False)
+        writer.append(
+            {
+                "obs": None,
+                "action": step0["action"],
+                "reward": step0["reward"],
+                "td_error": step0["td_error"],
+                "done": step0["done"],
+            },
+            partial_step=False,
+        )
 
         # Show the on-policy flow: append obs → sample & learn → append action.
         for step_id in range(1, 6):
             step = make_step(step_id)
-            writer.append({
-                'obs': step['obs'],
-                'action': None,
-                'reward': None,
-                'td_error': None,
-                'done': None,
-            }, partial_step=True)
+            writer.append(
+                {
+                    "obs": step["obs"],
+                    "action": None,
+                    "reward": None,
+                    "td_error": None,
+                    "done": None,
+                },
+                partial_step=True,
+            )
             # In a real agent: items must be flushed before they can be sampled.
             writer.flush()
             # Sample trajectories from replay to compute the policy.
             try:
-                for sample in client.sample('replay', num_samples=1,
-                                            emit_timesteps=False, timeout_ms=500):
-                    print(f'  Sampled during partial step {step_id}: '
-                          f'obs shape={np.asarray(sample.data[0]).shape}')
+                for sample in client.sample(
+                    "replay", num_samples=1, emit_timesteps=False, timeout_ms=500
+                ):
+                    print(
+                        f"  Sampled during partial step {step_id}: "
+                        f"obs shape={np.asarray(sample.data[0]).shape}"
+                    )
             except reverb.errors.DeadlineExceededError:
-                print(f'  Partial step {step_id}: no items available yet '
-                      f'(rate limiter blocked)')
-            writer.append({
-                'obs': None,
-                'action': step['action'],
-                'reward': step['reward'],
-                'td_error': step['td_error'],
-                'done': step['done'],
-            }, partial_step=False)
+                print(
+                    f"  Partial step {step_id}: no items available yet "
+                    f"(rate limiter blocked)"
+                )
+            writer.append(
+                {
+                    "obs": None,
+                    "action": step["action"],
+                    "reward": step["reward"],
+                    "td_error": step["td_error"],
+                    "done": step["done"],
+                },
+                partial_step=False,
+            )
 
         writer.flush()
 
@@ -435,11 +454,13 @@ def example_7_infer_signature():
     ref = sw.create_reference_step(STEP_STRUCTURE)
 
     # Config 1: 3-step obs windows (emitted every step after index 2).
-    configs.append(sw.create_config(
-        pattern={'observation': ref['obs'][-3:]},
-        table='replay',
-        conditions=[sw.Condition.step_index() >= 2],
-    ))
+    configs.append(
+        sw.create_config(
+            pattern={"observation": ref["obs"][-3:]},
+            table="replay",
+            conditions=[sw.Condition.step_index() >= 2],
+        )
+    )
 
     # Define the step spec: what each `writer.append()` call provides.
     # Each leaf is a numpy array; infer_signature reads .dtype and .shape.
@@ -455,7 +476,7 @@ def example_7_infer_signature():
 
     # Use the inferred signature to construct the table.
     table = reverb.Table(
-        name='replay',
+        name="replay",
         sampler=reverb.selectors.Uniform(),
         remover=reverb.selectors.Fifo(),
         max_size=100,
@@ -473,7 +494,9 @@ def example_7_infer_signature():
 
         # Sample with unpack_as_table_signature.
         for sample in client.sample(
-            'replay', num_samples=2, emit_timesteps=False,
+            "replay",
+            num_samples=2,
+            emit_timesteps=False,
             unpack_as_table_signature=True,
         ):
             data = sample.data
@@ -498,5 +521,5 @@ def main():
     print("All examples passed.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

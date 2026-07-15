@@ -33,48 +33,50 @@ import reverb
 
 
 def main() -> None:
-  table = reverb.Table(
-      name='experience',
-      sampler=reverb.selectors.Uniform(),
-      remover=reverb.selectors.Fifo(),
-      max_size=100,
-      rate_limiter=reverb.rate_limiters.MinSize(1),
-  )
+    table = reverb.Table(
+        name="experience",
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        max_size=100,
+        rate_limiter=reverb.rate_limiters.MinSize(1),
+    )
 
-  # in_process=True owns the table directly; shm=True layers the SHM transport
-  # on top of it. shm=True does NOT imply in_process=True.
-  server = reverb.Server(tables=[table], in_process=True, shm=True)
-  try:
-    client = reverb.ShmClient(server.shm_socket_path)
+    # in_process=True owns the table directly; shm=True layers the SHM transport
+    # on top of it. shm=True does NOT imply in_process=True.
+    server = reverb.Server(tables=[table], in_process=True, shm=True)
+    try:
+        client = reverb.ShmClient(server.shm_socket_path)
 
-    # Identical API to LocalClient / gRPC Client.
-    with client.trajectory_writer(num_keep_alive_refs=3) as writer:
-      for step in range(3):
-        writer.append({
-            'obs': np.zeros(4, dtype=np.float32) + step,
-            'action': np.array([step], dtype=np.int64),
-        })
-      writer.create_item(
-          table='experience',
-          priority=1.0,
-          trajectory={
-              'obs': writer.history['obs'][:],
-              'action': writer.history['action'][:],
-          },
-      )
-      writer.flush()
+        # Identical API to LocalClient / gRPC Client.
+        with client.trajectory_writer(num_keep_alive_refs=3) as writer:
+            for step in range(3):
+                writer.append(
+                    {
+                        "obs": np.zeros(4, dtype=np.float32) + step,
+                        "action": np.array([step], dtype=np.int64),
+                    }
+                )
+            writer.create_item(
+                table="experience",
+                priority=1.0,
+                trajectory={
+                    "obs": writer.history["obs"][:],
+                    "action": writer.history["action"][:],
+                },
+            )
+            writer.flush()
 
-    samples = list(client.sample('experience', num_samples=1, emit_timesteps=False))
-    assert len(samples) == 1
-    # data columns are in tree-flatten (alphabetical key) order: action, obs.
-    action = np.asarray(samples[0].data[0])
-    obs = np.asarray(samples[0].data[1])
-    assert obs.shape == (3, 4), obs.shape
-    assert action.shape == (3, 1), action.shape
-    print(f'sampled obs:\n{obs}')
-  finally:
-    server.stop()
+        samples = list(client.sample("experience", num_samples=1, emit_timesteps=False))
+        assert len(samples) == 1
+        # data columns are in tree-flatten (alphabetical key) order: action, obs.
+        action = np.asarray(samples[0].data[0])
+        obs = np.asarray(samples[0].data[1])
+        assert obs.shape == (3, 4), obs.shape
+        assert action.shape == (3, 1), action.shape
+        print(f"sampled obs:\n{obs}")
+    finally:
+        server.stop()
 
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    main()

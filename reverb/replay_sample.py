@@ -20,40 +20,42 @@ import numpy as np
 
 
 class SampleInfo(NamedTuple):
-  """Extra details about the sampled item.
+    """Extra details about the sampled item.
 
-  Fields:
-    key: Key of the item that was sampled. Used for updating the priority.
-      Typically a python `int` (for output of Client.sample) or
-      `tf.uint64` Tensor (for output of TF Client.sample).
-    probability: Probability of selecting the item at the time of sampling.
-      A python `float` or `tf.float64` Tensor.
-    table_size: The total number of items present in the table at sample time.
-    priority: Priority of the item at the time of sampling. A python `float` or
-      `tf.float64` Tensor.
-    times_sampled: Number of times this item has been sampled (including this
-      time).
-  """
-  key: Union[np.ndarray, Any, int]
-  probability: Union[np.ndarray, Any, float]
-  table_size: Union[np.ndarray, Any, int]
-  priority: Union[np.ndarray, Any, float]
-  times_sampled: Union[np.ndarray, Any, int]
+    Fields:
+      key: Key of the item that was sampled. Used for updating the priority.
+        Typically a python `int` (for output of Client.sample) or
+        `tf.uint64` Tensor (for output of TF Client.sample).
+      probability: Probability of selecting the item at the time of sampling.
+        A python `float` or `tf.float64` Tensor.
+      table_size: The total number of items present in the table at sample time.
+      priority: Priority of the item at the time of sampling. A python `float` or
+        `tf.float64` Tensor.
+      times_sampled: Number of times this item has been sampled (including this
+        time).
+    """
 
-  @classmethod
-  def zeros(cls):
-    """Create a SampleInfo with Python zero values for all fields.."""
-    return cls(0, 0.0, 0, 0.0, 0)
+    key: Union[np.ndarray, Any, int]
+    probability: Union[np.ndarray, Any, float]
+    table_size: Union[np.ndarray, Any, int]
+    priority: Union[np.ndarray, Any, float]
+    times_sampled: Union[np.ndarray, Any, int]
+
+    @classmethod
+    def zeros(cls):
+        """Create a SampleInfo with Python zero values for all fields.."""
+        return cls(0, 0.0, 0, 0.0, 0)
 
 
 class ReplaySample(NamedTuple):
-  """Item returned by sample operations.
+    """Item returned by sample operations.
 
-  Fields:
-    info: Details about the sampled item. Instance of `SampleInfo`.
-    data: Tensors for the data. If the structure is available to the sampler
-      then the data will be nested. If the structure is not available then the
-      flattened structure, i.e. a list, is used.
-  """
-  info: SampleInfo
-  data: Union[Sequence[np.ndarray], Any]
+    Fields:
+      info: Details about the sampled item. Instance of `SampleInfo`.
+      data: Tensors for the data. If the structure is available to the sampler
+        then the data will be nested. If the structure is not available then the
+        flattened structure, i.e. a list, is used.
+    """
+
+    info: SampleInfo
+    data: Union[Sequence[np.ndarray], Any]

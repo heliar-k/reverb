@@ -24,8 +24,8 @@ import numpy as np
 
 import reverb
 
-
 # ── resource monitoring ──────────────────────────────────────────────────────
+
 
 class _ResourceMonitor(threading.Thread):
     """Daemon thread sampling RSS/CPU of a process every 100ms."""
@@ -66,6 +66,7 @@ class _ResourceMonitor(threading.Thread):
 def _has_psutil():
     try:
         import psutil  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -104,8 +105,8 @@ def _percentile(sorted_data, pct):
 #          benchmark just indexes into the pool — no randn in hot path.
 
 _SHAPES = {
-    "small": (1,),           # float32[1]           ≈    4 B
-    "med":   (84, 84, 4),    # float32[84,84,4]     ≈  110 KB
+    "small": (1,),  # float32[1]           ≈    4 B
+    "med": (84, 84, 4),  # float32[84,84,4]     ≈  110 KB
     "large": (256, 256, 3),  # float32[256,256,3]   ≈  770 KB
 }
 
@@ -350,39 +351,51 @@ def _fmt_lat(sec):
 def main():
     p = argparse.ArgumentParser(description="Unified Reverb client benchmark")
     p.add_argument(
-        "--mode", default="all",
+        "--mode",
+        default="all",
         choices=["sample", "insert", "pipeline", "all"],
     )
     p.add_argument(
-        "--transport", default="all",
+        "--transport",
+        default="all",
         help="comma-separated: inprocess,shm,grpc,all",
     )
     p.add_argument(
-        "--payload", default="all",
+        "--payload",
+        default="all",
         help="comma-separated: small,med,large,mixed,all",
     )
     p.add_argument(
-        "--table-size", default="1000,10000",
+        "--table-size",
+        default="1000,10000",
         help="comma-separated integers",
     )
     p.add_argument(
-        "--duration", type=int, default=5,
+        "--duration",
+        type=int,
+        default=5,
         help="pipeline duration in seconds (use 60+ for stability check)",
     )
     p.add_argument(
-        "--quick", action="store_true",
+        "--quick",
+        action="store_true",
         help="fast comparison: sample+pipeline, med payload, 10k table, 5s",
     )
     p.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="output machine-readable JSON",
     )
     p.add_argument(
-        "--warmup", type=int, default=20,
+        "--warmup",
+        type=int,
+        default=20,
         help="warmup ops for sample/insert modes",
     )
     p.add_argument(
-        "--num-ops", type=int, default=500,
+        "--num-ops",
+        type=int,
+        default=500,
         help="number of operations for sample/insert modes",
     )
     args = p.parse_args()
@@ -393,9 +406,7 @@ def main():
         payloads = ["med"]
         table_sizes = [10000]
     else:
-        modes = (
-            ["sample", "insert", "pipeline"] if args.mode == "all" else [args.mode]
-        )
+        modes = ["sample", "insert", "pipeline"] if args.mode == "all" else [args.mode]
         transports = (
             ["inprocess", "shm", "grpc"]
             if args.transport == "all"
@@ -436,25 +447,29 @@ def main():
                             tput, lats = _bench_sample(
                                 client, args.num_ops, args.warmup
                             )
-                            results.append({
-                                "key": key,
-                                "tput_sps": tput,
-                                "p50_s": _percentile(lats, 50),
-                                "p90_s": _percentile(lats, 90),
-                                "p99_s": _percentile(lats, 99),
-                            })
+                            results.append(
+                                {
+                                    "key": key,
+                                    "tput_sps": tput,
+                                    "p50_s": _percentile(lats, 50),
+                                    "p90_s": _percentile(lats, 90),
+                                    "p99_s": _percentile(lats, 99),
+                                }
+                            )
 
                         elif mode == "insert":
                             tput, lats = _bench_insert(
                                 client, args.num_ops, pl_buf, args.warmup
                             )
-                            results.append({
-                                "key": key,
-                                "tput_ips": tput,
-                                "p50_s": _percentile(lats, 50),
-                                "p90_s": _percentile(lats, 90),
-                                "p99_s": _percentile(lats, 99),
-                            })
+                            results.append(
+                                {
+                                    "key": key,
+                                    "tput_ips": tput,
+                                    "p50_s": _percentile(lats, 50),
+                                    "p90_s": _percentile(lats, 90),
+                                    "p99_s": _percentile(lats, 99),
+                                }
+                            )
 
                         elif mode == "pipeline":
                             res = _bench_pipeline(
@@ -495,16 +510,16 @@ def _print_report(results):
         if not group:
             continue
 
-        print(f"\n{'='*90}")
+        print(f"\n{'=' * 90}")
         print(f"  MODE: {mode_label}")
-        print(f"{'='*90}")
+        print(f"{'=' * 90}")
 
         if mode_label == "sample":
             print(
                 f"  {'transport/payload/table':<40} "
                 f"{'sps':>8}  {'p50':>10}  {'p90':>10}  {'p99':>10}"
             )
-            print(f"  {'-'*40} {'-'*8}  {'-'*10}  {'-'*10}  {'-'*10}")
+            print(f"  {'-' * 40} {'-' * 8}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
             for r in sorted(group, key=lambda x: x["key"]):
                 tag = r["key"].replace("|sample", "")
                 print(
@@ -517,7 +532,7 @@ def _print_report(results):
                 f"  {'transport/payload/table':<40} "
                 f"{'ips':>8}  {'p50':>10}  {'p90':>10}  {'p99':>10}"
             )
-            print(f"  {'-'*40} {'-'*8}  {'-'*10}  {'-'*10}  {'-'*10}")
+            print(f"  {'-' * 40} {'-' * 8}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
             for r in sorted(group, key=lambda x: x["key"]):
                 tag = r["key"].replace("|insert", "")
                 print(
@@ -540,7 +555,7 @@ def _print_report(results):
                     f"{'rss_mb':>7} {'cpu%':>5}"
                 )
             print(
-                f"  {'-'*40} {'-'*7} {'-'*7} | {'-'*8} {'-'*8} {'-'*8} | {'-'*8} {'-'*8} {'-'*8}"
+                f"  {'-' * 40} {'-' * 7} {'-' * 7} | {'-' * 8} {'-' * 8} {'-' * 8} | {'-' * 8} {'-' * 8} {'-' * 8}"
             )
             for r in sorted(group, key=lambda x: x["key"]):
                 tag = r["key"].replace("|pipeline", "")

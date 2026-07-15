@@ -37,29 +37,16 @@ statically linked into `libreverb.so` (duplicate flag registration).
 # pylint: disable=g-bad-import-order
 
 from reverb import item_selectors as selectors
-from reverb import rate_limiters
-
-from reverb.client import Client
-from reverb.client import LocalClient
-from reverb.client import ShmClient
-from reverb.client import Writer
-
-from reverb.errors import DeadlineExceededError
-from reverb.errors import ReverbError
-
-from reverb.platform.default import checkpointers
-
-from reverb.replay_sample import ReplaySample
-from reverb.replay_sample import SampleInfo
-
-from reverb.server import Server
-from reverb.server import Table
-
-from reverb.trajectory_writer import TrajectoryColumn
-from reverb.trajectory_writer import TrajectoryWriter
 
 # Expose the in-process C++ client class directly for advanced users.
 from reverb import pybind as _pybind  # noqa: E402
+from reverb import rate_limiters
+from reverb.client import Client, LocalClient, ShmClient, Writer
+from reverb.errors import DeadlineExceededError, ReverbError
+from reverb.platform.default import checkpointers
+from reverb.replay_sample import ReplaySample, SampleInfo
+from reverb.server import Server, Table
+from reverb.trajectory_writer import TrajectoryColumn, TrajectoryWriter
 
 InProcessClient = _pybind.InProcessClient
 del _pybind

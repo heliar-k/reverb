@@ -55,12 +55,12 @@ def example_1_round_robin():
     for i in range(NUM_SERVERS):
         server = reverb.Server(
             tables=[
-                reverb.Table.queue(name='experience', max_size=100),
+                reverb.Table.queue(name="experience", max_size=100),
             ],
             in_process=False,  # gRPC mode
         )
         servers.append(server)
-        clients.append(reverb.Client(f'localhost:{server.port}'))
+        clients.append(reverb.Client(f"localhost:{server.port}"))
         print(f"  Server {i} on port {server.port}")
 
     try:
@@ -71,17 +71,19 @@ def example_1_round_robin():
 
         # Create writers. Using explicit __enter__/__exit__ instead of a list
         # comprehension context manager for cleaner error handling.
-        writers = [client.trajectory_writer(num_keep_alive_refs=3)
-                   for client in clients]
+        writers = [
+            client.trajectory_writer(num_keep_alive_refs=3) for client in clients
+        ]
         for w in writers:
             w.__enter__()
         try:
             for step in range(9):
                 writer = writers[step % NUM_SERVERS]
-                writer.append({'obs': np.array([step], dtype=np.float32)})
+                writer.append({"obs": np.array([step], dtype=np.float32)})
                 writer.create_item(
-                    table='experience', priority=1.0,
-                    trajectory={'obs': writer.history['obs'][-1:]},
+                    table="experience",
+                    priority=1.0,
+                    trajectory={"obs": writer.history["obs"][-1:]},
                 )
 
             for writer in writers:
@@ -92,8 +94,9 @@ def example_1_round_robin():
 
         # Sample from each.
         for i, client in enumerate(clients):
-            sample = next(client.sample('experience', num_samples=1,
-                                        emit_timesteps=False))
+            sample = next(
+                client.sample("experience", num_samples=1, emit_timesteps=False)
+            )
             val = np.asarray(sample.data[0]).reshape(-1)[0]
             print(f"  Server {i} sampled value: {val:.0f}")
 
@@ -123,7 +126,7 @@ def example_2_server_wait():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='experience', max_size=100)],
+        tables=[reverb.Table.queue(name="experience", max_size=100)],
         in_process=False,
     )
 
@@ -156,7 +159,7 @@ def example_3_localhost_client():
     print("=" * 60)
 
     server = reverb.Server(
-        tables=[reverb.Table.queue(name='experience', max_size=100)],
+        tables=[reverb.Table.queue(name="experience", max_size=100)],
         in_process=False,
     )
 
@@ -164,11 +167,10 @@ def example_3_localhost_client():
         # Shorthand for: reverb.Client(f'localhost:{server.port}')
         client = server.localhost_client()
         client.insert(
-            {'obs': np.array([42.0], dtype=np.float32)},
-            priorities={'experience': 1.0},
+            {"obs": np.array([42.0], dtype=np.float32)},
+            priorities={"experience": 1.0},
         )
-        sample = next(client.sample('experience', num_samples=1,
-                                    emit_timesteps=False))
+        sample = next(client.sample("experience", num_samples=1, emit_timesteps=False))
         print(f"  Sampled: {np.asarray(sample.data[0]).reshape(-1)[0]:.0f}")
 
     finally:
@@ -186,5 +188,5 @@ def main():
     print("All examples passed.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

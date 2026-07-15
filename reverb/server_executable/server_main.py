@@ -19,9 +19,8 @@ class, but instead of the user's configuration coming from constructor
 arguments, it comes from a command-line argument in textproto format.
 """
 
-from absl import app
-from absl import flags
-from absl import logging
+from absl import app, flags, logging
+
 import reverb
 from reverb.platform.default import server_main_command_line_args
 from reverb.server_executable import server_from_proto
@@ -30,22 +29,20 @@ FLAGS = flags.FLAGS
 
 
 def main(unused_argv):
-  config_proto = (
-      server_main_command_line_args.get_server_config_proto())
-  port = config_proto.port
-  table_configs = server_from_proto.tables_from_proto(
-      config_proto.tables)
-  logging.info('Configuring reverb for %d tables', len(table_configs))
-  server = reverb.Server(tables=table_configs, port=port)
-  logging.info('Reverb started.')
-  server.wait()
+    config_proto = server_main_command_line_args.get_server_config_proto()
+    port = config_proto.port
+    table_configs = server_from_proto.tables_from_proto(config_proto.tables)
+    logging.info("Configuring reverb for %d tables", len(table_configs))
+    server = reverb.Server(tables=table_configs, port=port)
+    logging.info("Reverb started.")
+    server.wait()
 
 
 # This is used as entry point for the console_script defined in
 # setup.py
 def app_run_main():
-  app.run(main)
+    app.run(main)
 
 
-if __name__ == '__main__':
-  app_run_main()
+if __name__ == "__main__":
+    app_run_main()

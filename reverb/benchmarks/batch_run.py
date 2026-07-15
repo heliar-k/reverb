@@ -22,6 +22,7 @@ Each child prints one JSON array on its last stdout line (via --json);
 this script reassembles them.  If a child is killed (OOM/signal), its
 exit code is recorded and the batch continues.
 """
+
 import argparse
 import json
 import os
@@ -35,9 +36,7 @@ ALL_PAYLOADS = ["small", "med", "large", "mixed"]
 DEFAULT_TABLE_SIZES = [1000, 10000]
 ALL_MODES = ["sample", "insert", "pipeline"]
 
-TARGET = os.environ.get(
-    "CLIENT_BENCH", "bazel-bin/reverb/benchmarks/client_benchmark"
-)
+TARGET = os.environ.get("CLIENT_BENCH", "bazel-bin/reverb/benchmarks/client_benchmark")
 
 
 def _parse_csv(val, all_vals):
@@ -56,8 +55,11 @@ def main():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--num-ops", type=int, default=500)
     p.add_argument("--quick", action="store_true")
-    p.add_argument("--json", action="store_true",
-                   help="emit merged JSON instead of the text report")
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit merged JSON instead of the text report",
+    )
     args = p.parse_args()
 
     if args.quick:
@@ -81,50 +83,77 @@ def main():
     for pl_spec in payloads:
         for table_size in table_sizes:
             child_args = [
-                "--mode", "all" if len(modes) > 1 else modes[0],
-                "--transport", ",".join(transports),
-                "--payload", pl_spec,
-                "--table-size", str(table_size),
-                "--duration", str(args.duration),
-                "--warmup", str(args.warmup),
-                "--num-ops", str(args.num_ops),
+                "--mode",
+                "all" if len(modes) > 1 else modes[0],
+                "--transport",
+                ",".join(transports),
+                "--payload",
+                pl_spec,
+                "--table-size",
+                str(table_size),
+                "--duration",
+                str(args.duration),
+                "--warmup",
+                str(args.warmup),
+                "--num-ops",
+                str(args.num_ops),
                 "--json",
             ]
             tag = f"{pl_spec}|{table_size}"
             print(f"\n# === batch {tag} ===", file=sys.stderr, flush=True)
-            print(f"# cmd: {TARGET} {' '.join(child_args)}", file=sys.stderr, flush=True)
+            print(
+                f"# cmd: {TARGET} {' '.join(child_args)}", file=sys.stderr, flush=True
+            )
 
             proc = subprocess.run(
                 [TARGET] + child_args,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
 
             if proc.returncode != 0:
                 sig = -proc.returncode if proc.returncode < 0 else None
-                reason = (f"signal {sig} ({signal.Signals(sig).name})"
-                          if sig else f"exit {proc.returncode}")
+                reason = (
+                    f"signal {sig} ({signal.Signals(sig).name})"
+                    if sig
+                    else f"exit {proc.returncode}"
+                )
                 # OOM leaves a recognizable pattern: nonzero, empty/short stdout.
                 print(f"# batch {tag} FAILED ({reason})", file=sys.stderr, flush=True)
-                print(f"# stderr tail:\n{proc.stderr[-800:]}", file=sys.stderr, flush=True)
+                print(
+                    f"# stderr tail:\n{proc.stderr[-800:]}", file=sys.stderr, flush=True
+                )
                 failures.append((tag, reason))
                 continue
 
             try:
                 child_results = json.loads(proc.stdout)
                 all_results.extend(child_results)
-                print(f"# batch {tag} ok: {len(child_results)} results",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"# batch {tag} ok: {len(child_results)} results",
+                    file=sys.stderr,
+                    flush=True,
+                )
             except json.JSONDecodeError as e:
-                print(f"# batch {tag}: could not parse JSON ({e})",
-                      file=sys.stderr, flush=True)
-                print(f"# stdout tail:\n{proc.stdout[-800:]}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"# batch {tag}: could not parse JSON ({e})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"# stdout tail:\n{proc.stdout[-800:]}", file=sys.stderr, flush=True
+                )
                 failures.append((tag, f"json parse: {e}"))
 
-    print(f"\n# === summary ===", file=sys.stderr, flush=True)
-    print(f"# collected {len(all_results)} results from "
-          f"{len(payloads) * len(table_sizes)} batches, "
-          f"{len(failures)} failures", file=sys.stderr, flush=True)
+    print("\n# === summary ===", file=sys.stderr, flush=True)
+    print(
+        f"# collected {len(all_results)} results from "
+        f"{len(payloads) * len(table_sizes)} batches, "
+        f"{len(failures)} failures",
+        file=sys.stderr,
+        flush=True,
+    )
     for tag, reason in failures:
         print(f"#   FAIL {tag}: {reason}", file=sys.stderr, flush=True)
 

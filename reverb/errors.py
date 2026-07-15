@@ -16,12 +16,12 @@
 
 
 class ReverbError(Exception):
-  """Base class for Reverb errors."""
+    """Base class for Reverb errors."""
 
 
 class DeadlineExceededError(ReverbError):
-  """A call to the server timed out."""
+    """A call to the server timed out."""
 
 
 class ConnectionError(ReverbError):
-  """The connection to the server was lost (server closed/crashed)."""
+    """The connection to the server was lost (server closed/crashed)."""

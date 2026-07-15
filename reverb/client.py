@@ -25,10 +25,9 @@ import pickle
 from typing import Any, Dict, Generator, List, Literal, Optional, Union, overload
 
 import numpy as np
-from reverb import pybind
-from reverb import replay_sample
-from reverb import reverb_types
 import tree
+
+from reverb import pybind, replay_sample, reverb_types
 
 
 class Writer:
@@ -659,7 +658,9 @@ class Client(_BaseClient):
 
         chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
         cpp_writer = self._client.NewTrajectoryWriter(chunker_options, validate_items)
-        from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
@@ -683,7 +684,9 @@ class Client(_BaseClient):
 
         serialized_configs = [config.SerializeToString() for config in configs]
         cpp_writer = self._client.NewStructuredWriter(serialized_configs)
-        from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return structured_writer_lib.StructuredWriter(cpp_writer)
 
@@ -743,7 +746,9 @@ class LocalClient(_BaseClient):
         cpp_writer = self._client.new_trajectory_writer(chunker_options)
         # Imported here to avoid a circular import (trajectory_writer imports
         # pybind, not client) and to keep the module import TF-free.
-        from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
@@ -772,7 +777,9 @@ class LocalClient(_BaseClient):
         # directly.
         serialized_configs = [config.SerializeToString() for config in configs]
         cpp_writer = self._client.new_structured_writer(serialized_configs)
-        from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return structured_writer_lib.StructuredWriter(cpp_writer)
 
@@ -890,7 +897,9 @@ class ShmClient(_BaseClient):
                 num_keep_alive_refs=num_keep_alive_refs,
             )
         cpp_writer = self._client.new_trajectory_writer(chunker_options)
-        from reverb import trajectory_writer as trajectory_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
 
@@ -915,6 +924,8 @@ class ShmClient(_BaseClient):
             raise ValueError("At least one config must be provided.")
         serialized_configs = [config.SerializeToString() for config in configs]
         cpp_writer = self._client.new_structured_writer(serialized_configs)
-        from reverb import structured_writer as structured_writer_lib  # pylint: disable=g-import-not-at-top
+        from reverb import (
+            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
 
         return structured_writer_lib.StructuredWriter(cpp_writer)

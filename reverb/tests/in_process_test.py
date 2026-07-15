@@ -23,14 +23,11 @@ import os
 import tempfile
 import time
 
-from absl.testing import absltest
 import numpy as np
+from absl.testing import absltest
 
 import reverb
-from reverb import errors
-from reverb import replay_sample
-from reverb import signature_codec
-from reverb import structured_writer
+from reverb import errors, replay_sample, signature_codec, structured_writer
 from reverb.platform.default import checkpointers
 
 
@@ -631,7 +628,7 @@ class InProcessSignatureCacheRefreshTest(absltest.TestCase):
         sig = {"v": signature_codec.TensorSpec((None, 1), np.float32, "v")}
         client = self._server_with_signature(sig).in_process_client
 
-        info = client.server_info()
+        client.server_info()
         self.assertEqual(set(client._signature_cache.keys()), {"t"})
         cached_before = client._signature_cache["t"]
 

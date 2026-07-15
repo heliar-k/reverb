@@ -20,36 +20,34 @@ If this passes, the import path + deps for all migrated tests are correct.
 from absl.testing import absltest
 
 import reverb
-from reverb import errors
-from reverb import replay_sample
+from reverb import errors, replay_sample
 
 
 class TestsWiringTest(absltest.TestCase):
+    def test_package_imports(self):
+        # Sanity: the public package surface is reachable from tests/.
+        self.assertTrue(hasattr(reverb, "Client"))
+        self.assertTrue(hasattr(reverb, "LocalClient"))
+        self.assertTrue(hasattr(reverb, "Server"))
+        self.assertTrue(hasattr(reverb, "Table"))
+        self.assertTrue(hasattr(reverb, "TrajectoryWriter"))
+        self.assertTrue(hasattr(reverb, "TrajectoryColumn"))
+        self.assertTrue(hasattr(reverb, "selectors"))
+        self.assertTrue(hasattr(reverb, "rate_limiters"))
+        self.assertTrue(hasattr(reverb, "InProcessClient"))
 
-  def test_package_imports(self):
-    # Sanity: the public package surface is reachable from tests/.
-    self.assertTrue(hasattr(reverb, 'Client'))
-    self.assertTrue(hasattr(reverb, 'LocalClient'))
-    self.assertTrue(hasattr(reverb, 'Server'))
-    self.assertTrue(hasattr(reverb, 'Table'))
-    self.assertTrue(hasattr(reverb, 'TrajectoryWriter'))
-    self.assertTrue(hasattr(reverb, 'TrajectoryColumn'))
-    self.assertTrue(hasattr(reverb, 'selectors'))
-    self.assertTrue(hasattr(reverb, 'rate_limiters'))
-    self.assertTrue(hasattr(reverb, 'InProcessClient'))
+    def test_errors_hierarchy(self):
+        self.assertTrue(issubclass(errors.DeadlineExceededError, errors.ReverbError))
+        self.assertTrue(issubclass(errors.ReverbError, Exception))
 
-  def test_errors_hierarchy(self):
-    self.assertTrue(issubclass(errors.DeadlineExceededError, errors.ReverbError))
-    self.assertTrue(issubclass(errors.ReverbError, Exception))
-
-  def test_replay_sample_zeros(self):
-    info = replay_sample.SampleInfo.zeros()
-    self.assertEqual(info.key, 0)
-    self.assertEqual(info.probability, 0.0)
-    self.assertEqual(info.table_size, 0)
-    self.assertEqual(info.priority, 0.0)
-    self.assertEqual(info.times_sampled, 0)
+    def test_replay_sample_zeros(self):
+        info = replay_sample.SampleInfo.zeros()
+        self.assertEqual(info.key, 0)
+        self.assertEqual(info.probability, 0.0)
+        self.assertEqual(info.table_size, 0)
+        self.assertEqual(info.priority, 0.0)
+        self.assertEqual(info.times_sampled, 0)
 
 
-if __name__ == '__main__':
-  absltest.main()
+if __name__ == "__main__":
+    absltest.main()

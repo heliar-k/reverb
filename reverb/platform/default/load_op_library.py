@@ -16,7 +16,7 @@
 
 import tensorflow as tf
 
-UNDEFINED_SYMBOL_ERROR_MESSAGE = """
+UNDEFINED_SYMBOL_ERROR_MESSAGE = f"""
 Attempted to load a reverb dynamic library, but it could not find the required
 symbols inside of TensorFlow.  This commonly occurs when your version of
 tensorflow and reverb are mismatched.  For example, if you are using the python
@@ -24,21 +24,21 @@ package 'tf-nightly', make sure you use the python package 'dm-reverb-nightly'
 built on the same or the next night.  If you are using a release version package
 'tensorflow', use a release package 'dm-reverb' built to be compatible with
 that exact version.  If all else fails, file a github issue on deepmind/reverb.
-Current installed version of tensorflow: {tf_version}.
-""".format(tf_version=tf.__version__)
+Current installed version of tensorflow: {tf.__version__}.
+"""
 
 
 def reraise_wrapped_error(error: Exception):
-  """Wraps failures with better error messages.
+    """Wraps failures with better error messages.
 
-  Args:
-    error: The exception.  We must be inside a raise.
+    Args:
+      error: The exception.  We must be inside a raise.
 
-  Raises:
-    ImportError: Typically if there is a version mismatch.
-  """
-  if 'undefined symbol' in str(error).lower():
-    raise ImportError(
-        '%s\nOrignal error:\n%s' % (UNDEFINED_SYMBOL_ERROR_MESSAGE, error)
-    ) from error
-  raise error
+    Raises:
+      ImportError: Typically if there is a version mismatch.
+    """
+    if "undefined symbol" in str(error).lower():
+        raise ImportError(
+            "%s\nOrignal error:\n%s" % (UNDEFINED_SYMBOL_ERROR_MESSAGE, error)
+        ) from error
+    raise error

@@ -20,42 +20,43 @@ Mirrors `examples_notebook_test.py`'s exec-the-source approach.
 """
 
 import os
-from absl.testing import absltest, parameterized
 
 import numpy as np  # pylint: disable=unused-import
-import reverb
 import tree
+from absl.testing import absltest, parameterized
 
-_EXAMPLES_DIR = os.path.join(os.environ['TEST_SRCDIR'], 'reverb', 'examples')
+import reverb
+
+_EXAMPLES_DIR = os.path.join(os.environ["TEST_SRCDIR"], "reverb", "examples")
 
 _EXAMPLES = [
-    'demo.py',
-    'grpc_client.py',
-    'multi_server.py',
-    'production_patterns.py',
-    'shm_client.py',
-    'structured_writer.py',
-    'structured_writer_advanced.py',
-    'table_signature.py',
-    'training_loop.py',
+    "demo.py",
+    "grpc_client.py",
+    "multi_server.py",
+    "production_patterns.py",
+    "shm_client.py",
+    "structured_writer.py",
+    "structured_writer_advanced.py",
+    "table_signature.py",
+    "training_loop.py",
 ]
 
 
 class ExamplesScriptTest(parameterized.TestCase):
-  """Runs each standalone example script in-process and asserts it succeeds."""
+    """Runs each standalone example script in-process and asserts it succeeds."""
 
-  @parameterized.parameters(_EXAMPLES)
-  def test_example_runs(self, script):
-    path = os.path.join(_EXAMPLES_DIR, script)
-    with open(path) as f:
-      src = f.read()
-    # Execute the module body (imports + def main) in a fresh namespace, then
-    # call main(). __name__ is set so the `if __name__ == '__main__'` guard does
-    # not auto-run main (we invoke it explicitly afterwards).
-    g = {'__name__': 'examples_script', 'np': np, 'reverb': reverb, 'tree': tree}
-    exec(compile(src, path, 'exec'), g)  # pylint: disable=exec-used
-    g['main']()
+    @parameterized.parameters(_EXAMPLES)
+    def test_example_runs(self, script):
+        path = os.path.join(_EXAMPLES_DIR, script)
+        with open(path) as f:
+            src = f.read()
+        # Execute the module body (imports + def main) in a fresh namespace, then
+        # call main(). __name__ is set so the `if __name__ == '__main__'` guard does
+        # not auto-run main (we invoke it explicitly afterwards).
+        g = {"__name__": "examples_script", "np": np, "reverb": reverb, "tree": tree}
+        exec(compile(src, path, "exec"), g)  # pylint: disable=exec-used
+        g["main"]()
 
 
-if __name__ == '__main__':
-  absltest.main()
+if __name__ == "__main__":
+    absltest.main()

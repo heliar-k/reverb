@@ -19,15 +19,11 @@ TODO(b/204560248): Expand the documentation.
 
 import copy
 import math
-
 from typing import Any, Callable, NewType, Optional, Sequence
 
-from reverb import errors
-from reverb import pybind
-from reverb import reverb_types
-from reverb import signature_codec
 import tree
 
+from reverb import pybind, reverb_types, signature_codec
 from reverb.cc import patterns_pb2
 from third_party.reverb_tensor import reverb_tensor_pb2
 
@@ -42,519 +38,527 @@ from third_party.reverb_tensor import reverb_tensor_pb2
 
 
 def encode_structure(structure) -> reverb_tensor_pb2.SignatureProto:
-  """纯 Python 版 nested_structure_coder.encode_structure。
+    """纯 Python 版 nested_structure_coder.encode_structure。
 
-  将嵌套结构(dict/list/tuple,叶子为任意值,实际调用方传 None)序列化为
-  自定义 SignatureProto。叶子一律编码为空 tensor_spec;解码时还原为 None。
-  """
-  proto = reverb_tensor_pb2.SignatureProto()
-  if isinstance(structure, dict):
-    for key, value in structure.items():
-      proto.dict_value.values[key].CopyFrom(encode_structure(value))
-  elif isinstance(structure, list):
-    for value in structure:
-      proto.list_value.values.add().CopyFrom(encode_structure(value))
-  elif isinstance(structure, tuple):
-    for value in structure:
-      proto.tuple_value.values.add().CopyFrom(encode_structure(value))
-  else:
-    # 叶子节点(实际为 None):用空 tensor_spec 占位,解码时还原 None。
-    proto.tensor_spec.SetInParent()
-  return proto
+    将嵌套结构(dict/list/tuple,叶子为任意值,实际调用方传 None)序列化为
+    自定义 SignatureProto。叶子一律编码为空 tensor_spec;解码时还原为 None。
+    """
+    proto = reverb_tensor_pb2.SignatureProto()
+    if isinstance(structure, dict):
+        for key, value in structure.items():
+            proto.dict_value.values[key].CopyFrom(encode_structure(value))
+    elif isinstance(structure, list):
+        for value in structure:
+            proto.list_value.values.add().CopyFrom(encode_structure(value))
+    elif isinstance(structure, tuple):
+        for value in structure:
+            proto.tuple_value.values.add().CopyFrom(encode_structure(value))
+    else:
+        # 叶子节点(实际为 None):用空 tensor_spec 占位,解码时还原 None。
+        proto.tensor_spec.SetInParent()
+    return proto
 
 
 def decode_structure(proto: reverb_tensor_pb2.SignatureProto):
-  """encode_structure 的逆运算,还原嵌套结构(叶子为 None)。"""
-  kind = proto.WhichOneof('kind')
-  if kind == 'dict_value':
-    return {k: decode_structure(v) for k, v in proto.dict_value.values.items()}
-  if kind == 'list_value':
-    return [decode_structure(v) for v in proto.list_value.values]
-  if kind == 'tuple_value':
-    return tuple(decode_structure(v) for v in proto.tuple_value.values)
-  # tensor_spec / 未设置 / 其它:叶子节点。
-  return None
+    """encode_structure 的逆运算,还原嵌套结构(叶子为 None)。"""
+    kind = proto.WhichOneof("kind")
+    if kind == "dict_value":
+        return {k: decode_structure(v) for k, v in proto.dict_value.values.items()}
+    if kind == "list_value":
+        return [decode_structure(v) for v in proto.list_value.values]
+    if kind == "tuple_value":
+        return tuple(decode_structure(v) for v in proto.tuple_value.values)
+    # tensor_spec / 未设置 / 其它:叶子节点。
+    return None
+
 
 # TODO(b/204423296): Expose Python abstractions rather than the raw protos.
 Config = patterns_pb2.StructuredWriterConfig
 ConditionProto = patterns_pb2.Condition
 
 Pattern = tree.Structure[patterns_pb2.PatternNode]
-ReferenceStep = NewType('ReferenceStep', Any)
+ReferenceStep = NewType("ReferenceStep", Any)
 PatternTransform = Callable[[ReferenceStep], Pattern]
 
 
 class StructuredWriter:
-  """StructuredWriter uses static patterns to build and insert trajectories.
+    """StructuredWriter uses static patterns to build and insert trajectories.
 
-  TODO(b/204560248): Expand the documentation.
-  """
-
-  def __init__(self, cpp_writer: pybind.StructuredWriter):
-    self._writer = cpp_writer
-    self._data_structure = None
-    self._flat_data_length = None
-
-  def append(self, data: Any, *, partial_step: bool = False):
-    """Appends data to internal buffers and inserts generated trajectories.
-
-    NOTE! The data must have exactly the same structure in each step. Leaf nodes
-    are allowed to be `None` but the structure must be the same.
-
-    It is possible to create a "step" using more than one `append` call by
-    setting the `partial_step` flag. Partial steps can be used when some parts
-    of the step becomes available only as a result of inserting (and learning
-    from) trajectories that include the fields available first (e.g learn from
-    the SARS trajectory to select the next action in an on-policy agent). In the
-    final `append` call of the step, `partial_step` must be set to `False`.
-    Failing to "close" the partial step will result in error as the same field
-    must NOT be provided more than once in the same step.
-
-    Args:
-      data: The (possibly nested) data pushed to internal buffers.
-      partial_step: If `True` then the step is not considered "done" with this
-        call. See above for more details. Defaults to `False`.
-
-    Raises:
-      ValueError: If the number of items in the flattened data changes between
-        calls.
+    TODO(b/204560248): Expand the documentation.
     """
-    flat_data = tree.flatten(data)
 
-    if self._flat_data_length is None:
-      self._flat_data_length = len(flat_data)
-      self._data_structure = tree.map_structure(lambda _: None, data)
+    def __init__(self, cpp_writer: pybind.StructuredWriter):
+        self._writer = cpp_writer
+        self._data_structure = None
+        self._flat_data_length = None
 
-    if len(flat_data) != self._flat_data_length:
-      raise ValueError(
-          f'Flattened data has an unexpected length, got {len(flat_data)} '
-          f'but wanted {self._flat_data_length}.')
+    def append(self, data: Any, *, partial_step: bool = False):
+        """Appends data to internal buffers and inserts generated trajectories.
 
-    try:
-      if partial_step:
-        self._writer.AppendPartial(flat_data)
-      else:
-        self._writer.Append(flat_data)
-    except ValueError as e:
-      parts = str(e).split(' for column ')
+        NOTE! The data must have exactly the same structure in each step. Leaf nodes
+        are allowed to be `None` but the structure must be the same.
 
-      # If the error message doesn't have the expected format then we don't want
-      # to change anything.
-      if len(parts) != 2:
-        raise
+        It is possible to create a "step" using more than one `append` call by
+        setting the `partial_step` flag. Partial steps can be used when some parts
+        of the step becomes available only as a result of inserting (and learning
+        from) trajectories that include the fields available first (e.g learn from
+        the SARS trajectory to select the next action in an on-policy agent). In the
+        final `append` call of the step, `partial_step` must be set to `False`.
+        Failing to "close" the partial step will result in error as the same field
+        must NOT be provided more than once in the same step.
 
-      # Use the structure to find the path that corresponds to the flat index.
-      col_idx, rest = parts[1].split('. ', 1)
-      path = tree.flatten_with_path(self._data_structure)[int(col_idx)][0]
+        Args:
+          data: The (possibly nested) data pushed to internal buffers.
+          partial_step: If `True` then the step is not considered "done" with this
+            call. See above for more details. Defaults to `False`.
 
-      raise ValueError(
-          f'{parts[0]} for column {col_idx} (path={path}). {rest}') from e
+        Raises:
+          ValueError: If the number of items in the flattened data changes between
+            calls.
+        """
+        flat_data = tree.flatten(data)
 
-  def flush(self,
-            block_until_num_items: int = 0,
-            timeout_ms: Optional[int] = None):
-    """Block until all but `block_until_num_items` confirmed by the server.
+        if self._flat_data_length is None:
+            self._flat_data_length = len(flat_data)
+            self._data_structure = tree.map_structure(lambda _: None, data)
 
-    There are two ways that an item could be "pending":
+        if len(flat_data) != self._flat_data_length:
+            raise ValueError(
+                f"Flattened data has an unexpected length, got {len(flat_data)} "
+                f"but wanted {self._flat_data_length}."
+            )
 
-      1. Some of the data elements referenced by the item have not yet been
-         finalized (and compressed) as a `ChunkData`.
-      2. The item has been written to the gRPC stream but the response
-         confirming the insertion has not yet been received.
+        try:
+            if partial_step:
+                self._writer.AppendPartial(flat_data)
+            else:
+                self._writer.Append(flat_data)
+        except ValueError as e:
+            parts = str(e).split(" for column ")
 
-    Type 1 pending items are transformed into type 2 when flush is called by
-    forcing (premature) chunk finalization of the data elements referenced by
-    the items. This will allow the background worker to write the data and items
-    to the gRPC stream and turn them into type 2 pending items.
+            # If the error message doesn't have the expected format then we don't want
+            # to change anything.
+            if len(parts) != 2:
+                raise
 
-    The time it takes for type 2 pending items to be confirmed is primarily
-    due to the state of the table rate limiter. After the items have been
-    written to the gRPC stream then all we can do is wait (GIL is not held).
+            # Use the structure to find the path that corresponds to the flat index.
+            col_idx, rest = parts[1].split(". ", 1)
+            path = tree.flatten_with_path(self._data_structure)[int(col_idx)][0]
 
-    Args:
-      block_until_num_items: If > 0 then this many pending items will be allowed
-        to remain as type 1. If the number of type 1 pending items is less than
-        `block_until_num_items` then we simply wait until the total number of
-        pending items is <= `block_until_num_items`.
-      timeout_ms: (optional, default is no timeout) Maximum time to block for
-        before unblocking and raising a `DeadlineExceededError` instead. Note
-        that although the block is interrupted, the insertion of the items will
-        proceed in the background.
+            raise ValueError(
+                f"{parts[0]} for column {col_idx} (path={path}). {rest}"
+            ) from e
 
-    Raises:
-      ValueError: If `block_until_num_items` < 0.
-      DeadlineExceededError: If operation did not complete before the timeout.
-    """
-    if block_until_num_items < 0:
-      raise ValueError(
-          f'block_until_num_items must be >= 0, got {block_until_num_items}')
+    def flush(self, block_until_num_items: int = 0, timeout_ms: Optional[int] = None):
+        """Block until all but `block_until_num_items` confirmed by the server.
 
-    # pybind Flush 取 int timeout_ms(<=0 视为无限等待);None 需转为 0。
-    self._writer.Flush(block_until_num_items, timeout_ms or 0)
+        There are two ways that an item could be "pending":
 
-  def end_episode(self,
-                  clear_buffers: bool = True,
-                  timeout_ms: Optional[int] = None):
-    """Flush all pending items and generate a new episode ID.
+          1. Some of the data elements referenced by the item have not yet been
+             finalized (and compressed) as a `ChunkData`.
+          2. The item has been written to the gRPC stream but the response
+             confirming the insertion has not yet been received.
 
-    Configurations that are conditioned to only be appied on episode end are
-    applied (assuming all other conditions are fulfilled) and the items inserted
-    before flush is called.
+        Type 1 pending items are transformed into type 2 when flush is called by
+        forcing (premature) chunk finalization of the data elements referenced by
+        the items. This will allow the background worker to write the data and items
+        to the gRPC stream and turn them into type 2 pending items.
 
-    Args:
-      clear_buffers: Whether the history should be cleared or not. Buffers
-        should only not be cleared when trajectories spanning multiple episodes
-        are used.
-      timeout_ms: (optional, default is no timeout) Maximum time to block for
-        before unblocking and raising a `DeadlineExceededError` instead. Note
-        that although the block is interrupted, the buffers and episode ID are
-        reset all the same and the insertion of the items will proceed in the
-        background thread.
+        The time it takes for type 2 pending items to be confirmed is primarily
+        due to the state of the table rate limiter. After the items have been
+        written to the gRPC stream then all we can do is wait (GIL is not held).
 
-    Raises:
-      DeadlineExceededError: If operation did not complete before the timeout.
-    """
-    self._writer.EndEpisode(clear_buffers, timeout_ms)
+        Args:
+          block_until_num_items: If > 0 then this many pending items will be allowed
+            to remain as type 1. If the number of type 1 pending items is less than
+            `block_until_num_items` then we simply wait until the total number of
+            pending items is <= `block_until_num_items`.
+          timeout_ms: (optional, default is no timeout) Maximum time to block for
+            before unblocking and raising a `DeadlineExceededError` instead. Note
+            that although the block is interrupted, the insertion of the items will
+            proceed in the background.
 
-  @property
-  def step_is_open(self) -> bool:
-    """True if `partial_step` was set in the most recent `append`."""
-    return self._writer.step_is_open
+        Raises:
+          ValueError: If `block_until_num_items` < 0.
+          DeadlineExceededError: If operation did not complete before the timeout.
+        """
+        if block_until_num_items < 0:
+            raise ValueError(
+                f"block_until_num_items must be >= 0, got {block_until_num_items}"
+            )
+
+        # pybind Flush 取 int timeout_ms(<=0 视为无限等待);None 需转为 0。
+        self._writer.Flush(block_until_num_items, timeout_ms or 0)
+
+    def end_episode(self, clear_buffers: bool = True, timeout_ms: Optional[int] = None):
+        """Flush all pending items and generate a new episode ID.
+
+        Configurations that are conditioned to only be appied on episode end are
+        applied (assuming all other conditions are fulfilled) and the items inserted
+        before flush is called.
+
+        Args:
+          clear_buffers: Whether the history should be cleared or not. Buffers
+            should only not be cleared when trajectories spanning multiple episodes
+            are used.
+          timeout_ms: (optional, default is no timeout) Maximum time to block for
+            before unblocking and raising a `DeadlineExceededError` instead. Note
+            that although the block is interrupted, the buffers and episode ID are
+            reset all the same and the insertion of the items will proceed in the
+            background thread.
+
+        Raises:
+          DeadlineExceededError: If operation did not complete before the timeout.
+        """
+        self._writer.EndEpisode(clear_buffers, timeout_ms)
+
+    @property
+    def step_is_open(self) -> bool:
+        """True if `partial_step` was set in the most recent `append`."""
+        return self._writer.step_is_open
 
 
 class _RefNode:
-  """Helper class to make it easier to build `PatternNode`s."""
+    """Helper class to make it easier to build `PatternNode`s."""
 
-  def __init__(self, idx: int):
-    self._idx = idx
+    def __init__(self, idx: int):
+        self._idx = idx
 
-  def __getitem__(self, key):
-    if isinstance(key, int):
-      key = slice(key)
-    elif not isinstance(key, slice):
-      raise ValueError(
-          f'Key must be int or slice by got {key} (type {type(key)}).')
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            key = slice(key)
+        elif not isinstance(key, slice):
+            raise ValueError(
+                f"Key must be int or slice by got {key} (type {type(key)})."
+            )
 
-    return patterns_pb2.PatternNode(
-        flat_source_index=self._idx,
-        start=key.start,
-        stop=key.stop,
-        step=key.step)
+        return patterns_pb2.PatternNode(
+            flat_source_index=self._idx, start=key.start, stop=key.stop, step=key.step
+        )
 
 
 def create_reference_step(step_structure: tree.Structure[Any]) -> ReferenceStep:
-  """Create a reference structure that can be used to build patterns.
+    """Create a reference structure that can be used to build patterns.
 
-  ```python
+    ```python
 
-  step_structure = {
-      'a': None,
-      'b': {
-          'c': None,
-          'd': None,
+    step_structure = {
+        'a': None,
+        'b': {
+            'c': None,
+            'd': None,
+      }
     }
-  }
-  ref_step = create_reference_step(step_structure)
-  pattern = {
-      'last_two_a': ref_step['a'][-2:]
-      'second_to_last_c': ref['b']['c'][-2]
-      'most_recent_d': ref['b']['d'][-1]
-  }
+    ref_step = create_reference_step(step_structure)
+    pattern = {
+        'last_two_a': ref_step['a'][-2:]
+        'second_to_last_c': ref['b']['c'][-2]
+        'most_recent_d': ref['b']['d'][-1]
+    }
 
-  ```
+    ```
 
-  Args:
-    step_structure: Structure of the data which will be passed to
-      `StructuredWriter.append`.
+    Args:
+      step_structure: Structure of the data which will be passed to
+        `StructuredWriter.append`.
 
-  Returns:
-    An object with the same structure as `step_structure` except leaf nodes have
-      been replaced with a helper object that builds `patterns_pb2.PatternNode`
-      objects when __getitem__ is called.
-  """
-  return tree.unflatten_as(
-      step_structure,
-      [_RefNode(x) for x in range(len(tree.flatten(step_structure)))])
+    Returns:
+      An object with the same structure as `step_structure` except leaf nodes have
+        been replaced with a helper object that builds `patterns_pb2.PatternNode`
+        objects when __getitem__ is called.
+    """
+    return tree.unflatten_as(
+        step_structure, [_RefNode(x) for x in range(len(tree.flatten(step_structure)))]
+    )
 
 
 def pattern_from_transform(
-    step_structure: tree.Structure[Any],
-    transform: Callable[[ReferenceStep], Pattern]) -> Pattern:
-  """Creates a pattern by invoking a transform from step to output structures.
+    step_structure: tree.Structure[Any], transform: Callable[[ReferenceStep], Pattern]
+) -> Pattern:
+    """Creates a pattern by invoking a transform from step to output structures.
 
-  ```python
+    ```python
 
-  def my_transform(step):
-    return {
-        'last_two_a': step['a'][-2:]
-        'most_recent_b': tree.map_structure(lambda x: x[-1], step['b']),
+    def my_transform(step):
+      return {
+          'last_two_a': step['a'][-2:]
+          'most_recent_b': tree.map_structure(lambda x: x[-1], step['b']),
+      }
+
+    step_structure = {
+      'a': None,
+      'b': {
+        'c': None,
+        'd': None,
+      }
     }
 
-  step_structure = {
-    'a': None,
-    'b': {
-      'c': None,
-      'd': None,
-    }
-  }
+    pattern = pattern_from_transform(step_structure, my_transform)
 
-  pattern = pattern_from_transform(step_structure, my_transform)
+    ```
 
-  ```
+    Args:
+      step_structure: Structure of the data which will be passed to
+        `StructuredWriter.append`.
+      transform: Function that creates the trajectory to be inserted from a
+        reference structure.
 
-  Args:
-    step_structure: Structure of the data which will be passed to
-      `StructuredWriter.append`.
-    transform: Function that creates the trajectory to be inserted from a
-      reference structure.
-
-  Returns:
-    A structure with `patterns_pb2.PatternNode` as leaf nodes.
-  """
-  return transform(create_reference_step(step_structure))
+    Returns:
+      A structure with `patterns_pb2.PatternNode` as leaf nodes.
+    """
+    return transform(create_reference_step(step_structure))
 
 
-def create_config(pattern: Pattern,
-                  table: str,
-                  conditions: Sequence[ConditionProto] = (),
-                  priority: Optional[patterns_pb2.Priority] = None):
-  structure = tree.map_structure(lambda _: None, pattern)
-  if priority is None:
-    priority = constant_priority_fn(1.0)
-  return patterns_pb2.StructuredWriterConfig(
-      flat=tree.flatten(pattern),
-      pattern_structure=encode_structure(structure),
-      table=table,
-      priority=priority,
-      conditions=conditions)
+def create_config(
+    pattern: Pattern,
+    table: str,
+    conditions: Sequence[ConditionProto] = (),
+    priority: Optional[patterns_pb2.Priority] = None,
+):
+    structure = tree.map_structure(lambda _: None, pattern)
+    if priority is None:
+        priority = constant_priority_fn(1.0)
+    return patterns_pb2.StructuredWriterConfig(
+        flat=tree.flatten(pattern),
+        pattern_structure=encode_structure(structure),
+        table=table,
+        priority=priority,
+        conditions=conditions,
+    )
 
 
 def unpack_pattern(config: Config) -> Pattern:
-  if not config.HasField('pattern_structure'):
-    return config.flat
-  structure = decode_structure(config.pattern_structure)
-  return tree.unflatten_as(structure, config.flat)
+    if not config.HasField("pattern_structure"):
+        return config.flat
+    structure = decode_structure(config.pattern_structure)
+    return tree.unflatten_as(structure, config.flat)
 
 
-def infer_signature(configs: Sequence[Config],
-                    step_spec: reverb_types.SpecNest) -> reverb_types.SpecNest:
-  """Infers the table signature from the configs that generate its items.
+def infer_signature(
+    configs: Sequence[Config], step_spec: reverb_types.SpecNest
+) -> reverb_types.SpecNest:
+    """Infers the table signature from the configs that generate its items.
 
-  Args:
-    configs: All the configs used to generate items for the table.
-    step_spec: A structured example of the step that will be appended to the
-      `StructuredWriter`.
+    Args:
+      configs: All the configs used to generate items for the table.
+      step_spec: A structured example of the step that will be appended to the
+        `StructuredWriter`.
 
-  Returns:
-    A nested structure of `TensorSpec` describing the trajectories of the table.
+    Returns:
+      A nested structure of `TensorSpec` describing the trajectories of the table.
 
-  Raises:
-    ValueError: If no configs are provided.
-    ValueError: If configs doesn't produce trajectories of identical structure.
-    ValueError: If configs targets does not all target the same table.
-    ValueError: If configs produce trajectories with incompatible tensors (i.e.
-      tensors cannot be concatenated).
-  """
-  if not configs:
-    raise ValueError('At least one config must be provided.')
+    Raises:
+      ValueError: If no configs are provided.
+      ValueError: If configs doesn't produce trajectories of identical structure.
+      ValueError: If configs targets does not all target the same table.
+      ValueError: If configs produce trajectories with incompatible tensors (i.e.
+        tensors cannot be concatenated).
+    """
+    if not configs:
+        raise ValueError("At least one config must be provided.")
 
-  if any(c.pattern_structure != configs[0].pattern_structure for c in configs):
-    raise ValueError(
-        'All configs must have exactly the same pattern_structure.')
+    if any(c.pattern_structure != configs[0].pattern_structure for c in configs):
+        raise ValueError("All configs must have exactly the same pattern_structure.")
 
-  if any(c.table != configs[0].table for c in configs):
-    raise ValueError(
-        f'All configs must target the same table but provided configs '
-        f'included {", ".join(sorted(set(c.table for c in configs)))}.')
+    if any(c.table != configs[0].table for c in configs):
+        raise ValueError(
+            f"All configs must target the same table but provided configs "
+            f"included {', '.join(sorted(set(c.table for c in configs)))}."
+        )
 
-  flat_step_spec = tree.flatten(step_spec)
+    flat_step_spec = tree.flatten(step_spec)
 
-  # Uses the pure-Python `signature_codec.TensorSpec` (no TF). `step_spec`
-  # leaves are numpy arrays, so `.dtype` / `.shape` are native numpy attrs.
-  TensorSpec = signature_codec.TensorSpec
+    # Uses the pure-Python `signature_codec.TensorSpec` (no TF). `step_spec`
+    # leaves are numpy arrays, so `.dtype` / `.shape` are native numpy attrs.
+    TensorSpec = signature_codec.TensorSpec
 
-  def _validate_and_convert_to_spec(path, *nodes):
-    # Check that all nodes share the same dtype.
-    dtypes = [flat_step_spec[node.flat_source_index].dtype for node in nodes]
-    if any(dtype != dtypes[0] for dtype in dtypes):
-      raise ValueError(
-          f'Configs produce trajectories with multiple dtypes at {path}. '
-          f'Got {dtypes}.')
+    def _validate_and_convert_to_spec(path, *nodes):
+        # Check that all nodes share the same dtype.
+        dtypes = [flat_step_spec[node.flat_source_index].dtype for node in nodes]
+        if any(dtype != dtypes[0] for dtype in dtypes):
+            raise ValueError(
+                f"Configs produce trajectories with multiple dtypes at {path}. "
+                f"Got {dtypes}."
+            )
 
-    # Create shapes for all nodes.
-    shapes = []
-    for node in nodes:
-      shape = list(flat_step_spec[node.flat_source_index].shape)
-      if node.HasField('start'):
-        length = math.ceil((node.stop - node.start) / (node.step or 1))
-        shape = [length, *shape]
+        # Create shapes for all nodes.
+        shapes = []
+        for node in nodes:
+            shape = list(flat_step_spec[node.flat_source_index].shape)
+            if node.HasField("start"):
+                length = math.ceil((node.stop - node.start) / (node.step or 1))
+                shape = [length, *shape]
 
-      shapes.append(shape)
+            shapes.append(shape)
 
-    # Check that all shapes are either completely identical or at least
-    # identical in all dimensions but the first.
-    if (any(len(shape) != len(shapes[0]) for shape in shapes) or
-        (len(shapes[0]) > 1 and
-         any(shape[1:] != shapes[0][1:] for shape in shapes))):
-      raise ValueError(
-          f'Configs produce trajectories with incompatible shapes at {path}. '
-          f'Got {shapes}.')
+        # Check that all shapes are either completely identical or at least
+        # identical in all dimensions but the first.
+        if any(len(shape) != len(shapes[0]) for shape in shapes) or (
+            len(shapes[0]) > 1 and any(shape[1:] != shapes[0][1:] for shape in shapes)
+        ):
+            raise ValueError(
+                f"Configs produce trajectories with incompatible shapes at {path}. "
+                f"Got {shapes}."
+            )
 
-    # Merge the shapes into a single shape. If the first dimension varies then
-    # we set the leading dimension as unknown (None).
-    if all(shape == shapes[0] for shape in shapes):
-      merged_shape = shapes[0]
-    else:
-      merged_shape = [None, *shapes[0][1:]]
+        # Merge the shapes into a single shape. If the first dimension varies then
+        # we set the leading dimension as unknown (None).
+        if all(shape == shapes[0] for shape in shapes):
+            merged_shape = shapes[0]
+        else:
+            merged_shape = [None, *shapes[0][1:]]
 
-    return TensorSpec(
-        shape=merged_shape,
-        dtype=dtypes[0],
-        name='/'.join(str(x) for x in path))
+        return TensorSpec(
+            shape=merged_shape, dtype=dtypes[0], name="/".join(str(x) for x in path)
+        )
 
-  patterns = [unpack_pattern(config) for config in configs]
-  return tree.map_structure_with_path(_validate_and_convert_to_spec, *patterns)
+    patterns = [unpack_pattern(config) for config in configs]
+    return tree.map_structure_with_path(_validate_and_convert_to_spec, *patterns)
 
 
 class _ConditionBuilder:
-  """Helper class to make it easier to build conditions."""
+    """Helper class to make it easier to build conditions."""
 
-  def __init__(self, incomplete_condition: ConditionProto):
-    self._incomplete_condition = incomplete_condition
+    def __init__(self, incomplete_condition: ConditionProto):
+        self._incomplete_condition = incomplete_condition
 
-  def __mod__(self, cmp: int) -> '_ConditionBuilder':
-    incomplete_condition = copy.deepcopy(self._incomplete_condition)
-    incomplete_condition.mod_eq.mod = cmp
-    return _ConditionBuilder(incomplete_condition)
+    def __mod__(self, cmp: int) -> "_ConditionBuilder":
+        incomplete_condition = copy.deepcopy(self._incomplete_condition)
+        incomplete_condition.mod_eq.mod = cmp
+        return _ConditionBuilder(incomplete_condition)
 
-  # pytype: disable=signature-mismatch  # overriding-return-type-checks
-  def __eq__(self, cmp: int) -> ConditionProto:
-    condition = copy.deepcopy(self._incomplete_condition)
-    if condition.mod_eq.mod:
-      condition.mod_eq.eq = cmp
-    else:
-      condition.eq = cmp
-    return condition
+    # pytype: disable=signature-mismatch  # overriding-return-type-checks
+    def __eq__(self, cmp: int) -> ConditionProto:
+        condition = copy.deepcopy(self._incomplete_condition)
+        if condition.mod_eq.mod:
+            condition.mod_eq.eq = cmp
+        else:
+            condition.eq = cmp
+        return condition
 
-  def __ne__(self, cmp: int) -> ConditionProto:
-    condition = self == cmp
-    condition.inverse = True
-    return condition
+    def __ne__(self, cmp: int) -> ConditionProto:
+        condition = self == cmp
+        condition.inverse = True
+        return condition
 
-  def __gt__(self, cmp: int) -> ConditionProto:
-    return self >= cmp + 1
+    def __gt__(self, cmp: int) -> ConditionProto:
+        return self >= cmp + 1
 
-  def __ge__(self, cmp: int) -> ConditionProto:
-    condition = copy.deepcopy(self._incomplete_condition)
-    condition.ge = cmp
-    return condition
+    def __ge__(self, cmp: int) -> ConditionProto:
+        condition = copy.deepcopy(self._incomplete_condition)
+        condition.ge = cmp
+        return condition
 
-  def __lt__(self, cmp: int) -> ConditionProto:
-    return self <= cmp - 1
+    def __lt__(self, cmp: int) -> ConditionProto:
+        return self <= cmp - 1
 
-  def __le__(self, cmp: int) -> ConditionProto:
-    condition = self > cmp
-    condition.inverse = True
-    return condition
+    def __le__(self, cmp: int) -> ConditionProto:
+        condition = self > cmp
+        condition.inverse = True
+        return condition
 
-  # pytype: enable=signature-mismatch  # overriding-return-type-checks
+    # pytype: enable=signature-mismatch  # overriding-return-type-checks
 
 
 class Condition:
-  """Building blocks to create conditions from."""
+    """Building blocks to create conditions from."""
 
-  @staticmethod
-  def step_index():
-    """(Zero) index of the most recent appended step within the episode."""
-    return _ConditionBuilder(ConditionProto(step_index=True))
+    @staticmethod
+    def step_index():
+        """(Zero) index of the most recent appended step within the episode."""
+        return _ConditionBuilder(ConditionProto(step_index=True))
 
-  @staticmethod
-  def steps_since_applied():
-    """Number of added steps since an item was created for this config."""
-    return _ConditionBuilder(ConditionProto(steps_since_applied=True))
+    @staticmethod
+    def steps_since_applied():
+        """Number of added steps since an item was created for this config."""
+        return _ConditionBuilder(ConditionProto(steps_since_applied=True))
 
-  @staticmethod
-  def is_end_episode():
-    """True only when end_episode is called on the writer."""
-    return ConditionProto(is_end_episode=True, eq=1)
+    @staticmethod
+    def is_end_episode():
+        """True only when end_episode is called on the writer."""
+        return ConditionProto(is_end_episode=True, eq=1)
 
-  @staticmethod
-  def data(step_structure: tree.Structure[Any]):
-    """Value of a scalar integer or bool in the source data."""
-    flat = [
-        _ConditionBuilder(ConditionProto(flat_source_index=i))
-        for i in range(len(tree.flatten(step_structure)))
-    ]
-    return tree.unflatten_as(step_structure, flat)
+    @staticmethod
+    def data(step_structure: tree.Structure[Any]):
+        """Value of a scalar integer or bool in the source data."""
+        flat = [
+            _ConditionBuilder(ConditionProto(flat_source_index=i))
+            for i in range(len(tree.flatten(step_structure)))
+        ]
+        return tree.unflatten_as(step_structure, flat)
 
 
 def constant_priority_fn(value: float) -> patterns_pb2.Priority:
-  """Builds a priority function that always returns the same value.
+    """Builds a priority function that always returns the same value.
 
-  Args:
-    value: constant priority value.
+    Args:
+      value: constant priority value.
 
-  Returns:
-    Priority function that always returns a constant value.
-  """
+    Returns:
+      Priority function that always returns a constant value.
+    """
 
-  return patterns_pb2.Priority(
-      constant_fn=patterns_pb2.Priority.ConstantPriorityFn(value=value))
+    return patterns_pb2.Priority(
+        constant_fn=patterns_pb2.Priority.ConstantPriorityFn(value=value)
+    )
 
 
 def td_error(
-    max_priority_weight: float, step_structure: tree.Structure[Any],
-    get_field_from_step_fn: Callable[[tree.Structure[Any]], Any]
+    max_priority_weight: float,
+    step_structure: tree.Structure[Any],
+    get_field_from_step_fn: Callable[[tree.Structure[Any]], Any],
 ) -> patterns_pb2.Priority:
-  """Builds a td_error priority function.
+    """Builds a td_error priority function.
 
-  See details of the TD error in https://openreview.net/pdf?id=r1lyTjAqYX.
+    See details of the TD error in https://openreview.net/pdf?id=r1lyTjAqYX.
 
-  The TD error of a trajectory is computed by combining the TD error at each
-  timestep. If that column is called `td_error`, the computation to obtain the
-  trajectory TD error is:
+    The TD error of a trajectory is computed by combining the TD error at each
+    timestep. If that column is called `td_error`, the computation to obtain the
+    trajectory TD error is:
 
-  ```
-  abs_td_error = jnp.abs(td_error)
-  max_priority = max_priority_weight * jnp.max(abs_td_error, axis=0)
-  mean_priority = (1 - max_priority_weight) * jnp.mean(abs_td_error, axis=0)
-  priority = max_priority + mean_priority
-  ```
+    ```
+    abs_td_error = jnp.abs(td_error)
+    max_priority = max_priority_weight * jnp.max(abs_td_error, axis=0)
+    mean_priority = (1 - max_priority_weight) * jnp.mean(abs_td_error, axis=0)
+    priority = max_priority + mean_priority
+    ```
 
-  Args:
-    max_priority_weight: max priority weight to use in the TD error computation.
-    step_structure: structure of the step.
-    get_field_from_step_fn: This function gets a step and returns the field that
-      contains the per-step TD error. Note that this field corresponds to the
-      input step, and has to be present also in the resulting trajectory (if the
-      trajectory is a dictionary, the name of the field in the trajectory can
-      change). Besides, this field from the input step should only correspond to
-      one field in the resulting trajectory, otherwise we cannot guarantee which
-      one is used to compute the priority.
+    Args:
+      max_priority_weight: max priority weight to use in the TD error computation.
+      step_structure: structure of the step.
+      get_field_from_step_fn: This function gets a step and returns the field that
+        contains the per-step TD error. Note that this field corresponds to the
+        input step, and has to be present also in the resulting trajectory (if the
+        trajectory is a dictionary, the name of the field in the trajectory can
+        change). Besides, this field from the input step should only correspond to
+        one field in the resulting trajectory, otherwise we cannot guarantee which
+        one is used to compute the priority.
 
-  Returns:
-    A priority function which computes the priority as the TD error.
-  """
+    Returns:
+      A priority function which computes the priority as the TD error.
+    """
 
-  def get_flat_index(step_structure):
-    flat = list(range(len(tree.flatten(step_structure))))
-    return tree.unflatten_as(step_structure, flat)
+    def get_flat_index(step_structure):
+        flat = list(range(len(tree.flatten(step_structure))))
+        return tree.unflatten_as(step_structure, flat)
 
-  index = get_field_from_step_fn(get_flat_index(step_structure))
+    index = get_field_from_step_fn(get_flat_index(step_structure))
 
-  return patterns_pb2.Priority(
-      td_error=patterns_pb2.Priority.TDError(
-          max_priority_weight=max_priority_weight, flat_source_index=index))
+    return patterns_pb2.Priority(
+        td_error=patterns_pb2.Priority.TDError(
+            max_priority_weight=max_priority_weight, flat_source_index=index
+        )
+    )
 
 
-if __name__ == '__main__':
-  # ponytail: encode/decode_structure 往返自检(dict/list/tuple + None 叶子)。
-  for struct in (
-      {'a': None, 'b': {'c': None}},
-      [None, None, None],
-      ({'x': None}, [None]),
-      None,
-  ):
-    got = decode_structure(encode_structure(struct))
-    assert got == struct, (struct, got)
-  print('PASS')
+if __name__ == "__main__":
+    # ponytail: encode/decode_structure 往返自检(dict/list/tuple + None 叶子)。
+    for struct in (
+        {"a": None, "b": {"c": None}},
+        [None, None, None],
+        ({"x": None}, [None]),
+        None,
+    ):
+        got = decode_structure(encode_structure(struct))
+        assert got == struct, (struct, got)
+    print("PASS")

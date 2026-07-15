@@ -7,9 +7,9 @@ which ru_maxrss on the parent misses.
 
 Prints peak cgroup usage in GB alongside exit code.
 """
+
 import subprocess
 import sys
-import threading
 import time
 
 CGROUP_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
@@ -20,8 +20,9 @@ def main():
     args = sys.argv[1:] or ["--quick"]
     print(f"# cg-probe: {TARGET} {' '.join(args)}", flush=True)
 
-    proc = subprocess.Popen([TARGET] + args, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        [TARGET] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
     peak = 0
     samples = []
     while proc.poll() is None:
@@ -40,8 +41,11 @@ def main():
     print(f"# exit: {rc}", flush=True)
     print(f"# peak cgroup mem: {peak:.2f} GB", flush=True)
     if samples:
-        print(f"# samples: {len(samples)}, "
-              f"start={samples[0]:.2f}GB end={samples[-1]:.2f}GB", flush=True)
+        print(
+            f"# samples: {len(samples)}, "
+            f"start={samples[0]:.2f}GB end={samples[-1]:.2f}GB",
+            flush=True,
+        )
     sys.exit(1 if (rc < 0 or rc == 137) else 0)
 
 

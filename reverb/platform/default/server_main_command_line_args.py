@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Get server configuration (constructor args) from textproto cli arg.
-"""
-from absl import flags
-from reverb.server_executable import reverb_config_pb2
+"""Get server configuration (constructor args) from textproto cli arg."""
 
+from absl import flags
 from google.protobuf import text_format
 
+from reverb.server_executable import reverb_config_pb2
 
 _CONFIG = flags.DEFINE_string(
-    "config", None, "Reverb server config in textproto format",
-    required=True)
+    "config", None, "Reverb server config in textproto format", required=True
+)
 
 
 def get_server_config_proto() -> reverb_config_pb2.ReverbServerConfig:
-  config_proto = reverb_config_pb2.ReverbServerConfig()
-  text_format.Parse(_CONFIG.value, config_proto)
-  return config_proto
+    config_proto = reverb_config_pb2.ReverbServerConfig()
+    text_format.Parse(_CONFIG.value, config_proto)
+    return config_proto

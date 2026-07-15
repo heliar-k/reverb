@@ -32,7 +32,6 @@ import numpy as np
 
 import reverb
 
-
 # ---------------------------------------------------------------------------
 # Dummy RL environment (pure numpy)
 # ---------------------------------------------------------------------------
@@ -47,8 +46,7 @@ def agent_step(unused_timestep) -> np.ndarray:
 
 
 def environment_step(unused_action) -> np.ndarray:
-    return np.random.randint(
-        0, 256, size=OBSERVATION_SHAPE, dtype=OBSERVATION_DTYPE)
+    return np.random.randint(0, 256, size=OBSERVATION_SHAPE, dtype=OBSERVATION_DTYPE)
 
 
 # ===========================================================================
@@ -65,7 +63,7 @@ def example_1_overlapping_trajectories():
     server = reverb.Server(
         tables=[
             reverb.Table(
-                name='my_table',
+                name="my_table",
                 sampler=reverb.selectors.Prioritized(priority_exponent=0.8),
                 remover=reverb.selectors.Fifo(),
                 max_size=int(1e6),
@@ -84,27 +82,30 @@ def example_1_overlapping_trajectories():
             timestep = environment_step(None)
             for step in range(4):
                 action = agent_step(timestep)
-                writer.append({'action': action, 'observation': timestep})
+                writer.append({"action": action, "observation": timestep})
                 timestep = environment_step(action)
 
                 if step >= 2:
                     # The item consists of the 3 most recent timesteps.
                     writer.create_item(
-                        table='my_table',
+                        table="my_table",
                         priority=1.5,
                         trajectory={
-                            'actions': writer.history['action'][-3:],
-                            'observations': writer.history['observation'][-3:],
+                            "actions": writer.history["action"][-3:],
+                            "observations": writer.history["observation"][-3:],
                         },
                     )
 
             writer.flush()
 
         # Sample: emit_timesteps=False returns one ReplaySample per item.
-        for sample in client.sample('my_table', num_samples=2,
-                                    emit_timesteps=False):
-            print('  actions shape:', np.asarray(sample.data[0]).shape)      # e.g. actions shape: (3, 2)
-            print('  observations shape:', np.asarray(sample.data[1]).shape)  # e.g. observations shape: (3, 10, 10)
+        for sample in client.sample("my_table", num_samples=2, emit_timesteps=False):
+            print(
+                "  actions shape:", np.asarray(sample.data[0]).shape
+            )  # e.g. actions shape: (3, 2)
+            print(
+                "  observations shape:", np.asarray(sample.data[1]).shape
+            )  # e.g. observations shape: (3, 10, 10)
 
     finally:
         server.stop()
@@ -129,7 +130,7 @@ def example_2_complete_episodes():
     server = reverb.Server(
         tables=[
             reverb.Table(
-                name='my_table',
+                name="my_table",
                 sampler=reverb.selectors.Prioritized(priority_exponent=0.8),
                 remover=reverb.selectors.Fifo(),
                 max_size=int(1e6),
@@ -149,34 +150,37 @@ def example_2_complete_episodes():
 
                 for _ in range(EPISODE_LENGTH):
                     action = agent_step(timestep)
-                    writer.append({'action': action, 'observation': timestep})
+                    writer.append({"action": action, "observation": timestep})
                     timestep = environment_step(action)
 
                 # Terminal observation WITHOUT an action.
-                writer.append({'observation': timestep})
+                writer.append({"observation": timestep})
 
                 # Action history is one shorter than observation history
                 # because the terminal step has no action.
                 # Drop the last (None) entry.
                 writer.create_item(
-                    table='my_table',
+                    table="my_table",
                     priority=1.5,
                     trajectory={
-                        'actions': writer.history['action'][:-1],
-                        'observations': writer.history['observation'][:],
+                        "actions": writer.history["action"][:-1],
+                        "observations": writer.history["observation"][:],
                     },
                 )
 
                 # Blocks until insert confirmed, then clears history.
                 writer.end_episode(timeout_ms=1000)
 
-                assert len(writer.history['action']) == 0
-                assert len(writer.history['observation']) == 0
+                assert len(writer.history["action"]) == 0
+                assert len(writer.history["observation"]) == 0
 
-        for sample in client.sample('my_table', num_samples=2,
-                                    emit_timesteps=False):
-            print('  actions shape:', np.asarray(sample.data[0]).shape)      # e.g. actions shape: (150, 2)
-            print('  observations shape:', np.asarray(sample.data[1]).shape)  # e.g. observations shape: (151, 10, 10)
+        for sample in client.sample("my_table", num_samples=2, emit_timesteps=False):
+            print(
+                "  actions shape:", np.asarray(sample.data[0]).shape
+            )  # e.g. actions shape: (150, 2)
+            print(
+                "  observations shape:", np.asarray(sample.data[1]).shape
+            )  # e.g. observations shape: (151, 10, 10)
 
     finally:
         server.stop()
@@ -197,14 +201,14 @@ def example_3_multiple_tables():
     server = reverb.Server(
         tables=[
             reverb.Table(
-                name='my_table_a',
+                name="my_table_a",
                 sampler=reverb.selectors.Prioritized(priority_exponent=0.8),
                 remover=reverb.selectors.Fifo(),
                 max_size=int(1e6),
                 rate_limiter=reverb.rate_limiters.MinSize(2),
             ),
             reverb.Table(
-                name='my_table_b',
+                name="my_table_b",
                 sampler=reverb.selectors.Uniform(),
                 remover=reverb.selectors.Fifo(),
                 max_size=int(1e6),
@@ -221,34 +225,34 @@ def example_3_multiple_tables():
             timestep = environment_step(None)
             for step in range(4):
                 action = agent_step(timestep)
-                writer.append({'action': action, 'observation': timestep})
+                writer.append({"action": action, "observation": timestep})
                 timestep = environment_step(action)
 
                 if step >= 2:
                     # Length-3 trajectory into the prioritized table.
                     writer.create_item(
-                        table='my_table_a',
+                        table="my_table_a",
                         priority=1.5,
                         trajectory={
-                            'actions': writer.history['action'][-3:],
-                            'observations': writer.history['observation'][-3:],
+                            "actions": writer.history["action"][-3:],
+                            "observations": writer.history["observation"][-3:],
                         },
                     )
                     # Length-2 trajectory into the uniform table.
                     writer.create_item(
-                        table='my_table_b',
+                        table="my_table_b",
                         priority=1.0,
                         trajectory={
-                            'actions': writer.history['action'][-2:],
-                            'observations': writer.history['observation'][-2:],
+                            "actions": writer.history["action"][-2:],
+                            "observations": writer.history["observation"][-2:],
                         },
                     )
 
             writer.flush()
 
         info = client.server_info()
-        print('  table_a items:', info['my_table_a'].current_size)
-        print('  table_b items:', info['my_table_b'].current_size)
+        print("  table_a items:", info["my_table_a"].current_size)
+        print("  table_b items:", info["my_table_b"].current_size)
 
     finally:
         server.stop()
@@ -270,11 +274,11 @@ def example_4_checkpointing():
     print("Example 4: Checkpointing")
     print("=" * 60)
 
-    ckpt_root = tempfile.mkdtemp(prefix='reverb_ckpt_')
+    ckpt_root = tempfile.mkdtemp(prefix="reverb_ckpt_")
 
     def _ckpt_table():
         return reverb.Table(
-            name='q',
+            name="q",
             sampler=reverb.selectors.Fifo(),
             remover=reverb.selectors.Fifo(),
             max_size=10,
@@ -287,19 +291,21 @@ def example_4_checkpointing():
         tables=[_ckpt_table()],
         in_process=True,
         checkpointer=reverb.platform.checkpointers_lib.DefaultCheckpointer(
-            path=ckpt_root),
+            path=ckpt_root
+        ),
     )
     c = ckpt_server.in_process_client
     with c.trajectory_writer(num_keep_alive_refs=1) as w:
         for i in range(5):
-            w.append({'v': np.array([i], dtype=np.float32)})
+            w.append({"v": np.array([i], dtype=np.float32)})
             w.create_item(
-                table='q', priority=1.0,
-                trajectory={'v': w.history['v'][-1:]},
+                table="q",
+                priority=1.0,
+                trajectory={"v": w.history["v"][-1:]},
             )
         w.flush()
     path = c.checkpoint()
-    print('  checkpoint written to:', path)
+    print("  checkpoint written to:", path)
     del ckpt_server
 
     # Restore into a new server.
@@ -307,12 +313,13 @@ def example_4_checkpointing():
         tables=[_ckpt_table()],
         in_process=True,
         checkpointer=reverb.platform.checkpointers_lib.DefaultCheckpointer(
-            path=ckpt_root),
+            path=ckpt_root
+        ),
     )
     rc = restored_server.in_process_client
-    print('  restored table size:', rc.server_info()['q'].current_size)
-    for sample in rc.sample('q', num_samples=5, emit_timesteps=False):
-        print('  restored value:', np.asarray(sample.data[0]).reshape(-1)[0])
+    print("  restored table size:", rc.server_info()["q"].current_size)
+    for sample in rc.sample("q", num_samples=5, emit_timesteps=False):
+        print("  restored value:", np.asarray(sample.data[0]).reshape(-1)[0])
     restored_server.stop()
 
 
@@ -328,5 +335,5 @@ def main():
     print("All examples passed.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

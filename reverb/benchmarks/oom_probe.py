@@ -14,6 +14,7 @@ Usage:
   python reverb/benchmarks/oom_probe.py -- --mode pipeline --transport grpc \
         --payload large --table-size 10000 --duration 10
 """
+
 import os
 import resource
 import signal
@@ -44,18 +45,20 @@ def main():
 
     # Use the bazel-built stub (hermetic python with numpy/psutil/reverb),
     # not the system python which lacks those deps.
-    target = os.environ.get("CLIENT_BENCH", "bazel-bin/reverb/benchmarks/client_benchmark")
+    target = os.environ.get(
+        "CLIENT_BENCH", "bazel-bin/reverb/benchmarks/client_benchmark"
+    )
     cmd = [target] + args
     print(f"# probe: {' '.join(args)}", flush=True)
     print(f"# probe: cmd={' '.join(cmd)}", flush=True)
 
     t0 = time.perf_counter()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
 
     peak_rss = 0.0
     samples = []
-    killed_by_signal = None
 
     # Stream child output while sampling RSS.
     while True:
@@ -81,15 +84,16 @@ def main():
 
     if rc < 0:
         sig = -rc
-        killed_by_signal = sig
-        verdict = (f"KILLED by signal {sig} "
-                   f"({signal.Signals(sig).name}) — likely OOM if SIGKILL(9)")
+        verdict = (
+            f"KILLED by signal {sig} "
+            f"({signal.Signals(sig).name}) — likely OOM if SIGKILL(9)"
+        )
     elif rc == 137:
         verdict = "exit 137 (128+SIGKILL) — classic OOM-killer signature"
     else:
         verdict = f"normal exit rc={rc}"
 
-    print(f"\n# ── probe summary ──", flush=True)
+    print("\n# ── probe summary ──", flush=True)
     print(f"# config:      {' '.join(args)}", flush=True)
     print(f"# exit code:   {rc}", flush=True)
     print(f"# verdict:     {verdict}", flush=True)
@@ -99,8 +103,8 @@ def main():
         last = samples[-5:]
         print(f"# last 5 RSS:  {['%.0f' % s for s in last]} MB", flush=True)
         # climb in the last samples == grew until killed
-        if len(samples) >= 5 and samples[-1] >= samples[len(samples)//2]:
-            print(f"# note:        RSS still climbing near end", flush=True)
+        if len(samples) >= 5 and samples[-1] >= samples[len(samples) // 2]:
+            print("# note:        RSS still climbing near end", flush=True)
 
     # Also report this parent's own peak (ru_maxrss is in kB on Linux).
     ru = resource.getrusage(resource.RUSAGE_CHILDREN)

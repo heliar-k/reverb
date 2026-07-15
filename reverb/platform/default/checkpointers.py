@@ -22,4 +22,4 @@ TempDirCheckpointer = checkpointers_lib.TempDirCheckpointer
 
 
 def default_checkpointer() -> CheckpointerBase:
-  return TempDirCheckpointer()
+    return TempDirCheckpointer()

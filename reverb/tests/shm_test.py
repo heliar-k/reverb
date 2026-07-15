@@ -31,12 +31,11 @@ import tempfile
 import threading
 import time
 
-from absl.testing import absltest
 import numpy as np
+from absl.testing import absltest
 
 import reverb
-from reverb import errors
-from reverb import structured_writer
+from reverb import errors, structured_writer
 
 
 def _make_table(
@@ -325,9 +324,7 @@ class ShmConcurrentWriterSamplerTest(absltest.TestCase):
     """
 
     def test_concurrent_writer_and_sampler_on_one_client(self):
-        server, client = _make_shm_server(
-            table_name="t", max_size=10000, min_size=1
-        )
+        server, client = _make_shm_server(table_name="t", max_size=10000, min_size=1)
         stop = threading.Event()
         errs = []
         items_written = []

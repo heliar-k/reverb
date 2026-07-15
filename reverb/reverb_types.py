@@ -17,9 +17,7 @@
 import dataclasses
 from typing import Any, Optional, Union
 
-from reverb import pybind
-from reverb import signature_codec
-
+from reverb import pybind, signature_codec
 from reverb.cc import schema_pb2
 
 Fifo = pybind.FifoSelector
@@ -38,50 +36,52 @@ SpecNest = Any
 
 @dataclasses.dataclass
 class TableInfo:
-  """A tuple describing Table information.
+    """A tuple describing Table information.
 
-  The main difference between this object and a `schema_pb2.TableInfo` message
-  is that the signature is a nested structure of `signature_codec.TensorSpec`
-  objects, instead of a raw proto.
+    The main difference between this object and a `schema_pb2.TableInfo` message
+    is that the signature is a nested structure of `signature_codec.TensorSpec`
+    objects, instead of a raw proto.
 
-  It also has a `TableInfo.from_serialized_proto` classmethod, which is an
-  alternate constructor for creating a `TableInfo` object from a serialized
-  `schema_pb2.TableInfo` proto.
-  """
-  # LINT.IfChange
-  name: str
-  sampler_options: schema_pb2.KeyDistributionOptions
-  remover_options: schema_pb2.KeyDistributionOptions
-  max_size: int
-  max_times_sampled: int
-  rate_limiter_info: schema_pb2.RateLimiterInfo
-  signature: Optional[SpecNest]
-  current_size: int
-  num_episodes: int
-  num_deleted_episodes: int
-  num_unique_samples: int
-  table_worker_time: schema_pb2.TableWorkerTime
-  # LINT.ThenChange(../../reverb/schema.proto)
+    It also has a `TableInfo.from_serialized_proto` classmethod, which is an
+    alternate constructor for creating a `TableInfo` object from a serialized
+    `schema_pb2.TableInfo` proto.
+    """
 
-  @classmethod
-  def from_serialized_proto(cls, proto_string: bytes) -> 'TableInfo':
-    """Constructs a TableInfo from a serialized `schema_pb2.TableInfo`."""
-    proto = schema_pb2.TableInfo.FromString(proto_string)
-    signature = None
-    if proto.HasField('signature'):
-      signature = signature_codec.decode_signature(
-          proto.signature.SerializeToString())
-    return cls(
-        name=proto.name,
-        sampler_options=proto.sampler_options,
-        remover_options=proto.remover_options,
-        max_size=proto.max_size,
-        max_times_sampled=proto.max_times_sampled,
-        rate_limiter_info=proto.rate_limiter_info,
-        signature=signature,
-        current_size=proto.current_size,
-        num_episodes=proto.num_episodes,
-        num_deleted_episodes=proto.num_deleted_episodes,
-        num_unique_samples=proto.num_unique_samples,
-        table_worker_time=proto.table_worker_time,
+    # LINT.IfChange
+    name: str
+    sampler_options: schema_pb2.KeyDistributionOptions
+    remover_options: schema_pb2.KeyDistributionOptions
+    max_size: int
+    max_times_sampled: int
+    rate_limiter_info: schema_pb2.RateLimiterInfo
+    signature: Optional[SpecNest]
+    current_size: int
+    num_episodes: int
+    num_deleted_episodes: int
+    num_unique_samples: int
+    table_worker_time: schema_pb2.TableWorkerTime
+    # LINT.ThenChange(../../reverb/schema.proto)
+
+    @classmethod
+    def from_serialized_proto(cls, proto_string: bytes) -> "TableInfo":
+        """Constructs a TableInfo from a serialized `schema_pb2.TableInfo`."""
+        proto = schema_pb2.TableInfo.FromString(proto_string)
+        signature = None
+        if proto.HasField("signature"):
+            signature = signature_codec.decode_signature(
+                proto.signature.SerializeToString()
+            )
+        return cls(
+            name=proto.name,
+            sampler_options=proto.sampler_options,
+            remover_options=proto.remover_options,
+            max_size=proto.max_size,
+            max_times_sampled=proto.max_times_sampled,
+            rate_limiter_info=proto.rate_limiter_info,
+            signature=signature,
+            current_size=proto.current_size,
+            num_episodes=proto.num_episodes,
+            num_deleted_episodes=proto.num_deleted_episodes,
+            num_unique_samples=proto.num_unique_samples,
+            table_worker_time=proto.table_worker_time,
         )

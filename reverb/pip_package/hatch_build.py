@@ -28,17 +28,15 @@ from hatchling.metadata.plugin.interface import MetadataHookInterface
 
 
 class CustomBuildHook(BuildHookInterface):
-
-  def initialize(self, version: str, build_data: dict[str, Any]):
-    build_data['infer_tag'] = True
-    build_data['platform'] = os.environ['plat_name']
-    build_data['pure_python'] = False
+    def initialize(self, version: str, build_data: dict[str, Any]):
+        build_data["infer_tag"] = True
+        build_data["platform"] = os.environ["plat_name"]
+        build_data["pure_python"] = False
 
 
 class MetaDataHook(MetadataHookInterface):
-
-  def update(self, metadata: dict[str, Any]) -> None:
-    metadata['version'] = os.environ['version']
-    # ponytail: 去除 tensorflow optional-dependency——内嵌 numpy 模式不依赖 TF。
-    metadata['optional-dependencies'] = {}
-    metadata['name'] = os.environ['project_name']
+    def update(self, metadata: dict[str, Any]) -> None:
+        metadata["version"] = os.environ["version"]
+        # ponytail: 去除 tensorflow optional-dependency——内嵌 numpy 模式不依赖 TF。
+        metadata["optional-dependencies"] = {}
+        metadata["name"] = os.environ["project_name"]
