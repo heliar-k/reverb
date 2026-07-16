@@ -37,7 +37,12 @@ struct TensorSpec {
 //   - FromNdArray 时 Py_INCREF 持 PyObject*,拿 PyArray_DATA 裸指针
 //   - worker 线程读裸指针,不持 GIL
 //   - 释放时入 DeferredFreeQueue,主线程持 GIL 统一 Py_DECREF
-class TensorBuffer {
+//
+// ponytail: pybind11 把 pybind11 namespace 标为 visibility("hidden"),
+// 参数含 py::object 的方法 (FromNdArray/ToNdArray) 可见性被降为 hidden,
+// 导致 libreverb.so 的 version-script (*deepmind*reverb*) 无法导出它们,
+// libpybind.so import 时 undefined symbol。显式 default 恢复导出。
+class __attribute__((visibility("default"))) TensorBuffer {
  public:
   TensorBuffer() = default;
   TensorBuffer(TensorSpec spec, std::string bytes);
