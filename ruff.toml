@@ -31,8 +31,6 @@ ignore = [
 # __init__.py re-exports public API symbols; F401 (unused import) is the whole
 # point here.
 "reverb/__init__.py" = ["F401"]
-# configure.py is a legacy setup script using cross-scope file handles.
-"configure.py" = ["SIM115"]
 
 [format]
 quote-style = "double"
