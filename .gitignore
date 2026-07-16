@@ -17,3 +17,13 @@
 __pycache__/
 *.pyc
 /tags
+
+# Editable install: bazel 生成产物被复制进源树 (build_editable)
+/reverb/libpybind.so
+/reverb/libreverb.so
+/reverb/pybind.py
+/reverb/cc/schema_pb2.py
+/reverb/cc/patterns_pb2.py
+/reverb/cc/checkpointing/checkpoint_pb2.py
+/reverb/server_executable/reverb_config_pb2.py
+/third_party/reverb_tensor/reverb_tensor_pb2.py
