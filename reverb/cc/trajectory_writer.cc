@@ -1361,19 +1361,21 @@ absl::Status TrajectoryWriter::FlushLocked(int ignore_last_num_items,
   // `ignore_last_num_items` items to the server. We release the mutex and wait
   // for the items to be confirmed or the TrajectoryWriter to be closed.
   //
-  // BUGFIX: also break out when the worker has died (stream_ok_ == false).
-  // The SHM/local worker can exit with items still in write_queue_/
-  // in_flight_items_ (e.g. an unhandled error path that sets stream_ok_=false
-  // without surfacing via unrecoverable_status_, or a transport close). Without
-  // this check, Flush would wait forever for a worker that no longer exists —
-  // the 4.5h hang. stream_ok_ stays true on the normal closed_&&empty path, so
-  // this does not fire on graceful shutdown.
+  // We break out only when the worker reaches a terminal verdict
+  // (unrecoverable_status_ set) or all items are confirmed. We deliberately
+  // do NOT break on `!stream_ok_` alone: a transient gRPC stream failure
+  // (OnWriteDone/OnReadDone with ok=false, or OnDone) sets stream_ok_=false
+  // while the worker is still alive and about to retry on a new stream
+  // (SetContextAndCreateStream resets stream_ok_=true). Breaking here would
+  // surface the premature per-event stream_status_ (e.g. INTERNAL "stream
+  // write failed") before the retry runs, making Flush return a
+  // non-retryable-looking error for a transient failure. Every worker death
+  // path (gRPC worker loop at the thread exit, RunLocalWorker, RunShmWorker)
+  // sets unrecoverable_status_ before exiting, so waiting on it is sufficient
+  // to avoid the worker-dead deadlock; the AwaitWithTimeout bounds the wait.
   auto cond = [ignore_last_num_items, this]()
                   ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) -> bool {
     if (!unrecoverable_status_.ok()) {
-      return true;
-    }
-    if (!stream_ok_) {
       return true;
     }
     return write_queue_.size() + in_flight_items_.size() <=
