@@ -260,8 +260,9 @@ def reverb_cc_test(name, srcs, deps = [], **kwargs):
     # ponytail: cc_test 主动嵌入 Python 解释器(scoped_interpreter + import_array),
     # 链接器必须解析 Py* 符号。原硬编码 -lpython3.10 绑死系统版本,与 py 侧
     # hermetic 3.11 混搭。现改依赖 @rules_python//python/cc:current_py_cc_libs——
-    # 它跟随当前 py_cc_toolchain(local_runtime_repo 指向 venv python3.10),
-    # libpython 版本自动与解释器一致,不再硬编码系统路径。
+    # 它跟随当前 py_cc_toolchain(python-build-standalone),libpython 版本自动与
+    # 解释器一致,不再硬编码系统路径。链接由 current_py_cc_libs 管;内嵌解释器
+    # 的运行时 stdlib/site-packages 由 reverb_embed_py_test wrapper 管(见下)。
     deps = depset(deps + new_deps + ["@rules_python//python/cc:current_py_cc_libs"]).to_list()
     cc_test(
         name = name,
@@ -269,6 +270,116 @@ def reverb_cc_test(name, srcs, deps = [], **kwargs):
         copts = tf_copts(),
         srcs = srcs,
         deps = deps,
+        **kwargs
+    )
+
+# ponytail: 内嵌解释器的 cc_test(scoped_interpreter + import numpy)在
+# python-build-standalone 下运行时找不到 stdlib(编译期 base_prefix='/install')
+# 与 numpy(@pypi site-packages 不在 cc_test runfiles)。该 wrapper 在分析期
+# 从 py3 toolchain 取 interpreter 路径,生成 shell 脚本设 PYTHONHOME(指向
+# standalone 树)+ PYTHONPATH(指向 @pypi//numpy site-packages),再把 standalone
+# 树(py3_runtime.files)与 numpy 拉进 runfiles,最后 exec 真正的 cc_binary。
+# 模式取自 pybind11_bazel commit 9d8c6b4(pybind_py_env_test)。非 Windows:wrapper
+# 脚本;Windows:直链 binary(reverb 无 Windows 内嵌 cc_test 目标)。
+def _embed_py_env_test_impl(ctx):
+    toolchain = ctx.toolchains["@rules_python//python:toolchain_type"]
+    py3_runtime = toolchain.py3_runtime
+    if not py3_runtime:
+        fail("No python3 runtime found in toolchain")
+
+    binary = ctx.executable.binary
+
+    if ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo]):
+        extension = binary.extension
+        exe = ctx.actions.declare_file(ctx.label.name + ("." + extension if extension else ""))
+        ctx.actions.symlink(output = exe, target_file = binary, is_executable = True)
+        return [DefaultInfo(
+            executable = exe,
+            runfiles = ctx.runfiles(files = [exe])
+            .merge(ctx.attr.binary[DefaultInfo].default_runfiles)
+            .merge(ctx.runfiles(transitive_files = py3_runtime.files))
+            .merge(ctx.attr.numpy[DefaultInfo].default_runfiles),
+        )]
+
+    interpreter = py3_runtime.interpreter
+
+    # 从 @pypi//numpy:numpy(py_library,多文件)里找 numpy/__init__.py,
+    # 其父目录 = site-packages。不用 allow_single_file(它不是单文件)。
+    numpy_files = ctx.attr.numpy[DefaultInfo].files.to_list()
+    numpy_init = None
+    for f in numpy_files:
+        if f.short_path.endswith("/numpy/__init__.py"):
+            numpy_init = f
+            break
+    if numpy_init == None:
+        fail("Could not find numpy/__init__.py in @pypi//numpy")
+    numpy_site_packages = numpy_init.short_path
+    numpy_site_packages = numpy_site_packages[:numpy_site_packages.rfind("/numpy/__init__.py")]
+
+    script = ctx.actions.declare_file(ctx.label.name + ".sh")
+    content = "#!/bin/bash\n"
+    content += "set -euo pipefail\n"
+    content += "if [ -z \"${RUNFILES_DIR:-}\" ]; then\n"
+    content += "  if [ -d \"$0.runfiles\" ]; then\n"
+    content += "    RUNFILES_DIR=\"$0.runfiles\"\n"
+    content += "  else\n"
+    content += "    RUNFILES_DIR=\"$(dirname \"$0\")/../..\"\n"
+    content += "  fi\n"
+    content += "fi\n"
+    # PYTHONHOME = standalone 树根(interpreter 的 bin 的父目录)。
+    content += "INTERPRETER=\"$RUNFILES_DIR/" + ctx.workspace_name + "/" + interpreter.short_path + "\"\n"
+    content += "if [ ! -f \"$INTERPRETER\" ]; then\n"
+    content += "  INTERPRETER=$(find \"$RUNFILES_DIR\" -path \"*/" + interpreter.short_path + "\" | head -n1)\n"
+    content += "fi\n"
+    content += "export PYTHONHOME=$(dirname $(dirname $(readlink -f \"$INTERPRETER\")))\n"
+    # PYTHONPATH = numpy 的 site-packages 目录(numpy 自带 .libs,无传递运行时依赖)。
+    content += "NUMPY_SP=\"$RUNFILES_DIR/" + ctx.workspace_name + "/" + numpy_site_packages + "\"\n"
+    content += "if [ ! -d \"$NUMPY_SP\" ]; then\n"
+    content += "  NUMPY_SP=$(find \"$RUNFILES_DIR\" -type d -path \"*/" + numpy_site_packages + "\" | head -n1)\n"
+    content += "fi\n"
+    content += "export PYTHONPATH=\"${PYTHONPATH:+$PYTHONPATH:}$NUMPY_SP\"\n"
+    content += "BIN=\"$RUNFILES_DIR/" + ctx.workspace_name + "/" + binary.short_path + "\"\n"
+    content += "if [ ! -f \"$BIN\" ]; then\n"
+    content += "  BIN=$(find \"$RUNFILES_DIR\" -path \"*/" + binary.short_path + "\" | head -n1)\n"
+    content += "fi\n"
+    content += "exec \"$BIN\" \"$@\"\n"
+    ctx.actions.write(script, content, is_executable = True)
+
+    runfiles = ctx.runfiles(files = [script, binary])
+    runfiles = runfiles.merge(ctx.attr.binary[DefaultInfo].default_runfiles)
+    runfiles = runfiles.merge(ctx.runfiles(transitive_files = py3_runtime.files))
+    runfiles = runfiles.merge(ctx.attr.numpy[DefaultInfo].default_runfiles)
+    return [DefaultInfo(executable = script, runfiles = runfiles)]
+
+_embed_py_env_test = rule(
+    implementation = _embed_py_env_test_impl,
+    test = True,
+    attrs = {
+        "binary": attr.label(executable = True, cfg = "target", mandatory = True),
+        "numpy": attr.label(
+            default = "@pypi//numpy:numpy",
+        ),
+        "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+    },
+    toolchains = ["@rules_python//python:toolchain_type"],
+)
+
+def reverb_embed_py_test(name, binary, size = "small", **kwargs):
+    """Wrap a cc_binary 内嵌 Python 的测试,设 PYTHONHOME+PYTHONPATH。
+
+    仅给真正 Py_Initialize 的 cc_test 用(tensor_proxy_test)。其余 cc_test
+    虽传递链接 libpython(经 :tensor_proxy/:chunker)但不初始化解释器,无需此 wrapper。
+
+    Args:
+      name: 测试目标名。
+      binary: 已构建的 cc_binary(:name_bin),deps 由调用方精确指定。
+      size: 传递给 _embed_py_env_test。
+      **kwargs: 额外参数(如 tags)。
+    """
+    _embed_py_env_test(
+        name = name,
+        binary = binary,
+        size = size,
         **kwargs
     )
 

@@ -2,9 +2,11 @@ load(
     "//reverb/cc/platform:build_rules.bzl",
     "reverb_cc_library",
     "reverb_cc_test",
+    "reverb_embed_py_test",
     "reverb_grpc_deps",
     "reverb_tf_deps",
 )
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -280,13 +282,18 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-cc_test(
-    name = "tensor_proxy_test",
+# ponytail: 嵌入解释器(scoped_interpreter + import_array)需链接 libpython;
+# 依赖 @rules_python//python/cc:current_py_cc_libs(python-build-standalone)。
+# numpy 头取自 @pypi//numpy:numpy_headers。python-build-standalone 下内嵌
+# libpython 的 base_prefix='/install',运行时找不到 stdlib+numpy;故构建
+# cc_binary 并用 reverb_embed_py_test wrapper 设 PYTHONHOME/PYTHONPATH。
+# 模式取自 pybind11_bazel commit 9d8c6b4。仅此测试真正 Py_Initialize。
+cc_binary(
+    name = "tensor_proxy_test_bin",
     srcs = ["tensor_proxy_test.cc"],
     copts = ["-Wno-sign-compare"],
-    # ponytail: 嵌入解释器(scoped_interpreter + import_array)需链接 libpython;
-    # 改依赖 @rules_python//python/cc:current_py_cc_libs(跟随 local_runtime_repo 的
-    # venv python3.10),不再硬编码系统路径。numpy 头仍取自 @pypi//numpy:numpy_headers。
+    testonly = True,
+    visibility = ["//visibility:private"],
     deps = [
         ":tensor_proxy",
         "@com_google_googletest//:gtest",
@@ -295,6 +302,11 @@ cc_test(
         "@pypi//numpy:numpy_headers",
         "@rules_python//python/cc:current_py_cc_libs",
     ],
+)
+
+reverb_embed_py_test(
+    name = "tensor_proxy_test",
+    binary = ":tensor_proxy_test_bin",
 )
 
 # --- length-delimited protobuf IO(替代 TFRecord,checkpoint 序列化基础,D3 决策) ---

@@ -87,7 +87,7 @@ rules_shell_toolchains()
 load("//third_party/py:python_init_repositories.bzl", "python_init_repositories")
 
 python_init_repositories(
-    default_python_version = "3.10",
+    default_python_version = "3.11",
     requirements = {
         "3.9": "//reverb/pip_package:requirements_lock_3_9.txt",
         "3.10": "//reverb/pip_package:requirements_lock_3_10.txt",
@@ -98,28 +98,9 @@ python_init_repositories(
 )
 
 load("@python_version_repo//:py_version.bzl", "HERMETIC_PYTHON_VERSION", "REQUIREMENTS")
-load("//third_party/py:python_init_repositories.bzl", "python_init_toolchains")
+load("//third_party/py:python_init_repositories.bzl", "get_toolchain_name_per_python_version", "python_init_toolchains")
 
-# ponytail: local_runtime_repo + pip_parse 都需解释器路径。外部仓库规则不能
-# watch workspace 内相对路径,故用绝对路径指向 uv venv。换 venv/机器时用
-# `--repo_env=REVERB_PYTHON_INTERPRETER=/path/to/python` 覆盖(见 .bazelrc);
-# 该环境变量在 third_party/py:python_init_repositories.bzl 的 local_runtime_repo
-# 里读取,pip_parse 则通过 WORKSPACE 里 REVERB_PYTHON_INTERPRETER 常量传入。
-# venv 由 `uv venv --python 3.10 && uv pip install absl-py dm-tree portpicker numpy packaging protobuf` 创建。
-REVERB_PYTHON_INTERPRETER = "/home/guankai1/code/cpp/reverb/.venv/bin/python"
-
-# ponytail: 切 local_runtime_repo 指向 uv venv 的 python3.10(见
-# python_init_repositories.bzl)。该解释器 sysconfig 自省出系统 python3.10 的
-# /usr/include/python3.10 头 + /usr/lib/.../libpython3.10.so 库,生成 toolchain。
-# cc 侧 Python.h/libpython 自动跟随,不再硬编码系统路径;bazel 不再下载
-# python-build-standalone。多版本矩阵测试由 uv 在 bazel 外做。
-# ponytail: interpreter_path 必须是绝对路径或 PATH 名字——local_runtime_repo 是
-# 外部仓库规则,不能 watch workspace 内的相对路径。用绝对路径指向 uv venv;
-# 换机器/换 venv 时覆盖 PYTHON_INTERPRETER 环境变量(见 .bazelrc repo_env)。
-python_init_toolchains(
-    hermetic_python_version = HERMETIC_PYTHON_VERSION,
-    interpreter_path = REVERB_PYTHON_INTERPRETER,
-)
+python_init_toolchains(hermetic_python_version = HERMETIC_PYTHON_VERSION)
 
 load("@rules_python//python:pip.bzl", "package_annotation", "pip_parse")
 
@@ -192,10 +173,9 @@ pip_parse(
             "framework_lib",
         ],
     },
-    # ponytail: 改用 python_interpreter 字符串指向 uv venv 解释器(与
-    # local_runtime_repo 同一 venv),取代 python_interpreter_target 的 hermetic
-    # standalone 解释器。pip 在该解释器下把 requirements_lock 装进 @pypi 外部仓。
-    python_interpreter = REVERB_PYTHON_INTERPRETER,
+    python_interpreter_target = "@{}_host//:python".format(
+        get_toolchain_name_per_python_version("python", HERMETIC_PYTHON_VERSION),
+    ),
     requirements_lock = REQUIREMENTS,
 )
 
