@@ -248,17 +248,14 @@ cc_library(
 
 # ponytail: 原生 cc_library,去 reverb_tf_deps() 注入(Task 9)。sampler.h/cc 已无 TF include,
 # 数据出口改为 TensorBuffer。GrpcSamplerWorker 仍需 grpc++。
+# ponytail: 去掉 -lpython3.10 linkopts——Py* 符号保持 undefined,运行时由宿主
+# Python 进程注入(libreverb.so 经 libpybind.so 被 dlopen 加载)。这让 .so 跟
+# Python 版本解耦,源码安装不再依赖系统装了某版本 libpython。
 cc_library(
     name = "sampler",
     srcs = ["sampler.cc"],
     hdrs = ["sampler.h"],
     copts = ["-Wno-sign-compare"],
-    # ponytail: :tensor_proxy(pybind11/numpy C-API),需链接 libpython 解析 Py* 符号。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunk_store",
         ":errors",
