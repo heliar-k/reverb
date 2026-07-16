@@ -147,13 +147,7 @@ cc_test(
     name = "signature_test",
     srcs = ["signature_test.cc"],
     # ponytail: :signature 依赖 :tensor_proxy(pybind11/numpy),运行时需 libpython。
-    # 升级路径: 若 :tensor_proxy 拆出无 Python 的 data_type 子库,可去掉此 linkopts。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
-    deps = [
+deps = [
         ":signature",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_matchers",
@@ -163,6 +157,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -245,13 +240,7 @@ cc_test(
     size = "small",
     copts = ["-Wno-sign-compare"],
     # ponytail: :trajectory_util -> :tensor_compression -> :tensor_proxy,
-    # 需链接 libpython 解析 Py* 符号。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
-    deps = [
+deps = [
         ":trajectory_util",
         ":tensor_proxy",
         "//reverb/cc:chunk_store",
@@ -264,6 +253,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -294,21 +284,16 @@ cc_test(
     name = "tensor_proxy_test",
     srcs = ["tensor_proxy_test.cc"],
     copts = ["-Wno-sign-compare"],
-    # 嵌入解释器需链接 libpython;系统 Python 3.10(numpy 1.23.5 基于此构建)
-    # ponytail: 去 hermetic sysroot 后用系统 libc_nonshared.a(glibc 2.35 的
-    # Scrt1.o 已不再引用 __libc_csu_init,但保留 libc_nonshared.a 供 atexit/
-    # pthread_atfork 等非共享符号)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
+    # ponytail: 嵌入解释器(scoped_interpreter + import_array)需链接 libpython;
+    # 改依赖 @rules_python//python/cc:current_py_cc_libs(跟随 local_runtime_repo 的
+    # venv python3.10),不再硬编码系统路径。numpy 头仍取自 @pypi//numpy:numpy_headers。
     deps = [
         ":tensor_proxy",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@pybind11",
         "@pypi//numpy:numpy_headers",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 

@@ -52,12 +52,6 @@ cc_test(
     srcs = ["table_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :table -> :trajectory_util -> :tensor_compression -> :tensor_proxy
-    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :chunker_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunk_store",
         ":schema_cc_proto",
@@ -78,6 +72,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -87,12 +82,6 @@ cc_test(
     size = "small",
     copts = ["-Wno-sign-compare"],
     # ponytail: :tensor_compression 依赖 :tensor_proxy(pybind11/numpy C-API),
-    # 需链接 libpython 解析 Py* 符号(同 :tensor_proxy_test/:signature_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":tensor_compression",
         "//reverb/cc/platform:status_matchers",
@@ -102,6 +91,7 @@ cc_test(
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -112,12 +102,6 @@ cc_test(
     name = "sampler_test",
     srcs = ["sampler_test.cc"],
     copts = ["-Wno-sign-compare"],
-    # ponytail: :sampler -> :tensor_proxy(pybind11/numpy C-API),需链接 libpython。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunk_store",
         ":reverb_service_cc_grpc_proto",
@@ -140,6 +124,7 @@ cc_test(
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -451,12 +436,6 @@ cc_test(
     srcs = ["in_process_client_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :in_process_client -> :trajectory_writer/:sampler -> :tensor_proxy
-    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :trajectory_writer_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":in_process_client",
@@ -475,18 +454,13 @@ cc_test(
         "@com_google_absl//absl/types:optional",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 cc_test(
     name = "trajectory_writer_test",
     srcs = ["trajectory_writer_test.cc"],
     # ponytail: :trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy
-    # C-API), 需链接 libpython 解析 Py* 符号。host libpython 需链接 libc_nonshared.a(atexit 等非共享符号)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":schema_cc_proto",
@@ -504,6 +478,7 @@ cc_test(
         "@com_google_absl//absl/types:optional",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
@@ -513,12 +488,6 @@ cc_test(
     copts = ["-Wno-sign-compare"],
     # ponytail: 原生 cc_test,去 reverb_tf_deps() + :proto_test_util/:tensor_testutil(后者仍 TF-coupled)。
     # :streaming_trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy C-API),
-    # 需链接 libpython 解析 Py* 符号(同 :chunker_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":reverb_service_cc_grpc_proto",
@@ -543,6 +512,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+    "@rules_python//python/cc:current_py_cc_libs",
     ] + reverb_grpc_deps(),
 )
 
@@ -556,12 +526,6 @@ cc_test(
     # MockClientReaderWriter used by writer_test/streaming_trajectory_writer_test,
     # because TrajectoryWriter drives the stream via the callback reactor API.
     # :trajectory_writer -> :chunker -> :tensor_proxy(pybind11/numpy C-API),
-    # needs libpython to resolve Py* symbols (same as :trajectory_writer_test).
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":reverb_service_cc_grpc_proto",
@@ -586,6 +550,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+    "@rules_python//python/cc:current_py_cc_libs",
     ] + reverb_grpc_deps(),
 )
 
@@ -595,12 +560,6 @@ cc_test(
     copts = ["-Wno-sign-compare"],
     # ponytail: 原生 cc_test,去 reverb_tf_deps() + TF 头(struct.pb/env.h/tensor_shape)。
     # :reverb_service_impl -> :table -> :chunker -> :tensor_proxy(pybind11/numpy
-    # C-API),需链接 libpython 解析 Py* 符号(同 :streaming_trajectory_writer_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":reverb_service_impl",
         ":schema_cc_proto",
@@ -625,6 +584,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+    "@rules_python//python/cc:current_py_cc_libs",
     ] + reverb_grpc_deps(),
 )
 
@@ -661,12 +621,6 @@ cc_test(
     srcs = ["chunker_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :chunker -> :tensor_proxy(pybind11/numpy C-API),
-    # 需链接 libpython 解析 Py* 符号。host libpython 需链接 libc_nonshared.a(atexit 等非共享符号)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":schema_cc_proto",
@@ -716,6 +670,7 @@ reverb_cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
+    "@rules_python//python/cc:current_py_cc_libs",
     ] + reverb_grpc_deps(),
 )
 
@@ -854,12 +809,6 @@ cc_test(
     srcs = ["structured_writer_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :structured_writer -> :trajectory_writer -> :tensor_proxy
-    # (pybind11/numpy C-API),需链接 libpython 解析 Py* 符号(同 :chunker_test)。
-    linkopts = [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-lpython3.10",
-        "/usr/lib/x86_64-linux-gnu/libc_nonshared.a",
-    ],
     deps = [
         ":chunker",
         ":patterns_cc_proto",
@@ -877,6 +826,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
