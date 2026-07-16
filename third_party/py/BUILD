@@ -14,6 +14,5 @@ exports_files(
         "python_repo.bzl",
         "python_init_rules.bzl",
         "python_init_repositories.bzl",
-        "wheel_version.bzl",
     ],
 )

@@ -1,8 +1,6 @@
 load("//reverb/pip_package:python_wheel.bzl", "collect_data_files", "transitive_py_deps")
 load("@python_version_repo//:py_version.bzl", "REQUIREMENTS")
 load("@rules_python//python:pip.bzl", "compile_pip_requirements")
-load("@rules_python//python:py_binary.bzl", "py_binary")
-load("//reverb/pip_package:reverb_wheel.bzl", "reverb_wheel")
 
 licenses(["notice"])  # Apache 2.0
 
@@ -32,6 +30,8 @@ exports_files(
     glob(["requirements*.txt"]),
 )
 
+# cc_deps / py_deps: PEP 517 后端 (_build_backend.py) 经 bazel cquery 收集
+# 这两个 target 的产物来组装 wheel。
 collect_data_files(
     name = "cc_deps",
     deps = [
@@ -46,39 +46,4 @@ transitive_py_deps(
         "//reverb/server_executable:server_from_proto",
         "//reverb/server_executable:server_main",
     ],
-)
-
-py_binary(
-    name = "build_wheel",
-    srcs = ["build_wheel.py"],
-    deps = [
-        "@pypi//build",
-    ],
-)
-
-reverb_wheel(
-    name = "wheel",
-    headers = [],
-    platform_name = select({
-        "@platforms//os:osx": "macosx",
-        "@platforms//os:macos": "macosx",
-        "@platforms//os:windows": "win",
-        "@platforms//os:linux": "linux",
-    }),
-    platform_tag = select({
-        "@platforms//cpu:aarch64": "arm64",
-        "@platforms//cpu:arm64": "arm64",
-        "@platforms//cpu:x86_64": "x86_64",
-        "@platforms//cpu:ppc": "ppc64le",
-    }),
-    source_files = [
-        "//:README.md",
-        # "setup.py",
-        ":licenses",
-        ":cc_deps",
-        ":py_deps",
-        ":pyproject.toml",
-        ":hatch_build.py",
-    ],
-    tags = ["manual"],
 )

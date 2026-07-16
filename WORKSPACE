@@ -183,11 +183,6 @@ load("@pypi//:requirements.bzl", "install_deps")
 
 install_deps()
 
-# @tf_wheel_version_suffix:reverb/pip_package/reverb_version.bzl load 它生成
-# wheel 版本后缀。ponytail: 替代 @local_xla python_wheel_version_suffix_repository。
-load("//third_party/py:wheel_version.bzl", "python_wheel_version_suffix_repository")
-
-python_wheel_version_suffix_repository(name = "tf_wheel_version_suffix")
 # End hermetic Python initialization
 
 # reverb 闭包需要的 C++ 依赖:原生 http_archive 注册(去 @local_xla build_file)。
