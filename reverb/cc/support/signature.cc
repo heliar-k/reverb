@@ -98,6 +98,14 @@ std::vector<int64_t> ShapeFromProto(
 absl::Status FlatSignatureFromSignatureProto(
     const ::reverb::tensor::SignatureProto& value, absl::string_view context,
     DtypesAndShapes* dtypes_and_shapes) {
+  // Engage the optional on entry: callers (e.g. InProcessClient) pass a
+  // default-constructed (nullopt) optional and rely on us to populate it.
+  // Without this, `(*dtypes_and_shapes)->push_back(...)` below dereferences a
+  // disengaged optional — UB that manifests as a segfault inside
+  // `NewTrajectoryWriter`/`NewWriter` whenever a table has a signature.
+  if (!dtypes_and_shapes->has_value()) {
+    *dtypes_and_shapes = std::vector<internal::TensorSpec>{};
+  }
   switch (value.kind_case()) {
     case ::reverb::tensor::SignatureProto::kTensorSpec: {
       const auto& tensor_spec = value.tensor_spec();
