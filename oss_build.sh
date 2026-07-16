@@ -98,7 +98,7 @@ for python_version in $PYTHON_VERSIONS; do
   else
     platform=linux_x86_64
     target_platform=manylinux_2_27_x86_64
-    uvx auditwheel repair --plat $target_platform --exclude libtensorflow_framework.so.2 --wheel-dir $OUTPUT_DIR $output_wheel
+    uvx auditwheel repair --plat $target_platform --wheel-dir $OUTPUT_DIR $output_wheel
 
     install_wheel=$OUTPUT_DIR/"$(basename $output_wheel | sed "s/$platform/$target_platform/")"
   fi
@@ -108,7 +108,7 @@ for python_version in $PYTHON_VERSIONS; do
     uv venv --clear --python $python_version ./venvs/py$python_version
     source ./venvs/py$python_version/bin/activate
 
-    uv pip install "$install_wheel[tensorflow]"
+    uv pip install "$install_wheel"
 
     echo "Run Python tests..."
     set +e
