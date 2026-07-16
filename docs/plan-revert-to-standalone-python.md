@@ -139,6 +139,24 @@ Step 1 删剩的 PATH 注入残留。
      含 `Requires-Dist: protobuf >= 5.27`。bazel 由 `_build_backend.py` 传
      `--repo_env=HERMETIC_PYTHON_VERSION=3.10` 下载 standalone 3.10 编译 .so,
      版本对齐自动成立。
+   - **多版本矩阵(2026-07-16,顺序测试)**:5 个支持版本(3.9–3.13)全部通过。
+     每个版本 `uv venv --python <ver>` → `uv pip install . --no-build-isolation`
+     → `import reverb` + `reverb.InProcessClient`(由 .so 提供)加载验证:
+
+     | Python | 安装 | import | .so 加载 | protobuf(≥5.27) | numpy |
+     | -------- | ------ | -------- | --------- | ----------------- | ------- |
+     | 3.9.25 | ✅ | ✅ | ✅ | 6.33.6 ✅ | 2.0.2 |
+     | 3.10.12 | ✅ | ✅ | ✅ | 7.35.1 ✅ | 2.2.6 |
+     | 3.11.15 | ✅ | ✅ | ✅ | 7.35.1 ✅ | 2.4.6 |
+     | 3.12.13 | ✅ | ✅ | ✅ | 7.35.1 ✅ | 2.5.1 |
+     | 3.13.14 | ✅ | ✅ | ✅ | 7.35.1 ✅ | 2.5.1 |
+
+     `_build_backend.py` 读 `sys.version_info` 传 `HERMETIC_PYTHON_VERSION=<ver>`,
+     bazel 按该版本下载对应 python-build-standalone 编译 .so,wheel 标签
+     `cp<major><minor>-...` 与解释器一致,版本对齐跨 5 版本均自动成立。
+     3.9 首次构建 5m41s(下 standalone 3.9),后续版本各自下对应 standalone。
+     pip 各版本解析的 numpy/protobuf 不同(高 python 装高 numpy),但 protobuf
+     都满足 `>=5.27`。
 
 ## 计划遗漏的回归与修复（执行中发现）
 
