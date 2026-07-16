@@ -169,7 +169,8 @@ def _metadata() -> str:
         f"Requires-Dist: portpicker\n"
         f"Requires-Dist: numpy\n"
         f"Requires-Dist: packaging\n"
-        f"Requires-Dist: protobuf\n"
+        # >=5.27: generated _pb2.py uses google.protobuf.runtime_version (5.27+).
+        f"Requires-Dist: protobuf >= 5.27\n"
     )
 
 
