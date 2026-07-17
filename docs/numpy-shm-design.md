@@ -247,7 +247,8 @@ sequenceDiagram
   返回 bootstrap 快照（ticket ⑧）；`Checkpoint` 未实现。`Insert`（plain `Writer`）
   **won't fix**——legacy `Writer` 无 SHM seam，Python 层覆盖为 `NotImplementedError`
   （ticket ⑬），用 `trajectory_writer` / `structured_writer`。`ShmClient` 可 pickle
-  （ticket ⑫，存 `socket_path` 重连）。
+  （ticket ⑫，存 `socket_path` 重连）。`NewTrajectoryWriter` 从缓存快照填
+  `flat_signature_map`，signature 校验生效（ticket ⑧-2b，镜像 `InProcessClient`）。
 - **trajectory_writer**：chunker/column 逻辑在 client 进程（复用现有
   `TrajectoryWriter`，只把 `RunLocalWorker` 的 `InsertOrAssignAsync` 换成
   `RunShmWorker`：ALLOCATE 申请偏移 → memcpy 序列化 `ChunkData` proto → INSERT →

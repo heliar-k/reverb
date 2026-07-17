@@ -31,12 +31,16 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   `writer`/`insert` Python 层覆盖抛 `NotImplementedError`。C++ 侧 `NewWriter`
 >   注释从 `TODO(④)` 改 won't fix。测试 `ShmClientPicklableTest`（3 例）+
 >   `ShmClientLegacyWriterInsertNotImplementedTest`（3 例）落地。
+> - ✅ ⑧-2b `validate_items` wiring——`ShmClient::NewTrajectoryWriter` 从
+>   `cached_server_info_` 填 `flat_signature_map`（镜像 InProcessClient），
+>   `trajectory_writer` 的 signature 校验真正生效。测试
+>   `ShmClientValidateItemsTest`（3 例）落地。⑧-2 的按需 `SERVER_INFO` 往返仍 deferred。
 > - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）——v2 唯一剩余，需 checkpointer
 >   集成，单独一轮。
 >
-> **新 session 入口**：⑫⑬ 已落地，v2 仅剩 ⑪ `checkpoint`。本会话改动未提交
-> （`client.py`/`shm_client.{h,cc}`/`shm_test.py`/`tickets.md`/`docs/*`），跑
->   `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
+> **新 session 入口**：⑫⑬⑧-2b 已落地，v2 仅剩 ⑪ `checkpoint` + ⑧-2 按需
+> SERVER_INFO（可继续 defer）。本会话改动未提交（`shm_client.{h,cc}`/
+>   `shm_test.py`/`tickets.md`），跑 `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
 
 ---
 
@@ -207,7 +211,7 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 - [ ] `ShmServer` dispatch 增 `HandleServerInfo`：序列化各表**当前** `TableInfo` 写 S→C
 - [ ] `ShmClient._fetch_server_info_proto` 改为发 `SERVER_INFO` 阻塞读 `SERVER_INFO_RESP`（按需刷新，对齐 gRPC「每次调用刷新签名缓存」）
 - [ ] 表签名变更（`Table.replace`）后 `server_info()` 能反映新签名
-- [ ] `NewTrajectoryWriter` 把缓存的 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效（step 1 已暴露数据，但 writer options 未接，需后续 wiring）
+- [x] `NewTrajectoryWriter` 把缓存的 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效（step 1 已暴露数据，但 writer options 未接，需后续 wiring）——**已完成（⑧-2b）**：`ShmClient::NewTrajectoryWriter` 遍历 `cached_server_info_`，经 `FlatSignatureFromTableInfo` 填 map（镜像 `InProcessClient`）；无签名表设 nullopt 跳过校验。测试 `ShmClientValidateItemsTest` 3 例（匹配通过 / 列数不匹配拒 / 无签名表跳过）。`ponytail:` 上限：快照不反映会话中途签名变更，不匹配安全失败。
 - [ ] 测试：`Table.replace` 后 `server_info()` 反映新签名；`trajectory_writer(validate_items=True)` 拒绝不匹配 trajectory
 
 ---

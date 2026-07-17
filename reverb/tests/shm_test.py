@@ -455,6 +455,66 @@ class ShmClientServerInfoTest(absltest.TestCase):
         self.assertIn("t", info)
 
 
+class ShmClientValidateItemsTest(absltest.TestCase):
+    """ticket ⑧ step 2b: trajectory_writer populates flat_signature_map from
+    the cached bootstrap server_info so CreateItem's ItemAndRefs::Validate runs
+    the same signature check as gRPC/LocalClient. Previously the map was left
+    empty and validate_items was a no-op."""
+
+    def _make_signed_server(self, sig):
+        server = reverb.Server(
+            tables=[
+                reverb.Table(
+                    name="t",
+                    sampler=reverb.selectors.Fifo(),
+                    remover=reverb.selectors.Fifo(),
+                    max_size=10,
+                    max_times_sampled=1,
+                    rate_limiter=reverb.rate_limiters.MinSize(1),
+                    signature=sig,
+                )
+            ],
+            in_process=True,
+            shm=True,
+        )
+        return server, reverb.ShmClient(server.shm_socket_path)
+
+    def test_matching_trajectory_is_accepted(self):
+        sig = {"v": signature_codec.TensorSpec((None, 1), np.float32, "v")}
+        server, client = self._make_signed_server(sig)
+        # Trajectory column matches the signature shape/dtype -> no raise.
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": np.array([1.0], dtype=np.float32)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
+
+    def test_mismatched_dtype_is_rejected(self):
+        sig = {"v": signature_codec.TensorSpec((None, 1), np.float32, "v")}
+        server, client = self._make_signed_server(sig)
+        # Trajectory column is int but the signature declares float32 ->
+        # ValueError (C++ InvalidArgumentError maps to PyExc_ValueError).
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": np.array([1], dtype=np.int32)})
+            with self.assertRaisesRegex(
+                ValueError, "inconsistent with the table signature"
+            ):
+                w.create_item(
+                    table="t",
+                    priority=1.0,
+                    trajectory={"v": w.history["v"][:]},
+                )
+
+    def test_unsigned_table_skips_validation(self):
+        # A table with no signature gets nullopt in flat_signature_map, so
+        # Validate skips it (any trajectory shape accepted), mirroring
+        # LocalClient. _make_shm_server builds an unsigned table.
+        server, client = _make_shm_server()
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": np.asarray(1.0)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
+
+
 class ShmConcurrentWriterSamplerTest(absltest.TestCase):
     """Decision D regression: a writer worker thread and a sampler worker
     thread on ONE ShmClient must run concurrently without corrupting the
@@ -630,12 +690,15 @@ class ShmMultiTableTest(absltest.TestCase):
         server.stop()
 
     def test_unknown_table_insert_returns_error(self):
-        # An unknown table name on the insert path surfaces as FileNotFoundError
-        # too (RunShmWorker maps ShmError::NOT_FOUND -> absl::NotFoundError,
-        # raised on flush()).
+        # ticket ⑧-2b: an unknown table name is now rejected at CreateItem
+        # time by ItemAndRefs::Validate (the flat_signature_map built from the
+        # bootstrap snapshot doesn't contain it), surfacing as ValueError
+        # (C++ InvalidArgumentError) — mirroring InProcessClient/gRPC
+        # validate_items=True. Previously (v1, empty map) it reached the server
+        # and surfaced as FileNotFoundError on flush().
         server = self._make_two_table_server()
         client = reverb.ShmClient(server.shm_socket_path)
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaisesRegex(ValueError, "could not be found"):
             _insert_one(client, "nonexistent", np.array([0.0], dtype=np.float32))
         server.stop()
 

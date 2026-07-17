@@ -490,10 +490,26 @@ absl::Status ShmClient::NewTrajectoryWriter(
     std::unique_ptr<TrajectoryWriter>* writer) {
   REVERB_RETURN_IF_ERROR(options.Validate());
   // SHM mode: the writer's RunShmWorker sends inserts over conn_. No local
-  // tables — the server owns the Table. flat_signature_map is left as-is (no
-  // ServerInfo round-trip in v1); callers wanting signature validation must
-  // populate it themselves. See appendix A4.
-  *writer = std::make_unique<TrajectoryWriter>(&conn_, options);
+  // tables — the server owns the Table. ticket ⑧ step 2b: populate
+  // flat_signature_map from the bootstrap-time cached_server_info_ so that
+  // CreateItem's ItemAndRefs::Validate runs the same signature check as
+  // gRPC/LocalClient. Each table occupies one entry; a table with no
+  // signature gets nullopt (Validate skips it). A table absent from the
+  // snapshot is treated as "unknown table" by Validate.
+  // ponytail: snapshot is connect-time only; does NOT reflect mid-session
+  // Table.replace / signature changes — upgrade via a SERVER_INFO ring
+  // round-trip (ticket ⑧ step 2). For now a stale signature blocks a
+  // mismatched trajectory (safe-fail); a replaced-but-compatible signature
+  // is not auto-picked up.
+  TrajectoryWriter::Options effective_options = options;
+  internal::FlatSignatureMap signatures;
+  for (const auto& info : cached_server_info_) {
+    internal::DtypesAndShapes& entry = signatures[info.name()];
+    REVERB_RETURN_IF_ERROR(
+        internal::FlatSignatureFromTableInfo(info, &entry));
+  }
+  effective_options.flat_signature_map = std::move(signatures);
+  *writer = std::make_unique<TrajectoryWriter>(&conn_, effective_options);
   return absl::OkStatus();
 }
 

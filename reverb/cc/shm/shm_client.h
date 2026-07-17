@@ -119,10 +119,12 @@ class ShmClient {
 
   // Constructs a TrajectoryWriter in SHM mode: the chunker/column/backpressure
   // logic runs client-side, but inserts go over SHM to the server's Table
-  // (appendix A4). `options.flat_signature_map` is left as-is (no
-  // ServerInfo round-trip in v1); pass a populated map if you want
-  // ItemAndRefs::Validate to check trajectory signatures against a known
-  // table signature.
+  // (appendix A4). ticket ⑧ step 2b: flat_signature_map is populated from
+  // cached_server_info_ (bootstrap snapshot) so ItemAndRefs::Validate checks
+  // trajectory signatures against the table signatures — same path as
+  // gRPC/LocalClient. ponytail: snapshot is connect-time only; a mid-session
+  // Table.replace / signature change is not reflected until reconnect (upgrade
+  // via SERVER_INFO round-trip, ticket ⑧ step 2).
   absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
                                    std::unique_ptr<TrajectoryWriter>* writer);
 

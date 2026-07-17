@@ -173,11 +173,19 @@ gRPC / `LocalClient`。
 导致签名缓存为空、抛 `ValueError: Could not find table`；快照填入缓存后，带签名的表
 可正常按签名解包。
 
+**`trajectory_writer` 的 signature 校验现已生效**（ticket ⑧-2b）：`NewTrajectoryWriter`
+从缓存快照填 `flat_signature_map`，`create_item` 经 `ItemAndRefs::Validate` 校验
+trajectory 与表签名（列数/dtype/shape），不匹配抛 `ValueError`——与 `LocalClient`
+一致（总是校验，无 `validate_items=False` 开关）。无签名的表跳过校验。同样的快照
+限制适用：会话中途 `Table.replace` 改签名后，旧 writer 仍持旧签名，需重连刷新。
+
 ### 5.3 `ShmClient` 多表路由（ticket ⑨）
 
 `ShmServer` 构造时接收**全部表**，按表名路由：`sample`/`trajectory_writer` 的
-`table` 参数直接定位目标表。引用未知表名时返回 `NOT_FOUND`（Python 侧表现为
-`FileNotFoundError`）。多表与 gRPC / `LocalClient` 行为一致。
+`table` 参数直接定位目标表。引用未知表名：`sample` 返回 `NOT_FOUND`（Python
+`FileNotFoundError`）；`trajectory_writer.create_item` 经 `flat_signature_map`
+在 client 侧拒为 `ValueError`（ticket ⑧-2b，对齐 InProcessClient/gRPC
+validate_items=True）。多表与 gRPC / `LocalClient` 行为一致。
 
 ### 5.4 `timeout_ms` 行为不对称
 
