@@ -13,7 +13,7 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > 支持。优先级 P0→P4 标在各 ticket 标题；依赖链与批次建议见文末「v2 依赖图」。
 > v1 依据 `docs/client-transports.md` §1 对比表与 `docs/numpy-shm-spec.md` §6。
 >
-> **当前进度（工作区未提交，2026-07-17）：**
+> **当前进度（已提交至 `e7d5367`，2026-07-17）：**
 >
 > - ✅ ⑧ `server_info`（bootstrap 快照）、✅ ⑨ 多表、✅ ⑩ `mutate_priorities`+`reset`
 >   ——三 ticket 同批落地，已提交 `74608c1`。C++ `//reverb/cc/shm:*` 8/8、Python
@@ -26,8 +26,7 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   改异步（`EnqueSampleRequest` + `DrainPendingSamples` 镜像 insert 的
 >   callback→outbox 模式）+ `ReadBlocking` 加 60s 硬上限兜底。回归测试
 >   `ShmSampleDeadlockRegressionTest` 落地。已提交 `adcfab9`。
-> - ✅ ⑫ `pickle`、✅ ⑬ deprecate legacy `Writer`/`insert`——本轮同批落地（工作区
->   未提交）。`__reduce__` 返回 `(ShmClient, (socket_path,))`，反序列化重连；
+> - ✅ ⑫ `pickle`、✅ ⑬ deprecate legacy `Writer`/`insert`——同批落地，已提交 `6b008f4`。`__reduce__` 返回 `(ShmClient, (socket_path,))`，反序列化重连；
 >   `writer`/`insert` Python 层覆盖抛 `NotImplementedError`。C++ 侧 `NewWriter`
 >   注释从 `TODO(④)` 改 won't fix。测试 `ShmClientPicklableTest`（3 例）+
 >   `ShmClientLegacyWriterInsertNotImplementedTest`（3 例）落地。
@@ -35,7 +34,7 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   `cached_server_info_` 填 `flat_signature_map`（镜像 InProcessClient），
 >   `trajectory_writer` 的 signature 校验真正生效。测试
 >   `ShmClientValidateItemsTest`（3 例）落地。⑧-2 的按需 `SERVER_INFO` 往返仍 deferred。
-> - ✅ ⑪ `checkpoint`——v2 路线图最后一个功能 ticket 落地（工作区未提交）。
+> - ✅ ⑪ `checkpoint`——v2 路线图最后一个功能 ticket 落地，已提交 `e729da5`+`e7d5367`。
 >   镜像 ⑩ 控制面模式：`CHECKPOINT=8`/`CHECKPOINT_RESP=108` 走 INSERT 流
 >   （`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化 send→read-ACK。
 >   `ShmServer::Create` 增可选 `shared_ptr<Checkpointer>` 参数；`HandleCheckpoint`
@@ -47,10 +46,8 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   `ShmClientCheckpointTest`（2 例：save→load 数据一致 / corrupt 报错）落地。
 >
 > **新 session 入口**：v2 路线图全部完成（⑧-⑬，仅 ⑧-2 按需 SERVER_INFO 往返
->   仍 deferred，无用户撞过，`ponytail:` 标注）。本会话改动未提交
->   （`shm_protocol.proto`/`shm_server.{h,cc}`/`shm_client.{h,cc}`/`BUILD`/
->   `pybind.cc`/`pybind.pyi`/`server.py`/`shm_test.py`/`tickets.md`/docs），
->   跑 `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
+>   仍 deferred，无用户撞过，`ponytail:` 标注）。所有改动已提交
+>   （`adcfab9`/`6b008f4`/`f911245`/`740591a`/`e729da5`/`e7d5367`）。
 
 ---
 
