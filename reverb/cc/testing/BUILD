@@ -27,18 +27,6 @@ reverb_cc_library(
 )
 
 reverb_cc_library(
-    name = "tensor_testutil",
-    testonly = 1,
-    hdrs = ["tensor_testutil.h"],
-    deps = [
-        "//reverb/cc/platform:logging",
-        # ponytail: TF-era 测试辅助,显式依赖 TF 头文件(同上)。
-        "@pypi//tf_nightly:headers_lib",
-        "@pypi//tf_nightly:framework_lib",
-    ],
-)
-
-reverb_cc_library(
     name = "time_testutil",
     testonly = 1,
     hdrs = ["time_testutil.h"],
