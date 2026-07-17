@@ -35,7 +35,7 @@ import numpy as np
 from absl.testing import absltest
 
 import reverb
-from reverb import errors, structured_writer
+from reverb import errors, signature_codec, structured_writer
 
 
 def _make_table(
@@ -291,23 +291,121 @@ class ShmClientReprTest(absltest.TestCase):
         self.assertEqual(repr(client), f"ShmClient(socket_path={client._socket_path})")
 
 
-class ShmClientServerInfoStubTest(absltest.TestCase):
-    """v1 ShmServer has no ServerInfo round-trip (C++ dispatch handles only
-    SAMPLE/RELEASE/INSERT/ALLOCATE). ShmClient._fetch_server_info_proto returns
-    [] so server_info() yields {} rather than failing. Callers needing real
-    table metadata must use the gRPC/in_process path."""
+class ShmClientServerInfoTest(absltest.TestCase):
+    """ticket ⑧ step 1: server_info() returns a bootstrap-time snapshot of the
+    server's TableInfo (piggybacked on the SHM handshake), not an empty {}.
+    The snapshot reflects table state at Connect time; mid-session
+    Table.replace / signature changes are NOT reflected (step 2 deferred)."""
 
-    def test_server_info_returns_empty_dict(self):
-        server, client = _make_shm_server()
+    def test_server_info_returns_real_metadata(self):
+        server, client = _make_shm_server(table_name="t", max_size=7)
         info = client.server_info()
         self.assertIsInstance(info, dict)
-        self.assertEqual(info, {})
+        self.assertIn("t", info)
+        self.assertEqual(info["t"].max_size, 7)
+        # sampler/remover options are populated (Fifo selectors by default).
+        self.assertIsNotNone(info["t"].sampler_options)
+        self.assertIsNotNone(info["t"].remover_options)
+        # No signature declared on this table -> None.
+        self.assertIsNone(info["t"].signature)
+        # The snapshot is taken at Connect time, before any insert -> empty.
+        self.assertEqual(info["t"].current_size, 0)
 
-    def test_server_info_does_not_raise_on_timeout(self):
+    def test_server_info_reflects_size_at_connect_time(self):
+        # Insert items via the in-process path BEFORE the ShmClient connects,
+        # so the bootstrap snapshot sees a non-empty table.
+        server, _ = _make_shm_server(table_name="t", max_size=10, min_size=1)
+        local = server.in_process_client
+        for i in range(3):
+            _insert_one(local, "t", np.array([float(i)], dtype=np.float32))
+
+        # Now connect an ShmClient; its snapshot captures the 3 items.
+        client = reverb.ShmClient(server.shm_socket_path)
+        info = client.server_info()
+        self.assertEqual(info["t"].current_size, 3)
+
+    def test_server_info_carries_table_signature(self):
+        # A table built with a signature propagates it through the bootstrap
+        # snapshot so _get_signature_for_table (and thus
+        # sample(unpack_as_table_signature=True)) can find the table.
+        sig = {"v": signature_codec.TensorSpec((None, 1), np.float32, "v")}
+        server = reverb.Server(
+            tables=[
+                reverb.Table(
+                    name="t",
+                    sampler=reverb.selectors.Fifo(),
+                    remover=reverb.selectors.Fifo(),
+                    max_size=10,
+                    max_times_sampled=1,
+                    rate_limiter=reverb.rate_limiters.MinSize(1),
+                    signature=sig,
+                )
+            ],
+            in_process=True,
+            shm=True,
+        )
+        client = reverb.ShmClient(server.shm_socket_path)
+        info = client.server_info()
+        self.assertIn("t", info)
+        self.assertIsNotNone(info["t"].signature)
+        # The signature cache is populated from server_info().
+        self.assertIn("t", client._signature_cache)
+
+    def test_sample_unpack_as_table_signature_works(self):
+        # The regression that motivated ticket ⑧: before the fix,
+        # sample(unpack_as_table_signature=True) threw
+        # `ValueError: Could not find table` because server_info() returned {}
+        # and the signature cache was empty. Now the bootstrap snapshot feeds
+        # the cache, so unpacking against the table signature works.
+        sig = {
+            "obs": signature_codec.TensorSpec((None, 1), np.float32, "obs"),
+        }
+        server = reverb.Server(
+            tables=[
+                reverb.Table(
+                    name="t",
+                    sampler=reverb.selectors.Fifo(),
+                    remover=reverb.selectors.Fifo(),
+                    max_size=10,
+                    max_times_sampled=1,
+                    rate_limiter=reverb.rate_limiters.MinSize(1),
+                    signature=sig,
+                )
+            ],
+            in_process=True,
+            shm=True,
+        )
+        client = reverb.ShmClient(server.shm_socket_path)
+        with client.trajectory_writer(num_keep_alive_refs=3) as w:
+            for i in range(3):
+                w.append({"obs": np.array([float(i)], dtype=np.float32)})
+            w.create_item(
+                table="t",
+                priority=1.0,
+                trajectory={"obs": w.history["obs"][:]},
+            )
+            w.flush()
+
+        sample = next(
+            client.sample(
+                "t",
+                num_samples=1,
+                unpack_as_table_signature=True,
+                emit_timesteps=False,
+            )
+        )
+        # With a table signature + unpack_as_table_signature=True, data is a
+        # dict keyed by the signature's column names (not a flat list).
+        self.assertIsInstance(sample.data, dict)
+        self.assertEqual(set(sample.data.keys()), {"obs"})
+        np.testing.assert_array_equal(sample.data["obs"], [[0.0], [1.0], [2.0]])
+
+    def test_server_info_accepts_timeout_kwarg(self):
+        # The hook accepts `timeout` for parity with the gRPC/Local hooks;
+        # it is ignored (no round-trip — the data is cached at Connect).
         server, client = _make_shm_server()
-        # The stub ignores the timeout arg entirely; must not raise.
         info = client.server_info(timeout=1)
-        self.assertEqual(info, {})
+        self.assertIn("t", info)
 
 
 class ShmConcurrentWriterSamplerTest(absltest.TestCase):
@@ -397,6 +495,235 @@ class ShmConcurrentWriterSamplerTest(absltest.TestCase):
         self.assertGreater(len(items_written), 0, "writer made no progress")
         self.assertGreater(len(samples_seen), 0, "sampler made no progress")
 
+        server.stop()
+
+
+class ShmMultiTableTest(absltest.TestCase):
+    """ticket ⑨: an ShmServer holds ALL tables and routes by table name.
+
+    Pre-⑨ the server held exactly ONE table (tables[0]); a multi-table
+    `Server(shm=True)` silently dropped items targeting any other table and
+    could not sample them. These tests pin the routing on both the sample and
+    insert paths, the server_info snapshot, and NOT_FOUND surfacing for an
+    unknown table.
+    """
+
+    def _make_two_table_server(self):
+        """uniform_table (Uniform) + fifo_table (Fifo), both MinSize(1)."""
+        uniform_table = reverb.Table(
+            name="uniform_table",
+            sampler=reverb.selectors.Uniform(),
+            remover=reverb.selectors.Fifo(),
+            max_size=10,
+            max_times_sampled=1,
+            rate_limiter=reverb.rate_limiters.MinSize(1),
+        )
+        fifo_table = reverb.Table(
+            name="fifo_table",
+            sampler=reverb.selectors.Fifo(),
+            remover=reverb.selectors.Fifo(),
+            max_size=10,
+            max_times_sampled=1,
+            rate_limiter=reverb.rate_limiters.MinSize(1),
+        )
+        server = reverb.Server(
+            tables=[uniform_table, fifo_table],
+            in_process=True,
+            shm=True,
+        )
+        return server
+
+    def test_multi_table_server_info_lists_all_tables(self):
+        server = self._make_two_table_server()
+        client = reverb.ShmClient(server.shm_socket_path)
+        info = client.server_info()
+        self.assertEqual(set(info.keys()), {"uniform_table", "fifo_table"})
+        self.assertEqual(info["uniform_table"].max_size, 10)
+        self.assertEqual(info["fifo_table"].max_size, 10)
+        server.stop()
+
+    def test_multi_table_sample_routes_by_name(self):
+        # Pre-seed both tables via the in-process client (so data exists before
+        # SHM sampling), then sample each back over SHM by table name and
+        # verify no cross-contamination: uniform_table holds only 0.0 and
+        # fifo_table holds only 1.0.
+        server = self._make_two_table_server()
+        local = server.in_process_client
+        _insert_one(local, "uniform_table", np.array([0.0], dtype=np.float32))
+        _insert_one(local, "fifo_table", np.array([1.0], dtype=np.float32))
+
+        client = reverb.ShmClient(server.shm_socket_path)
+        u = next(client.sample("uniform_table", num_samples=1, emit_timesteps=False))
+        f = next(client.sample("fifo_table", num_samples=1, emit_timesteps=False))
+        np.testing.assert_array_equal(u.data[0], [[0.0]])
+        np.testing.assert_array_equal(f.data[0], [[1.0]])
+        server.stop()
+
+    def test_multi_table_insert_routes_by_name(self):
+        # Insert into each table over SHM via trajectory_writer, then sample
+        # each back and verify routing (distinct values per table).
+        server = self._make_two_table_server()
+        client = reverb.ShmClient(server.shm_socket_path)
+        _insert_one(client, "uniform_table", np.array([10.0], dtype=np.float32))
+        _insert_one(client, "fifo_table", np.array([20.0], dtype=np.float32))
+
+        u = next(client.sample("uniform_table", num_samples=1, emit_timesteps=False))
+        f = next(client.sample("fifo_table", num_samples=1, emit_timesteps=False))
+        np.testing.assert_array_equal(u.data[0], [[10.0]])
+        np.testing.assert_array_equal(f.data[0], [[20.0]])
+        server.stop()
+
+    def test_unknown_table_sample_returns_error(self):
+        # An unknown table name on the sample path surfaces as FileNotFoundError
+        # (absl::kNotFound -> PyExc_FileNotFoundError via MaybeRaiseFromStatus).
+        server = self._make_two_table_server()
+        client = reverb.ShmClient(server.shm_socket_path)
+        with self.assertRaises(FileNotFoundError):
+            next(client.sample("nonexistent", num_samples=1, emit_timesteps=False))
+        server.stop()
+
+    def test_unknown_table_insert_returns_error(self):
+        # An unknown table name on the insert path surfaces as FileNotFoundError
+        # too (RunShmWorker maps ShmError::NOT_FOUND -> absl::NotFoundError,
+        # raised on flush()).
+        server = self._make_two_table_server()
+        client = reverb.ShmClient(server.shm_socket_path)
+        with self.assertRaises(FileNotFoundError):
+            _insert_one(client, "nonexistent", np.array([0.0], dtype=np.float32))
+        server.stop()
+
+
+class ShmMutateResetTest(absltest.TestCase):
+    """ticket ⑩: mutate_priorities / reset over the SHM transport.
+
+    These ride the INSERT flow (insert_c2s/insert_s2c) under
+    ShmConnection::insert_flow_mu so they never race RunShmWorker as a second
+    producer on the insert ring. Mirror in_process_test.py's
+    test_in_process_mutate_and_reset and client_test.py's mutate/reset cases.
+    """
+
+    def _make_server(self, table_name="t", max_size=10, max_times_sampled=0):
+        # max_times_sampled=0 keeps sampled items reusable so a second sample
+        # after a mutate does not block on an empty table (MinSize(1)).
+        return _make_shm_server(
+            table_name=table_name,
+            max_size=max_size,
+            min_size=1,
+            max_times_sampled=max_times_sampled,
+        )
+
+    def test_mutate_priorities_updates_priority(self):
+        server, client = self._make_server()
+        _insert_one(client, "t", np.array([1.0], dtype=np.float32))
+        key = next(client.sample("t", num_samples=1, emit_timesteps=False)).info.key
+        client.mutate_priorities("t", updates={key: 42.5})
+        after = next(
+            client.sample("t", num_samples=1, emit_timesteps=False)
+        ).info.priority
+        self.assertAlmostEqual(after, 42.5)
+        server.stop()
+
+    def test_mutate_priorities_deletes_item(self):
+        # server_info() is a bootstrap snapshot (won't reflect the delete), so
+        # verify via the live in-process client's server_info, which sees the
+        # real table state.
+        server, client = self._make_server(max_size=10)
+        for i in range(3):
+            _insert_one(client, "t", np.array([float(i)], dtype=np.float32))
+        self.assertEqual(server.in_process_client.server_info()["t"].current_size, 3)
+        key = next(client.sample("t", num_samples=1, emit_timesteps=False)).info.key
+        client.mutate_priorities("t", deletes=[key])
+        self.assertEqual(server.in_process_client.server_info()["t"].current_size, 2)
+        server.stop()
+
+    def test_reset_clears_table(self):
+        server, client = self._make_server(max_size=10)
+        for i in range(3):
+            _insert_one(client, "t", np.array([float(i)], dtype=np.float32))
+        self.assertEqual(server.in_process_client.server_info()["t"].current_size, 3)
+        client.reset("t")
+        # The live in-process client sees the post-reset state (current_size 0).
+        self.assertEqual(server.in_process_client.server_info()["t"].current_size, 0)
+        # And sampling an empty table with a short rate-limiter timeout raises
+        # DeadlineExceededError (MinSize(1) blocks when the table is empty).
+        with self.assertRaises(errors.DeadlineExceededError):
+            next(
+                client.sample("t", num_samples=1, timeout_ms=300, emit_timesteps=False)
+            )
+        server.stop()
+
+    def test_mutate_priorities_unknown_table_raises(self):
+        # absl::NotFoundError -> Python FileNotFoundError (ticket ⑨ mapping).
+        server, client = self._make_server()
+        with self.assertRaises(FileNotFoundError):
+            client.mutate_priorities("nonexistent", updates={1: 1.0})
+        server.stop()
+
+    def test_reset_unknown_table_raises(self):
+        server, client = self._make_server()
+        with self.assertRaises(FileNotFoundError):
+            client.reset("nonexistent")
+        server.stop()
+
+    def test_mutate_reset_does_not_corrupt_concurrent_inserts(self):
+        # Validates the insert_flow_mu: a control-plane call (mutate_priorities)
+        # on the caller thread overlaps RunShmWorker inserts on the writer's
+        # background thread — both touch insert_c2s. The mutex serializes them
+        # so neither corrupts the ring. Run inserts in a background thread,
+        # fire mutate_priorities on the main thread, then verify every inserted
+        # item samples back intact (no corruption / lost items).
+        server, client = self._make_server(table_name="t", max_size=500)
+        stop = threading.Event()
+        errs = []
+        written = []
+
+        def writer_loop():
+            try:
+                i = 0
+                while not stop.is_set():
+                    val = float(i)
+                    with client.trajectory_writer(num_keep_alive_refs=1) as w:
+                        w.append({"v": np.array([val], dtype=np.float32)})
+                        w.create_item(
+                            table="t",
+                            priority=1.0,
+                            trajectory={"v": w.history["v"][:]},
+                        )
+                        w.flush()
+                    written.append(val)
+                    i += 1
+            except Exception as e:  # noqa: BLE001
+                errs.append(repr(e))
+
+        t_w = threading.Thread(target=writer_loop)
+        t_w.start()
+        # While the writer thread hammers insert_c2s, repeatedly mutate a
+        # (possibly absent) key's priority on the main thread. This is the
+        # control-plane-vs-insert overlap the mutex protects. MutateItems
+        # ignores absent keys, so this is a safe no-op on data.
+        deadline = time.time() + 2.0
+        mutate_calls = 0
+        while time.time() < deadline:
+            client.mutate_priorities("t", updates={0: 1.0})
+            mutate_calls += 1
+        stop.set()
+        t_w.join(timeout=15)
+        self.assertFalse(t_w.is_alive(), "writer thread hung")
+        self.assertEqual(errs, [])
+        self.assertGreater(mutate_calls, 0, "no mutate calls made")
+        self.assertGreater(len(written), 0, "writer made no progress")
+        # Drain samples and confirm the values are an intact subset of what was
+        # written (no corruption: each sampled value must be one we wrote).
+        written_set = set(written)
+        seen = set()
+        try:
+            for s in client.sample(
+                "t", num_samples=200, emit_timesteps=False, timeout_ms=200
+            ):
+                seen.add(float(np.asarray(s.data[0]).reshape(-1)[0]))
+        except errors.DeadlineExceededError:
+            pass  # table drained / rate-limiter timeout — fine
+        self.assertTrue(seen.issubset(written_set), f"corruption: {seen - written_set}")
         server.stop()
 
 

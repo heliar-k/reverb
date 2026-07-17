@@ -14,7 +14,8 @@
 | 同机跨进程，要最快采样 | `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` |
 | 跨机 / 分布式 / 需要全套控制面 | gRPC `Client` | `reverb.Client('host:port')` |
 | 需 pickle 客户端（如多进程 worker 持有） | 只能 gRPC `Client` | — |
-| 需要 `checkpoint`/`mutate_priorities`/`reset`/`server_info` | gRPC 或 `LocalClient` | — |
+| 需要 `checkpoint` | gRPC 或 `LocalClient` | — |
+| 需要实时 `server_info`（反映 `Table.replace`） | gRPC 或 `LocalClient` | — |
 
 一句话：**能内嵌就 `LocalClient`；要跨进程就要么 gRPC（图省事/要全套 API）要么
 `ShmClient`（图采样性能）；要 pickle 只能 gRPC。**
@@ -28,11 +29,11 @@
 | 构造 | `Client('localhost:port')` | `server.in_process_client` | `reverb.ShmClient(server.shm_socket_path)` |
 | 持有 | gRPC channel | 进程内 Table 指针 | SHM mmap + ring 状态 |
 | `pickle` | ✅ 支持（存 `server_address`） | ❌ 不可（持进程内指针） | ❌ 不可（持 mmap + ring） |
-| 多表 | ✅ 全部表 | ✅ 全部表 | ⚠️ v1 只持 **`tables[0]`** 一个表 |
+| 多表 | ✅ 全部表 | ✅ 全部表 | ✅ 全部表（按表名路由，ticket ⑨） |
 | `sample` 的 `timeout_ms` | ⚠️ **静默忽略**（gRPC `NewSampler` 无 timeout 参数） | ✅ 生效（超时抛 `DeadlineExceededError`） | ✅ 生效（超时抛 `DeadlineExceededError`） |
 | `sample` 默认 `emit_timesteps` | `True` | `True` | `True`（三者统一） |
-| `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ⚠️ **返回空 `{}`**（v1 无 ServerInfo 往返） |
-| `mutate_priorities` / `reset` | ✅ | ✅ | ❌ 不支持（C++ dispatch 不处理） |
+| `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ✅ **bootstrap 快照**（连接时缓存，无往返） |
+| `mutate_priorities` / `reset` | ✅ | ✅ | ✅（ticket ⑩，走 insert 流 + 客户端互斥锁） |
 | `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ❌ 不支持 |
 | `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM） |
 | `writer`（legacy）/ `insert` | ✅ | ✅ | ❌ **`NewWriter` 返回 `UnimplementedError`** |
@@ -48,9 +49,9 @@ trajectory_writer   ✅          ✅              ✅
 structured_writer   ✅          ✅              ✅
 writer (legacy)     ✅          ✅              ❌ UnimplementedError
 insert              ✅          ✅              ❌ (内部依赖 writer)
-mutate_priorities   ✅          ✅              ❌
-reset               ✅          ✅              ❌
-server_info         ✅ 真实      ✅ 真实          ⚠️ 返回 {}
+mutate_priorities   ✅          ✅              ✅（ticket ⑩）
+reset               ✅          ✅              ✅（ticket ⑩）
+server_info         ✅ 真实      ✅ 真实          ✅ bootstrap 快照
 checkpoint          ✅          ✅              ❌
 ```
 
@@ -106,7 +107,7 @@ client = server.in_process_client                        # LocalClient
 server = reverb.Server(tables=[...], in_process=True, shm=True)
 #   in_process=True 拥有 Table；shm=True 在其上叠加 SHM 传输。
 #   注意：shm=True 不隐含 in_process=True，需显式开。
-#   v1：ShmServer 只持 tables[0] 一个表。
+#   SHM 现支持全部表（按表名路由，ticket ⑨）。
 try:
     client = reverb.ShmClient(server.shm_socket_path)
 
@@ -153,19 +154,26 @@ client.insert(data, {'t': 1.0})   # ❌ 运行时 UnimplementedError
 with client.trajectory_writer(3) as w: ...   # ✅
 ```
 
-### 5.2 `ShmClient.server_info()` 返回空 `{}`
+### 5.2 `ShmClient.server_info()` 返回 bootstrap 快照
 
-v1 SHM 协议没有 ServerInfo 往返（C++ dispatch 只处理 SAMPLE/RELEASE/INSERT/ALLOCATE）。
-`server_info()` 返回 `{}` 而非报错。**连锁后果**：`sample(unpack_as_table_signature=True)`
-会抛 `ValueError: Could not find table "..."`，因为它内部调 `_get_signature_for_table`
-→ `server_info()` 填充签名缓存 → 缓存为空 → 找不到表。
+`server_info()` 返回**连接时的 bootstrap 快照**——真实的 `TableInfo`（`max_size`/
+`sampler_options`/`remover_options`/`signature`/`current_size` 等），由 SHM 握手的
+`WelcomeResponse.server_info` 随手捎带，无额外往返。`timeout` 参数被接受（与
+gRPC/Local hook 对齐）但忽略——数据在 `Connect` 时已缓存。
 
-需要真实表元数据 / 签名时，用 gRPC 或 `LocalClient`。
+**限制**：快照在连接那一刻固定，**不反映会话中途的 `Table.replace` / 签名变更**
+（ticket ⑧ step 2 会补一个按需 `SERVER_INFO` ring 往返解决）。需要实时元数据时用
+gRPC / `LocalClient`。
 
-### 5.3 `ShmClient` 只有一个表
+**`sample(unpack_as_table_signature=True)` 现在可用**：此前因 `server_info()` 返回 `{}`
+导致签名缓存为空、抛 `ValueError: Could not find table`；快照填入缓存后，带签名的表
+可正常按签名解包。
 
-v1 `ShmServer` 构造时只接收 `tables[0]`。多表场景下，SHM 客户端只能访问第一个表；
-其余表用 gRPC / `LocalClient`。
+### 5.3 `ShmClient` 多表路由（ticket ⑨）
+
+`ShmServer` 构造时接收**全部表**，按表名路由：`sample`/`trajectory_writer` 的
+`table` 参数直接定位目标表。引用未知表名时返回 `NOT_FOUND`（Python 侧表现为
+`FileNotFoundError`）。多表与 gRPC / `LocalClient` 行为一致。
 
 ### 5.4 `timeout_ms` 行为不对称
 

@@ -31,6 +31,7 @@
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/platform/thread.h"
+#include "reverb/cc/reverb_service.pb.h"  // ticket ⑩: MutatePrioritiesRequest/ResetRequest
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/structured_writer.h"
@@ -215,6 +216,15 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
     if (err.code() == ShmError::DEADLINE_EXCEEDED) {
       return errors::RateLimiterTimeout();
     }
+    // ticket ⑨: map routing/argument errors so unknown-table samples surface as
+    // real Python exceptions (NotFound -> FileNotFoundError, InvalidArgument ->
+    // ValueError) instead of a generic InternalError.
+    if (err.code() == ShmError::NOT_FOUND) {
+      return absl::NotFoundError(err.message());
+    }
+    if (err.code() == ShmError::INVALID_ARGUMENT) {
+      return absl::InvalidArgumentError(err.message());
+    }
     return absl::InternalError(
         absl::StrCat("ShmSampler: server error: ", err.message()));
   }
@@ -283,7 +293,10 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
 
 ShmClient::~ShmClient() = default;
 
-ShmClient::ShmClient(ShmConnection conn) : conn_(std::move(conn)) {}
+ShmClient::ShmClient(ShmConnection conn,
+                     std::vector<TableInfo> cached_server_info)
+    : conn_(std::move(conn)),
+      cached_server_info_(std::move(cached_server_info)) {}
 
 // static
 absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
@@ -331,7 +344,117 @@ absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
   conn.control_fd = fd_guard.fd;  // ~ShmConnection closes it
   fd_guard.fd = -1;               // conn owns it now
 
-  return absl::WrapUnique(new ShmClient(std::move(conn)));
+  // ticket ⑧ step 1: cache the TableInfo piggybacked on the bootstrap
+  // WelcomeResponse so server_info() can return a real snapshot without a
+  // new round-trip (step 2 deferred). One table per v1 ShmServer.
+  std::vector<TableInfo> cached_server_info;
+  cached_server_info.reserve(w->welcome.server_info().table_info_size());
+  for (const auto& info : w->welcome.server_info().table_info()) {
+    cached_server_info.push_back(info);
+  }
+
+  return absl::WrapUnique(
+      new ShmClient(std::move(conn), std::move(cached_server_info)));
+}
+
+absl::Status ShmClient::ServerInfo(std::vector<TableInfo>* table_info) {
+  // ticket ⑧ step 1: return the bootstrap-time snapshot. ponytail: bootstrap
+  // snapshot only — does NOT reflect mid-session Table.replace / signature
+  // changes. Ceiling: a long-lived client whose table is replaced mid-session
+  // sees stale info. Upgrade path: SERVER_INFO/SERVER_INFO_RESP MsgType +
+  // HandleServerInfo on-demand round-trip (ticket ⑧ step 2).
+  *table_info = cached_server_info_;
+  return absl::OkStatus();
+}
+
+absl::Status ShmClient::MutatePriorities(
+    const std::string& table, const std::vector<KeyWithPriority>& updates,
+    const std::vector<uint64_t>& deletes) {
+  // ticket ⑩: ride the INSERT flow. Hold conn_.insert_flow_mu across the whole
+  // send→read-ACK sequence so this caller thread and RunShmWorker (the insert
+  // worker background thread) are never both mid-flight on insert_c2s — that
+  // would put two producers on one SPSC `head` and silently corrupt the ring.
+  // The server-side dispatch is single-threaded and reads insert_c2s in order,
+  // replying on insert_s2c in order, so whoever holds the mutex sends one
+  // request and gets its matching ACK before releasing. Reuses the existing
+  // reverb_service.proto MutatePrioritiesRequest (empty Response).
+  MutatePrioritiesRequest req;
+  req.set_table(table);
+  for (const auto& u : updates) *req.add_updates() = u;
+  for (uint64_t k : deletes) req.add_delete_keys(k);
+  std::string body;
+  req.SerializeToString(&body);
+
+  absl::MutexLock lock(&conn_.insert_flow_mu);
+  REVERB_RETURN_IF_ERROR(
+      conn_.insert_c2s.Write(MUTATE_PRIORITIES, absl::MakeSpan(body)));
+
+  MsgType resp_type;
+  std::string resp_body;
+  REVERB_RETURN_IF_ERROR(
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd));
+
+  if (resp_type == ERROR) {
+    // mirror FetchOne's error mapping: NOT_FOUND -> NotFoundError (Python
+    // FileNotFoundError), INVALID_ARGUMENT -> InvalidArgumentError, else
+    // InternalError.
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError(
+          "ShmClient::MutatePriorities: malformed ShmError");
+    }
+    if (err.code() == ShmError::NOT_FOUND) {
+      return absl::NotFoundError(err.message());
+    }
+    if (err.code() == ShmError::INVALID_ARGUMENT) {
+      return absl::InvalidArgumentError(err.message());
+    }
+    return absl::InternalError(
+        absl::StrCat("ShmClient::MutatePriorities: server error: ", err.message()));
+  }
+  if (resp_type != MUTATE_ACK) {
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::MutatePriorities: unexpected response type ", resp_type));
+  }
+  return absl::OkStatus();  // MUTATE_ACK is empty
+}
+
+absl::Status ShmClient::Reset(const std::string& table) {
+  // ticket ⑩: same insert-flow round-trip as MutatePriorities (see above for
+  // the mutex rationale). ResetRequest{table}; RESET_ACK is empty.
+  ResetRequest req;
+  req.set_table(table);
+  std::string body;
+  req.SerializeToString(&body);
+
+  absl::MutexLock lock(&conn_.insert_flow_mu);
+  REVERB_RETURN_IF_ERROR(
+      conn_.insert_c2s.Write(RESET, absl::MakeSpan(body)));
+
+  MsgType resp_type;
+  std::string resp_body;
+  REVERB_RETURN_IF_ERROR(
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd));
+
+  if (resp_type == ERROR) {
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError("ShmClient::Reset: malformed ShmError");
+    }
+    if (err.code() == ShmError::NOT_FOUND) {
+      return absl::NotFoundError(err.message());
+    }
+    if (err.code() == ShmError::INVALID_ARGUMENT) {
+      return absl::InvalidArgumentError(err.message());
+    }
+    return absl::InternalError(
+        absl::StrCat("ShmClient::Reset: server error: ", err.message()));
+  }
+  if (resp_type != RESET_ACK) {
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::Reset: unexpected response type ", resp_type));
+  }
+  return absl::OkStatus();  // RESET_ACK is empty
 }
 
 absl::Status ShmClient::NewSampler(const std::string& table_name,

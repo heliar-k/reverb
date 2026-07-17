@@ -20,9 +20,13 @@ pair is already guarded by `in_process_test.ClientLocalClientParityTest`; this
 file extends the guard to include SHM, so a regression in any one transport's
 write/read semantics surfaces as a cross-transport mismatch.
 
-SHM v1 holds ONE table (tables[0]); each test builds a single-table server per
-transport. `server_info`/`mutate_priorities`/`reset` are not SHM-supported, so
-parity is asserted only on the write→sample round trip.
+SHM supports all tables (routed by table name, ticket ⑨); each test builds a
+single-table server per transport. `mutate_priorities`/`reset` are SHM-
+supported as of ticket ⑩ (riding the insert flow under a client mutex);
+`server_info` is a bootstrap-time snapshot on SHM (does not reflect
+mid-session `Table.replace`), so live-`server_info` parity is asserted only
+between gRPC and LocalClient. The shared write→sample round trip remains the
+primary parity guard.
 """
 
 import numpy as np
@@ -152,6 +156,32 @@ class ThreeTransportParityTest(parameterized.TestCase):
                 self.assertEqual(obs.shape, (3, 4), f"{name} obs shape")
             np.testing.assert_array_equal(results["local"][1], results["grpc"][1])
             np.testing.assert_array_equal(results["shm"][1], results["grpc"][1])
+        finally:
+            for s in servers.values():
+                s.stop()
+
+    def test_mutate_and_reset_parity(self):
+        # ticket ⑩: mutate_priorities + reset now agree across all three
+        # transports. Insert one item, run mutate_priorities (absent key: no-op
+        # per MutateItems semantics) + reset, then confirm a fresh insert still
+        # samples back (mirrors client_test.py::test_reset: reset clears the
+        # table but leaves it usable). We do NOT sample an empty table after
+        # reset because gRPC's NewSampler silently ignores timeout_ms and would
+        # block forever on MinSize(1); instead we verify reset by re-inserting
+        # and sampling the new item.
+        clients, servers = _make_clients()
+        try:
+            for c in clients.values():
+                _write_trajectory(c, [7.0])
+            for c in clients.values():
+                c.mutate_priorities(TABLE, updates={999: 5.0})  # absent key: no-op
+                c.reset(TABLE)
+            # After reset the table is empty but usable: re-insert and sample.
+            for c in clients.values():
+                _write_trajectory(c, [9.0])
+            for name, c in clients.items():
+                obs = _sample_obs(c)
+                np.testing.assert_array_equal(obs, [9.0], err_msg=name)
         finally:
             for s in servers.values():
                 s.stop()

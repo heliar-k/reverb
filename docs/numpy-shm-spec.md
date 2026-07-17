@@ -1146,8 +1146,8 @@ class Server:
 | ------ | ------ |
 | `ShmServer + ShmClient` | insert → sample 完整路径 (同进程双线程) |
 | `ShmClient + TrajectoryWriter` | writer append → create_item → sample 读出 |
-| `ShmClient::MutatePriorities` | 更新优先级后 sample 概率变化 |
-| `ShmClient::Reset` | 重置后 table 为空 |
+| `ShmClient::MutatePriorities` | 更新优先级后 sample 概率变化 （已实现，ticket ⑩） |
+| `ShmClient::Reset` | 重置后 table 为空 （已实现，ticket ⑩） |
 | `ShmClient::Checkpoint + Load` | checkpoint → 新建 server load → sample 恢复数据 |
 
 ### 双进程测试

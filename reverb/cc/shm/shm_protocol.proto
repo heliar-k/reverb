@@ -29,12 +29,22 @@ enum MsgType {
   SAMPLE = 3;
   RELEASE = 4;
   ALLOCATE = 5;  // C4: client requests a pool offset from the server
+  // ticket ⑩: control-plane rides the INSERT flow (insert_c2s/s2c) under a
+  // client-side mutex so it never races RunShmWorker as a second producer on
+  // the insert ring. 6/7 were the free C→S values; spec §8.3 originally
+  // reserved 5 for MUTATE_PRIORITIES, but v1 reassigned 5 to ALLOCATE (C4).
+  MUTATE_PRIORITIES = 6;
+  RESET = 7;
   CLOSE = 9;
   // S→C
   WELCOME = 101;
   INSERT_ACK = 102;
   SAMPLE_RESP = 103;
   ALLOCATE_RESP = 104;  // C4: server returns the granted pool offset
+  // ticket ⑩: empty acks for the control-plane ops (reuses the existing
+  // MutatePrioritiesRequest/ResetRequest protos from reverb_service.proto).
+  MUTATE_ACK = 106;
+  RESET_ACK = 107;
   ERROR = 105;
 }
 

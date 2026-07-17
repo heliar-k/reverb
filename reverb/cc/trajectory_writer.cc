@@ -961,6 +961,16 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     // ChunkData is self-describing and the server deserializes it whole. We
     // populate only chunk_key/shm_offset/total_length. Upgrade: populate the
     // metadata if the server ever skips deserialization for the fast path.
+    //
+    // ticket ⑩: hold insert_flow_mu across the WHOLE insert operation — every
+    // ALLOCATE→ALLOCATE_RESP and the INSERT→INSERT_ACK round-trip — so
+    // MutatePriorities/Reset (caller thread, same conn) never race this worker
+    // as a second producer on insert_c2s. RunShmWorker is strictly synchronous
+    // (in_flight ≤ 1), so one lock per item is the natural granularity; the
+    // mutex is uncontended except when a control-plane call overlaps an
+    // in-flight insert. See ShmConnection::insert_flow_mu. The sample flow is
+    // untouched (ShmSampler writes sample_c2s).
+    absl::MutexLock insert_flow_lock(&shm_conn_->insert_flow_mu);
     ShmInsertRequest req;
     std::vector<uint64_t> chunk_offsets;  // for RELEASE after ACK (C2)
     internal::flat_hash_set<uint64_t> sent_keys;
@@ -1114,11 +1124,32 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       std::string rel_body;
       rel.SerializeToString(&rel_body);
       (void)shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      // ticket ⑨: map ShmError codes to the same absl statuses as FetchOne so
+      // an unknown-table insert surfaces as NotFoundError (not a generic
+      // InternalError). Falls back to InternalError for unknown codes.
+      absl::Status mapped;
+      ShmError err;
+      if (err.ParseFromString(ack_body)) {
+        switch (err.code()) {
+          case ShmError::NOT_FOUND:
+            mapped = absl::NotFoundError(err.message());
+            break;
+          case ShmError::INVALID_ARGUMENT:
+            mapped = absl::InvalidArgumentError(err.message());
+            break;
+          default:
+            mapped = absl::InternalError(absl::StrCat(
+                "RunShmWorker: server error: ", err.message()));
+            break;
+        }
+      } else {
+        mapped = absl::InternalError(
+            "RunShmWorker: server returned ERROR for INSERT");
+      }
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);
       stream_ok_ = false;
-      stream_status_ = absl::InternalError(
-          "RunShmWorker: server returned ERROR for INSERT");
+      stream_status_ = mapped;
       unrecoverable_status_ = stream_status_;
       data_cv_.Signal();
       return stream_status_;

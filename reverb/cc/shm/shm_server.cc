@@ -34,6 +34,7 @@
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/reverb_service.pb.h"  // ticket ⑩: MutatePrioritiesRequest/ResetRequest
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/support/trajectory_util.h"
@@ -79,18 +80,38 @@ void InstallSignalHandlers() {
 
 }  // namespace
 
-ShmServer::ShmServer(std::shared_ptr<Table> table, std::string socket_path,
-                     ShmBytePool pool, ShmBootstrapServer bootstrap)
-    : table_(std::move(table)),
-      socket_path_(std::move(socket_path)),
+ShmServer::ShmServer(std::vector<std::shared_ptr<Table>> tables,
+                     std::string socket_path, ShmBytePool pool,
+                     ShmBootstrapServer bootstrap)
+    : socket_path_(std::move(socket_path)),
       pool_(std::move(pool)),
-      bootstrap_(std::move(bootstrap)) {}
+      bootstrap_(std::move(bootstrap)) {
+  // ticket ⑨: build the name→Table map. Uniqueness is validated in Create,
+  // so here we just move each table into the map by its own name.
+  tables_.reserve(tables.size());
+  for (auto& t : tables) {
+    tables_.emplace(t->name(), std::move(t));
+  }
+}
 
 // static
 absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
-    std::shared_ptr<Table> table, const std::string& socket_path) {
-  if (table == nullptr) {
-    return absl::InvalidArgumentError("table must not be null");
+    std::vector<std::shared_ptr<Table>> tables, const std::string& socket_path) {
+  if (tables.empty()) {
+    return absl::InvalidArgumentError("tables must not be empty");
+  }
+  // ticket ⑨: unique-name validation. Python `Server` also checks, but C++
+  // defends itself (Create may be called from C++ directly).
+  internal::flat_hash_set<std::string> seen;
+  seen.reserve(tables.size());
+  for (const auto& t : tables) {
+    if (t == nullptr) {
+      return absl::InvalidArgumentError("table must not be null");
+    }
+    if (!seen.insert(t->name()).second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Duplicate table name: ", t->name()));
+    }
   }
   REVERB_ASSIGN_OR_RETURN(ShmBootstrapServer bootstrap,
                           ShmBootstrapServer::Create(socket_path));
@@ -101,7 +122,7 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
   REVERB_ASSIGN_OR_RETURN(
       ShmBytePool pool, ShmBytePool::Create(pool_name));
   return absl::WrapUnique(
-      new ShmServer(std::move(table), socket_path, std::move(pool),
+      new ShmServer(std::move(tables), socket_path, std::move(pool),
                     std::move(bootstrap)));
 }
 
@@ -286,6 +307,18 @@ bool ShmServer::TryAccept() {
   welcome.set_insert_s2c_shm_name(names.insert_s2c);
   welcome.set_sample_c2s_shm_name(names.sample_c2s);
   welcome.set_sample_s2c_shm_name(names.sample_s2c);
+  // ticket ⑧ step 1: piggyback TableInfo on the bootstrap handshake so the
+  // client can serve server_info() from a bootstrap snapshot — no new
+  // SERVER_INFO ring round-trip (that is step 2, deferred). ponytail:
+  // bootstrap-time snapshot only; mid-session Table.replace / signature
+  // changes are NOT reflected here until step 2 lands. Upgrade path: a
+  // SERVER_INFO/SERVER_INFO_RESP MsgType + on-demand round-trip.
+  // ticket ⑨: list ALL tables (was: just table_->info()). hash_map order is
+  // unspecified; the client consumes server_info into a name→TableInfo dict.
+  auto* server_info = welcome.mutable_server_info();
+  for (const auto& [name, table] : tables_) {
+    *server_info->add_table_info() = table->info();
+  }
   auto send = SendWelcome(client_fd, welcome);
   if (!send.ok()) {
     close(client_fd);
@@ -374,6 +407,40 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
         // dead-collection erases it next pass (avoid erasing mid-iteration).
         state.close_requested = true;
         return;
+      case MUTATE_PRIORITIES: {
+        // ticket ⑩: control-plane rides the insert flow (the client holds
+        // insert_flow_mu across the send→read-ACK pair, so this is drained in
+        // order between RunShmWorker's INSERT round-trips).
+        MutatePrioritiesRequest req;
+        if (!req.ParseFromString(payload)) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: malformed MutatePrioritiesRequest from client "
+              << client_id;
+          break;
+        }
+        auto st = HandleMutatePriorities(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleMutatePriorities failed for client "
+              << client_id << ": " << st;
+        }
+        break;
+      }
+      case RESET: {
+        ResetRequest req;
+        if (!req.ParseFromString(payload)) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: malformed ResetRequest from client " << client_id;
+          break;
+        }
+        auto st = HandleReset(state, req);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleReset failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
       default:
         // Unknown msg type on this flow: ignore (forward-compat).
         break;
@@ -499,16 +566,42 @@ absl::Status ShmServer::EnqueueSampleS2C(ClientState& state, MsgType type,
   return absl::OkStatus();
 }
 
+absl::StatusOr<std::shared_ptr<Table>> ShmServer::FindTable(
+    const std::string& name) const {
+  // ticket ⑨: shared table-name routing; ⑩ (mutate_priorities/reset) reuses
+  // this seam. Returns NotFoundError on miss; callers map that to a ShmError.
+  auto it = tables_.find(name);
+  if (it == tables_.end()) {
+    return absl::NotFoundError(
+        absl::StrCat("Unknown table: ", name));
+  }
+  return it->second;
+}
+
 absl::Status ShmServer::HandleSample(ClientState& state,
                                      const ShmSampleRequest& req) {
-  // 1. Sample from the real Table. This may block on the rate limiter up to
+  // 0. ticket ⑨: route by table name. Unknown table -> ShmError::NOT_FOUND on
+  //    the sample s2c flow (mirrors the DEADLINE_EXCEEDED error path below);
+  //    the client's FetchOne maps it to absl::NotFoundError.
+  auto table_or = FindTable(req.table());
+  if (!table_or.ok()) {
+    ShmError err;
+    err.set_code(ShmError::NOT_FOUND);
+    err.set_message(std::string(table_or.status().message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueSampleS2C(state, ERROR, body);
+  }
+  std::shared_ptr<Table> table = *std::move(table_or);
+
+  // 1. Sample from the routed Table. This may block on the rate limiter up to
   //    `timeout_ms` (ponytail: blocks all clients while one waits; per-client
   //    dispatch thread later, spec §8.7).
   absl::Duration timeout = (req.timeout_ms() < 0)
                                ? absl::InfiniteDuration()
                                : absl::Milliseconds(req.timeout_ms());
   Table::SampledItem item;
-  absl::Status sample_status = table_->Sample(&item, timeout);
+  absl::Status sample_status = table->Sample(&item, timeout);
   if (!sample_status.ok()) {
     // Map timeout (and rate-limiter timeout) to a ShmError the client surfaces.
     ShmError err;
@@ -623,6 +716,65 @@ absl::Status ShmServer::HandleAllocate(ClientState& state,
   return EnqueueInsertS2C(state, ALLOCATE_RESP, body);
 }
 
+absl::Status ShmServer::HandleMutatePriorities(
+    ClientState& state, const MutatePrioritiesRequest& req) {
+  // ticket ⑩: route by table name via FindTable (ticket ⑨'s seam). Unknown
+  // table -> ShmError::NOT_FOUND on the insert s2c flow; the client maps that
+  // to absl::NotFoundError -> Python FileNotFoundError. Mirrors InProcessClient
+  // / Client::MutatePriorities (table->MutateItems). The MutatePriorities-
+  // Response is empty; we send an empty MUTATE_ACK.
+  auto table_or = FindTable(req.table());
+  if (!table_or.ok()) {
+    ShmError err;
+    err.set_code(ShmError::NOT_FOUND);
+    err.set_message(std::string(table_or.status().message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  // Materialize the repeated fields into locals so the spans point at stable
+  // storage (a span over a temporary vector would dangle).
+  std::vector<KeyWithPriority> updates(req.updates().begin(), req.updates().end());
+  std::vector<uint64_t> deletes(req.delete_keys().begin(),
+                                req.delete_keys().end());
+  absl::Status s = (*table_or)->MutateItems(absl::MakeConstSpan(updates),
+                                            absl::MakeConstSpan(deletes));
+  if (!s.ok()) {
+    ShmError err;
+    err.set_code(ShmError::INTERNAL);
+    err.set_message(std::string(s.message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  return EnqueueInsertS2C(state, MUTATE_ACK, "");  // empty ack
+}
+
+absl::Status ShmServer::HandleReset(ClientState& state,
+                                    const ResetRequest& req) {
+  // ticket ⑩: route by table name; unknown table -> NOT_FOUND. ResetResponse
+  // is empty; we send an empty RESET_ACK.
+  auto table_or = FindTable(req.table());
+  if (!table_or.ok()) {
+    ShmError err;
+    err.set_code(ShmError::NOT_FOUND);
+    err.set_message(std::string(table_or.status().message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  absl::Status s = (*table_or)->Reset();
+  if (!s.ok()) {
+    ShmError err;
+    err.set_code(ShmError::INTERNAL);
+    err.set_message(std::string(s.message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  return EnqueueInsertS2C(state, RESET_ACK, "");  // empty ack
+}
+
 absl::Status ShmServer::HandleInsert(ClientState& state,
                                       const ShmInsertRequest& req) {
   // 1. Deserialize each referenced ChunkData from the pool (C4: client wrote
@@ -706,27 +858,28 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
   ClientState* state_ptr = &state;
   auto offsets = std::make_shared<std::vector<uint64_t>>(std::move(chunk_offsets));
 
+  // ticket ⑨: route each item to its named table via FindTable. If ANY item
+  // references an unknown table, reject the WHOLE request with ERROR
+  // (NOT_FOUND) on the insert s2c flow and insert nothing — stricter than the
+  // old single-table warn-and-skip, which silently masked bad routing. ⑩
+  // (mutate_priorities/reset) will reuse FindTable.
+  for (const PrioritizedItem& item_proto : req.items()) {
+    if (!FindTable(item_proto.table()).ok()) {
+      ShmError err;
+      err.set_code(ShmError::NOT_FOUND);
+      err.set_message(absl::StrCat(
+          "Unknown table: ", item_proto.table(),
+          " (item key ", item_proto.key(), ")"));
+      std::string body;
+      err.SerializeToString(&body);
+      return EnqueueInsertS2C(state, ERROR, body);
+    }
+  }
+
   for (const PrioritizedItem& item_proto : req.items()) {
     const std::string& table_name = item_proto.table();
-    if (table_name != table_->name()) {
-      // ponytail: v1 server owns exactly ONE table (spec §3.4). A mismatch is
-      // a client error; surface via the ACK's empty key set (the client treats
-      // a missing key as failure). Multi-table server is a later ticket.
-      REVERB_LOG(REVERB_WARNING) << "ShmServer::HandleInsert: table '"
-                                 << table_name << "' != server table '"
-                                 << table_->name() << "'; skipping item "
-                                 << item_proto.key();
-      // Count as completed so the ACK still fires.
-      if (remaining->fetch_sub(1) == 1) {
-        InsertAck ack;
-        for (uint64_t k : *ack_keys) ack.add_keys(k);
-        for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
-        std::string body;
-        ack.SerializeToString(&body);
-        REVERB_RETURN_IF_ERROR(EnqueueInsertS2C(*state_ptr, INSERT_ACK, body));
-      }
-      continue;
-    }
+    // FindTable already validated above; safe to dereference.
+    std::shared_ptr<Table> table = *FindTable(table_name);
 
     // Gather the chunks referenced by this item's trajectory.
     std::vector<std::shared_ptr<ChunkStore::Chunk>> item_chunks;
@@ -779,8 +932,8 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     }
 
     bool can_insert_more = false;
-    absl::Status s = table_->InsertOrAssignAsync(std::move(table_item),
-                                                 &can_insert_more, cb);
+    absl::Status s = table->InsertOrAssignAsync(std::move(table_item),
+                                                &can_insert_more, cb);
     if (!s.ok()) {
       return s;
     }

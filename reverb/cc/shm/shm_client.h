@@ -26,6 +26,7 @@
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/sampler.h"
+#include "reverb/cc/schema.pb.h"
 #include "reverb/cc/shm/byte_pool.h"
 #include "reverb/cc/shm/ring.h"
 #include "reverb/cc/shm/shm_connection.h"
@@ -144,12 +145,36 @@ class ShmClient {
                          bool delta_encoded, int max_in_flight_items,
                          std::unique_ptr<Writer>* writer);
 
+  // Returns the bootstrap-time snapshot of the server's TableInfo (one entry
+  // per table the server held at Connect time). ticket ⑧ step 1: this is
+  // piggybacked on the SHM bootstrap handshake — there is no on-demand
+  // SERVER_INFO ring round-trip (that is step 2, deferred).
+  // ponytail: bootstrap-time snapshot only; does NOT reflect mid-session
+  // Table.replace / signature changes. Ceiling: a long-lived client whose
+  // table is replaced mid-session sees stale info. Upgrade path: add a
+  // SERVER_INFO/SERVER_INFO_RESP MsgType + HandleServerInfo for an on-demand
+  // round-trip (ticket ⑧ step 2).
+  absl::Status ServerInfo(std::vector<TableInfo>* table_info);
+
+  // ticket ⑩: control-plane ops, mirroring InProcessClient::MutatePriorities /
+  // Reset. These ride the INSERT flow (insert_c2s/insert_s2c) under
+  // conn_.insert_flow_mu so they never race RunShmWorker as a second producer
+  // on insert_c2s. Unknown table -> absl::NotFoundError (server replies
+  // ShmError::NOT_FOUND), surfaced as Python FileNotFoundError. Reuses the
+  // existing reverb_service.proto MutatePrioritiesRequest/ResetRequest types.
+  absl::Status MutatePriorities(const std::string& table,
+                                const std::vector<KeyWithPriority>& updates,
+                                const std::vector<uint64_t>& deletes);
+  absl::Status Reset(const std::string& table);
+
   ShmConnection* connection() { return &conn_; }
 
  private:
-  explicit ShmClient(ShmConnection conn);
+  explicit ShmClient(ShmConnection conn,
+                     std::vector<TableInfo> cached_server_info);
 
   ShmConnection conn_;
+  std::vector<TableInfo> cached_server_info_;
 };
 
 }  // namespace shm

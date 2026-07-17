@@ -154,7 +154,7 @@ struct ShmFixture {
     auto f = std::make_unique<ShmFixture>();
     f->table = table;
     f->sock = "/tmp/reverb_shm_insert_" + UniqueTag(tag) + ".sock";
-    auto s = ShmServer::Create(table, f->sock);
+    auto s = ShmServer::Create({table}, f->sock);
     if (!s.ok()) return nullptr;
     f->server = std::move(*s);
     if (!f->server->Start().ok()) return nullptr;

@@ -1068,10 +1068,9 @@ PYBIND11_MODULE(libpybind, m) {
   // C++ types as the gRPC/local paths (just constructed in SHM mode), so the
   // existing `py::class_<TrajectoryWriter>`/`<StructuredWriter>` bindings
   // already wrap them — no re-binding needed, just return the pointer.
-  // ponytail: v1 ShmServer has no MutatePriorities/Reset/ServerInfo/Checkpoint
-  // round-trip (the C++ dispatch only handles SAMPLE/RELEASE/INSERT/ALLOCATE).
-  // Those are intentionally NOT bound here; callers needing them should use
-  // the gRPC/in_process path. Upgrade: wire them in ShmServer when needed.
+  // ticket ⑩: MutatePriorities/Reset ARE wired over SHM (riding the insert
+  // flow under ShmConnection::insert_flow_mu). server_info is the bootstrap
+  // snapshot (ticket ⑧); checkpoint remains unwired on SHM.
   auto shm_connect_fn = [](const std::string& socket_path)
       -> std::shared_ptr<ShmClient> {
     absl::StatusOr<std::unique_ptr<ShmClient>> result;
@@ -1136,6 +1135,53 @@ PYBIND11_MODULE(libpybind, m) {
         MaybeRaiseFromStatus(status);
         return writer.release();
       };
+  // ticket ⑧ step 1: server_info from the bootstrap snapshot cached at
+  // Connect time (no on-demand round-trip). Mirrors the InProcessClient
+  // server_info_fn binding: serialize each TableInfo to py::bytes.
+  auto shm_server_info_fn = [](ShmClient* client)
+      -> std::vector<py::bytes> {
+    std::vector<TableInfo> table_info;
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->ServerInfo(&table_info);
+    }
+    MaybeRaiseFromStatus(status);
+    std::vector<py::bytes> serialized_table_info;
+    serialized_table_info.reserve(table_info.size());
+    for (const auto& info : table_info) {
+      serialized_table_info.push_back(py::bytes(info.SerializeAsString()));
+    }
+    return serialized_table_info;
+  };
+  // ticket ⑩: MutatePriorities/Reset over SHM (ride the insert flow under
+  // ShmConnection::insert_flow_mu). Mirrors the gRPC Client / InProcessClient
+  // bindings: pair<uint64,double> -> KeyWithPriority proto, release GIL.
+  auto shm_mutate_priorities_fn =
+      [](ShmClient* client, const std::string& table,
+         const std::vector<std::pair<uint64_t, double>>& updates,
+         const std::vector<uint64_t>& deletes) {
+        std::vector<KeyWithPriority> update_protos;
+        for (const auto& update : updates) {
+          update_protos.emplace_back();
+          update_protos.back().set_key(update.first);
+          update_protos.back().set_priority(update.second);
+        }
+        absl::Status status;
+        {
+          py::gil_scoped_release g;
+          status = client->MutatePriorities(table, update_protos, deletes);
+        }
+        MaybeRaiseFromStatus(status);
+      };
+  auto shm_reset_fn = [](ShmClient* client, const std::string& table) {
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->Reset(table);
+    }
+    MaybeRaiseFromStatus(status);
+  };
 
   py::class_<ShmClient, std::shared_ptr<ShmClient>>(m, "ShmClient")
       .def(py::init(shm_connect_fn), py::arg("socket_path"))
@@ -1157,7 +1203,15 @@ PYBIND11_MODULE(libpybind, m) {
       .def("new_structured_writer", shm_new_structured_writer_fn,
            py::arg("configs"))
       .def("NewStructuredWriter", shm_new_structured_writer_fn,
-           py::arg("configs"));
+           py::arg("configs"))
+      .def("server_info", shm_server_info_fn)
+      .def("ServerInfo", shm_server_info_fn)
+      .def("mutate_priorities", shm_mutate_priorities_fn,
+           py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("MutatePriorities", shm_mutate_priorities_fn,
+           py::arg("table"), py::arg("updates"), py::arg("deletes"))
+      .def("reset", shm_reset_fn, py::arg("table"))
+      .def("Reset", shm_reset_fn, py::arg("table"));
 
   // ShmSampler mirrors Sampler's GetNextTrajectory: release the GIL for the C++
   // call, re-acquire to build the info+data tensor vector (GIL needed for the
@@ -1184,32 +1238,34 @@ PYBIND11_MODULE(libpybind, m) {
 
   // ShmServer: created+held by the Python `Server(shm=True)` object (C1). The
   // dispatch thread starts on `Start` and is joined on `Stop`; `Stop` is also
-  // called from Server.stop()/__del__. `Create` takes the (single, v1) Table
-  // and a udsocket path; an empty path auto-generates one.
+  // called from Server.stop()/__del__. `Create` takes the list of Tables (ticket
+  // ⑨: routed by table name) and a udsocket path; an empty path auto-generates
+  // one.
   py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
-      .def(py::init([](std::shared_ptr<Table> table,
+      .def(py::init([](std::vector<std::shared_ptr<Table>> tables,
                       const std::string& socket_path) {
              absl::StatusOr<std::unique_ptr<ShmServer>> result;
              {
                py::gil_scoped_release g;
-               result = ShmServer::Create(std::move(table), socket_path);
+               result = ShmServer::Create(std::move(tables), socket_path);
              }
              MaybeRaiseFromStatus(result.status());
              return std::shared_ptr<ShmServer>(std::move(*result));
            }),
-           py::arg("table"), py::arg("socket_path") = "")
+           py::arg("tables"), py::arg("socket_path") = "")
       .def_static(
           "Create",
-          [](std::shared_ptr<Table> table, const std::string& socket_path) {
+          [](std::vector<std::shared_ptr<Table>> tables,
+             const std::string& socket_path) {
             absl::StatusOr<std::unique_ptr<ShmServer>> result;
             {
               py::gil_scoped_release g;
-              result = ShmServer::Create(std::move(table), socket_path);
+              result = ShmServer::Create(std::move(tables), socket_path);
             }
             MaybeRaiseFromStatus(result.status());
             return std::shared_ptr<ShmServer>(std::move(*result));
           },
-          py::arg("table"), py::arg("socket_path") = "")
+          py::arg("tables"), py::arg("socket_path") = "")
       .def("Start",
            [](ShmServer* server) {
              absl::Status status;

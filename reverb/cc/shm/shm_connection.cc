@@ -60,6 +60,10 @@ ShmConnection::ShmConnection(ShmConnection&& other) noexcept
       pool(std::move(other.pool)),
       pool_shm_name(std::move(other.pool_shm_name)),
       control_fd(other.control_fd) {
+  // insert_flow_mu is non-movable (absl::Mutex); leave this instance's mutex
+  // default-constructed (unlocked). A ShmConnection is moved exactly once
+  // before any worker thread starts, so the destination's mutex is the one
+  // RunShmWorker/MutatePriorities/Reset all see. See shm_connection.h.
   other.control_fd = -1;  // stolen, so ~other does not double-close
 }
 
@@ -74,6 +78,7 @@ ShmConnection& ShmConnection::operator=(ShmConnection&& other) noexcept {
     if (control_fd >= 0) close(control_fd);
     control_fd = other.control_fd;
     other.control_fd = -1;
+    // insert_flow_mu intentionally NOT moved (non-movable; see move ctor).
   }
   return *this;
 }

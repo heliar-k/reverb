@@ -142,6 +142,7 @@ reverb_cc_library(
     deps = [
         ":byte_pool",
         ":ring",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -212,6 +213,7 @@ reverb_cc_library(
         "//reverb/cc:errors",
         "//reverb/cc:patterns_cc_proto",
         "//reverb/cc:sampler",
+        "//reverb/cc:schema_cc_proto",
         "//reverb/cc:structured_writer",
         "//reverb/cc:table",
         "//reverb/cc:trajectory_writer",

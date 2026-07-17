@@ -228,7 +228,7 @@ TEST(ShmCrashTest, ClientFdCloseReclaimsOffsetsAndUnlinksRings) {
              /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
 
   std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("c1") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -309,7 +309,7 @@ TEST(ShmCrashTest, RepeatedCrashDoesNotExhaustPool) {
   }
 
   std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("pool") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -365,7 +365,7 @@ TEST(ShmCrashTest, OtherClientUnaffectedByChildCrash) {
              /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
 
   std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("multi") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -443,7 +443,7 @@ TEST(ShmCrashTest, ClientFailsFastWhenServerStops) {
              /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
 
   std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("eof") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 

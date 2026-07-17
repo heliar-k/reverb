@@ -196,7 +196,7 @@ TEST(ShmSampleTest, SampleCrossesShmMatchesInsertedData) {
              /*squeeze=*/false);
 
   std::string sock = "/tmp/reverb_shm_sample_" + UniqueTag("s1") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -227,7 +227,7 @@ TEST(ShmSampleTest, SqueezedColumnRoundTrips) {
              /*squeeze=*/true);
 
   std::string sock = "/tmp/reverb_shm_sample_" + UniqueTag("sq") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -254,7 +254,7 @@ TEST(ShmSampleTest, EmptyTableTimeoutIsDeadlineExceeded) {
   auto table = MakeTable();  // empty: rate limiter min_size_to_sample = 1
 
   std::string sock = "/tmp/reverb_shm_sample_" + UniqueTag("to") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 
@@ -293,7 +293,7 @@ TEST(ShmSampleTest, ReleaseRecyclesPoolBlocks) {
   }
 
   std::string sock = "/tmp/reverb_shm_sample_" + UniqueTag("rel") + ".sock";
-  auto server = ShmServer::Create(table, sock);
+  auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
 

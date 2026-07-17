@@ -18,6 +18,7 @@
 #include <string>
 #include <utility>
 
+#include "absl/synchronization/mutex.h"
 #include "reverb/cc/shm/byte_pool.h"
 #include "reverb/cc/shm/ring.h"
 
@@ -74,6 +75,28 @@ struct ShmConnection {
   ShmConnection& operator=(ShmConnection&& other) noexcept;
   ShmConnection(const ShmConnection&) = delete;
   ShmConnection& operator=(const ShmConnection&) = delete;
+
+  // ticket ⑩: serializes the send-request → read-ACK round-trip on the
+  // INSERT flow so two producers never touch insert_c2s's single `head` at
+  // once. Both RunShmWorker (the insert worker background thread: its
+  // ALLOCATE→ALLOCATE_RESP and INSERT→INSERT_ACK round-trips) AND the
+  // caller-thread MutatePriorities/Reset round-trips acquire this mutex for
+  // the whole send→read sequence. The sample flow
+  // (sample_c2s/sample_s2c, ShmSampler's worker) is untouched and stays
+  // lock-free — the mutex only contends when a control-plane call overlaps
+  // an in-flight insert, which is rare.
+  // ponytail: one mutex on the existing insert flow instead of a third
+  // dedicated control ring pair. Ceiling: control-plane ops (mutate/reset)
+  // serialize against in-flight inserts on this client; the hot sample path
+  // is unaffected. Upgrade path: a third SPSC ring pair dedicated to
+  // control-plane traffic would let mutate/reset run fully concurrent with
+  // inserts if profiling shows this mutex contending.
+  // Note: absl::Mutex is non-movable, so the move ctor/assignment below leave
+  // the destination's mutex default-constructed (unlocked) and do not steal
+  // the source's. A connection is moved exactly once (ShmClient::Connect into
+  // the ShmClient member, or TryAccept into ClientState) before any worker
+  // thread starts, so the post-move mutex is the one all threads see.
+  mutable absl::Mutex insert_flow_mu;
 };
 
 }  // namespace shm

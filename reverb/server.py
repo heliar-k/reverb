@@ -344,8 +344,8 @@ class Server:
             `ShmServer` is created and held by this `Server`, exposing
             `Server.shm_socket_path` for `ShmClient` connections. SHM is an
             additional transport layered on the owned Table and can coexist with
-            either `in_process` mode or the gRPC service. v1: the `ShmServer` holds
-            ONE table (`tables[0]`); multi-table is deferred.
+            either `in_process` mode or the gRPC service. Supports all tables,
+            routed by table name (ticket ⑨).
           shm_socket_path: udsocket path for the SHM bootstrap server. If `None`
             (default), a path `/tmp/reverb_shm_<pid>.sock` is generated and cleaned
             up on `stop()`.
@@ -407,10 +407,10 @@ class Server:
             )
 
         if shm:
-            # C1: the ShmServer lifecycle hangs off this Server object. v1 holds ONE
-            # table (tables[0]); multi-table is deferred. SHM is an additional
-            # transport layered on the owned Table, independent of in_process/gRPC,
-            # so `shm=True` does NOT imply `in_process=True`.
+            # C1: the ShmServer lifecycle hangs off this Server object. SHM serves
+            # ALL tables (ticket ⑨: routed by table name) and is an additional
+            # transport layered on the owned Table, independent of
+            # in_process/gRPC, so `shm=True` does NOT imply `in_process=True`.
             import os  # pylint: disable=g-import-not-at-top
             import tempfile  # pylint: disable=g-import-not-at-top
 
@@ -421,7 +421,8 @@ class Server:
                     tempfile.gettempdir(), f"reverb_shm_{os.getpid()}.sock"
                 )
             self._shm_server = pybind.ShmServer(
-                table=tables[0].internal_table, socket_path=shm_socket_path
+                tables=[t.internal_table for t in tables],
+                socket_path=shm_socket_path,
             )
             self._shm_server.Start()
             self._shm_socket_path = self._shm_server.socket_path

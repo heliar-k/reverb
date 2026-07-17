@@ -828,11 +828,13 @@ class ShmClient(_BaseClient):
     pair per flow so each flow keeps its own SPSC producer). `sample`/`trajectory_writer`/`structured_writer`
     match `Client`/`LocalClient` exactly, so user code is transport-agnostic.
 
-    v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles only
-    SAMPLE/RELEASE/INSERT/ALLOCATE — there is no `server_info`/
-    `mutate_priorities`/`reset`/`checkpoint` round-trip over SHM, and the plain
-    `Writer` is unimplemented (use `trajectory_writer`/`structured_writer`).
-    `ShmClient` is not picklable: it holds SHM mmap + ring state (R13).
+    v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles
+    SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops
+    `mutate_priorities`/`reset` (ticket ⑩, riding the insert flow under a
+    client mutex). `server_info` returns a bootstrap-time snapshot (ticket ⑧);
+    `checkpoint` and the plain `Writer` are unimplemented over SHM (use
+    `trajectory_writer`/`structured_writer`). `ShmClient` is not picklable: it
+    holds SHM mmap + ring state (R13).
     """
 
     def __init__(self, socket_path: str):
@@ -854,12 +856,12 @@ class ShmClient(_BaseClient):
         )
 
     def _fetch_server_info_proto(self, timeout: Optional[int]):
-        # ponytail: v1 ShmServer has no ServerInfo round-trip (the C++ dispatch
-        # only handles SAMPLE/RELEASE/INSERT/ALLOCATE). Return an empty list so
-        # `server_info()` yields {} rather than failing to import; callers that
-        # need real table metadata should use the gRPC/in_process path. Upgrade:
-        # wire a ServerInfo request/response in ShmServer.
-        return []
+        # Bootstrap-time snapshot of TableInfo (ticket ⑧ step 1). `timeout` is
+        # accepted for parity with the gRPC hook but ignored — the data is
+        # cached at Connect time, no round-trip. ponytail: does not reflect
+        # mid-session Table.replace / signature changes; upgrade via a
+        # SERVER_INFO ring round-trip (ticket ⑧ step 2).
+        return self._client.ServerInfo()
 
     def _new_sampler(
         self, table: str, num_samples: int, buffer_size: int, timeout_ms: Optional[int]

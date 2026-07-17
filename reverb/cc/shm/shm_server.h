@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/shm/byte_pool.h"
@@ -81,19 +82,23 @@ struct ClientState {
   bool close_requested = false;
 };
 
-// ShmServer owns ONE real Table (ponytail: multi-table later), a ShmBytePool
-// (sole allocator, C4), and a bootstrap udsocket. A single dispatch thread
-// polls the listen socket for new clients, then non-blocking-reads each
-// client's C→S ring: SAMPLE → Table::Sample → UnpackChunkColumnAndSlice ON THE
-// DISPATCH THREAD (A1) → memcpy result bytes into the pool (refcount=1, C3) →
-// write SAMPLE_RESP to S→C (non-blocking, stashed in outbox if full, §8.7);
-// RELEASE → Unref each offset, →0 deallocates. Insert is NOT wired (ticket ④).
+// ShmServer owns ALL tables (ticket ⑨: routed by table name) keyed by name,
+// a ShmBytePool (sole allocator, C4), and a bootstrap udsocket. A single
+// dispatch thread polls the listen socket for new clients, then non-blocking-
+// reads each client's C→S ring: SAMPLE → FindTable(req.table) →
+// Table::Sample → UnpackChunkColumnAndSlice ON THE DISPATCH THREAD (A1) →
+// memcpy result bytes into the pool (refcount=1, C3) → write SAMPLE_RESP to
+// S→C (non-blocking, stashed in outbox if full, §8.7); RELEASE → Unref each
+// offset, →0 deallocates. Insert routes each PrioritizedItem to its named
+// table via FindTable (ticket ④ + ⑨).
 class ShmServer {
  public:
   // Create the pool + bootstrap server. `socket_path` is the udsocket path.
-  // ponytail: ONE table per server for v1; multi-table later.
+  // `tables` must be non-empty with unique names (validated here; the Python
+  // `Server` also checks, but C++ defends itself).
   static absl::StatusOr<std::unique_ptr<ShmServer>> Create(
-      std::shared_ptr<Table> table, const std::string& socket_path);
+      std::vector<std::shared_ptr<Table>> tables,
+      const std::string& socket_path);
 
   ~ShmServer();
 
@@ -118,7 +123,7 @@ class ShmServer {
   void CloseClientFdForTest();
 
  private:
-  ShmServer(std::shared_ptr<Table> table, std::string socket_path,
+  ShmServer(std::vector<std::shared_ptr<Table>> tables, std::string socket_path,
             ShmBytePool pool, ShmBootstrapServer bootstrap);
 
   // dispatch thread main loop
@@ -159,6 +164,16 @@ class ShmServer {
   absl::Status HandleAllocate(ClientState& state,
                               const ShmAllocateRequest& req);
 
+  // ticket ⑩: control-plane handlers. These ride the INSERT flow (insert_c2s
+  // → insert_s2c) so they reuse EnqueueInsertS2C. The client serializes them
+  // against RunShmWorker via ShmConnection::insert_flow_mu (see shm_client.cc)
+  // — the server side is single-threaded dispatch, so no extra server lock.
+  // MutatePriorities reuses the existing reverb_service.proto request type;
+  // maps FindTable miss → ShmError::NOT_FOUND (client raises FileNotFoundError).
+  absl::Status HandleMutatePriorities(ClientState& state,
+                                     const MutatePrioritiesRequest& req);
+  absl::Status HandleReset(ClientState& state, const ResetRequest& req);
+
   // Enqueue a S→C message on the INSERT flow's s2c ring: try a non-blocking
   // write, stash in insert_outbox if full.
   absl::Status EnqueueInsertS2C(ClientState& state, MsgType type,
@@ -184,7 +199,17 @@ class ShmServer {
   // Stop is idempotent with the Ring destructor's own owner-unlink.
   void CleanupClient(ClientState& state, bool unlink_rings);
 
-  std::shared_ptr<Table> table_;
+  // ticket ⑨: shared table-name routing. Returns the named table or
+  // NotFoundError. ⑩ (mutate_priorities/reset) reuses this seam.
+  absl::StatusOr<std::shared_ptr<Table>> FindTable(
+      const std::string& name) const;
+
+  // ponytail: map-only, no parallel ordered list. server_info fills
+  // table_info by iterating `tables_`; hash_map order is unspecified but the
+  // client consumes server_info into a name→TableInfo dict (set-equality in
+  // parity tests), so ordering is irrelevant. Collapse to nothing smaller;
+  // add an ordered vector only if a test starts asserting table_info order.
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
   std::string socket_path_;
   ShmBytePool pool_;
   ShmBootstrapServer bootstrap_;
