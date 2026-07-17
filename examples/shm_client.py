@@ -18,9 +18,9 @@ Same-machine cross-process transport: zero-copy, no serialization, ~9-11x
 faster than gRPC loopback (see docs/shm-benchmark.md). `ShmClient` mirrors
 `Client`/`LocalClient`, so only the transport differs.
 
-v1: `server_info` returns a connect-time bootstrap snapshot (real `TableInfo`,
-but does not reflect mid-session `Table.replace` — use gRPC/Local for live
-signatures). `mutate_priorities`/`reset`/`checkpoint` are supported over SHM
+v2: `server_info` does an on-demand `SERVER_INFO` ring round-trip (ticket ⑧
+step 2) and returns live `TableInfo` reflecting mid-session inserts / state
+changes. `mutate_priorities`/`reset`/`checkpoint` are supported over SHM
 (tickets ⑩/⑪, riding the insert flow). Legacy `writer`/`insert` raise
 `NotImplementedError` — use `trajectory_writer`/`structured_writer`.
 

@@ -341,10 +341,14 @@ class ShmClientReprTest(absltest.TestCase):
 
 
 class ShmClientServerInfoTest(absltest.TestCase):
-    """ticket ⑧ step 1: server_info() returns a bootstrap-time snapshot of the
-    server's TableInfo (piggybacked on the SHM handshake), not an empty {}.
-    The snapshot reflects table state at Connect time; mid-session
-    Table.replace / signature changes are NOT reflected (step 2 deferred)."""
+    """ticket ⑧: server_info() returns real TableInfo over SHM.
+
+    step 1 piggybacked a snapshot on the bootstrap handshake; step 2 added an
+    on-demand SERVER_INFO ring round-trip so server_info() reflects live
+    table state (current_size after inserts, signature changes) on every call,
+    mirroring gRPC's refresh-on-every-call semantics. The round-trip rides the
+    INSERT flow under insert_flow_mu like ⑩/⑪'s control-plane ops.
+    """
 
     def test_server_info_returns_real_metadata(self):
         server, client = _make_shm_server(table_name="t", max_size=7)
@@ -450,11 +454,36 @@ class ShmClientServerInfoTest(absltest.TestCase):
         np.testing.assert_array_equal(sample.data["obs"], [[0.0], [1.0], [2.0]])
 
     def test_server_info_accepts_timeout_kwarg(self):
-        # The hook accepts `timeout` for parity with the gRPC/Local hooks;
-        # it is ignored (no round-trip — the data is cached at Connect).
+        # The hook accepts `timeout` for parity with the gRPC/Local hooks; it is
+        # ignored (the SHM round-trip uses its own hard cap, see
+        # ShmClient::ServerInfo).
         server, client = _make_shm_server()
         info = client.server_info(timeout=1)
         self.assertIn("t", info)
+
+    def test_server_info_reflects_mid_session_inserts(self):
+        # ticket ⑧ step 2: server_info() is a live round-trip, NOT a connect-
+        # time snapshot. After connecting on an empty table, insert items via
+        # the in-process path and assert a subsequent server_info() call sees
+        # the new current_size. Under step 1 (bootstrap snapshot) this would
+        # still read 0.
+        #
+        # Note: we test current_size rather than a Table.replace signature
+        # change because Table.replace returns a *new empty* table (the server
+        # holds no hot-swap API), so signature mutation mid-session is not
+        # reachable from Python. current_size is the honest live-state signal:
+        # Table::info() reads data_.size() at call time, so a fresh
+        # SERVER_INFO response reflects inserts made since connect.
+        server, client = _make_shm_server(table_name="t", max_size=10, min_size=1)
+        self.assertEqual(client.server_info()["t"].current_size, 0)
+        local = server.in_process_client
+        for i in range(4):
+            _insert_one(local, "t", np.array([float(i)], dtype=np.float32))
+        # The live round-trip sees the 4 items inserted AFTER connect.
+        self.assertEqual(client.server_info()["t"].current_size, 4)
+        # And again after one more — each call is fresh, not memoized.
+        _insert_one(local, "t", np.array([4.0], dtype=np.float32))
+        self.assertEqual(client.server_info()["t"].current_size, 5)
 
 
 class ShmClientValidateItemsTest(absltest.TestCase):

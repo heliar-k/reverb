@@ -1011,8 +1011,8 @@ py::class_<PyShmClient>(m, "ShmClient")
 > `(ShmClient, (socket_path,))`，反序列化重连（不同于 `LocalClient` 持进程内
 > 指针不可序列化）。plain `Writer` 的 SHM 路径 won't fix（ticket ⑬）：legacy
 > `Writer` 无 SHM seam，Python 层覆盖 `writer`/`insert` 抛 `NotImplementedError`。
-> `trajectory_writer` 的 signature 校验已生效（ticket ⑧-2b）：`NewTrajectoryWriter`
-> 从 bootstrap 快照填 `flat_signature_map`，`create_item` 校验 trajectory 与表签名，
+> `trajectory_writer` 的 signature 校验已生效（ticket ⑧-2b → step 2）：`NewTrajectoryWriter`
+> 调 `ServerInfo()` 往返拿实时 `TableInfo` 填 `flat_signature_map`，`create_item` 校验 trajectory 与表签名，
 > 未知表拒为 `ValueError`（对齐 InProcessClient/gRPC validate_items=True）。
 
 ---

@@ -14,7 +14,7 @@
   buffer（每流一对，决策 D）+ server 轮询，bootstrap 用 Unix domain socket。
 - **API**：新增 `ShmClient`，镜像 `_BaseClient` 的热路径（sample /
   trajectory_writer / structured_writer）+ 冷路径控制面（`mutate_priorities`/
-  `reset` ticket ⑩、`server_info` bootstrap 快照 ticket ⑧、`checkpoint` ticket ⑪），
+  `reset` ticket ⑩、`server_info` 按需往返 ticket ⑧、`checkpoint` ticket ⑪），
   语义与 gRPC / LocalClient 一致。`pickle` 已支持（ticket ⑫）；
   legacy `writer`/`insert` won't fix（ticket ⑬，Python 层 `NotImplementedError`）。见 §6。
 
@@ -77,7 +77,7 @@ client ndarray
 | S7 | SHM 池与现有 ChunkStore 并存，但 SHM 字节是**瞬态传输缓冲**（insert 字节在 INSERT_ACK 后 RELEASE 回收，sample 字节在 client 读后 RELEASE 回收），仅在传输瞬间与 ChunkStore 双份 | 现有 Table / ChunkStore / sampler 零改动；避免 SHM 池永久占双份内存 |
 | S8 | insert：client 把 chunker 已压缩的 `ChunkData` proto 序列化后 memcpy 进 SHM，server 反序列化存档（不再二次压缩） | 复用 chunker 现有压缩；server 零压缩。注：与早期“client 送原始字节、server 压缩”设想不同，实现采用 proto 序列化简化多列处理（见 §8.5） |
 | S9 | sample：server 预切片成成品字节进 SHM，client 直接读 | client 侧零计算；每次独立分配不复用 |
-| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 （`server_info` 已实现 bootstrap 快照 ticket ⑧；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；`checkpoint` 已实现 ticket ⑪，走 insert 流 + 注入 checkpointer；`ShmClient` 已可 pickle ticket ⑫） |
+| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 （`server_info` 已实现 ticket ⑧：step 1 bootstrap 快照 → step 2 按需 `SERVER_INFO` ring 往返；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；`checkpoint` 已实现 ticket ⑪，走 insert 流 + 注入 checkpointer；`ShmClient` 已可 pickle ticket ⑫） |
 | S11 | Python 新增 `ShmClient`，镜像 `_BaseClient` | API 一致；三路并列 |
 | S12 | 支持 trajectory_writer / structured_writer（insert 经 trajectory_writer 的 SHM 路径实现）；plain `Writer` won't fix（无 SHM seam，Python 层 `NotImplementedError`，ticket ⑬） | writer backpressure 经反向 ring confirm |
 | S13 | 崩溃恢复：udsocket 断连检测 + 集中释放该 client SHM 偏移 | 简单可靠 |
@@ -297,7 +297,7 @@ sequenceDiagram
   `NotImplementedError`，ticket ⑬），用 `trajectory_writer` / `structured_writer`。
 - **控制面冷路径**：`mutate_priorities` / `reset` / `server_info` 已实现
   （`mutate_priorities`/`reset` 走 insert 流 + 客户端互斥锁，ticket ⑩；
-  `server_info` 为 bootstrap 快照，ticket ⑧）；`checkpoint` 已实现（ticket ⑪，
+  `server_info` 走按需 `SERVER_INFO` ring 往返，ticket ⑧ step 2）；`checkpoint` 已实现（ticket ⑪，
   走 insert 流 + 注入 checkpointer）。
   热路径（sample/insert）已完整。
 - **多 server 进程**：本文档不涉及（一个 server 进程，多 client）。v1 `ShmServer`
@@ -391,8 +391,9 @@ struct SlotHeader {
 #### C→S 请求（client 写，server 读）
 
 v1 已实现：`HELLO` / `INSERT` / `SAMPLE` / `RELEASE` / `ALLOCATE` / `CLOSE`。
-`MUTATE_PRIORITIES`（⑩）/ `RESET`（⑩）已实现；`SERVER_INFO` 按需往返未实现（⑧ step 1
-走 bootstrap piggyback，无需独立消息）；`CHECKPOINT` 已实现（⑪，走 insert 流，
+`MUTATE_PRIORITIES`（⑩）/ `RESET`（⑩）已实现；`SERVER_INFO` 已实现（⑧ step 2，走
+insert 流，复用 `ServerInfoRequest`/`ServerInfoResponse`，按需往返返回实时
+`TableInfo`）；`CHECKPOINT` 已实现（⑪，走 insert 流，
 复用 `CheckpointRequest`/`CheckpointResponse`）。
 
 | type 值 | msg_type 名 | body proto | 对应现有 RPC | 状态 |
@@ -406,11 +407,11 @@ v1 已实现：`HELLO` / `INSERT` / `SAMPLE` / `RELEASE` / `ALLOCATE` / `CLOSE`�
 | 7 | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset | ✓（⑩） |
 | 9 | `CLOSE` | 空 | client 主动关闭 | ✓ |
 | 8 | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint | ✓（⑪，走 insert 流） |
-| — | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | 未实现（⑧ step 1 用 bootstrap piggyback 代替） |
+| 10 | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | ✓（⑧ step 2，走 insert 流） |
 
 > 注：早期设计表把 type 5 预留给 `MUTATE_PRIORITIES`，实现中 5 被用于 `ALLOCATE`
-> （C4 集中分配流程），故 `MUTATE_PRIORITIES`=6、`RESET`=7。`CHECKPOINT`/
-> `SERVER_INFO` 未占号。
+> （C4 集中分配流程），故 `MUTATE_PRIORITIES`=6、`RESET`=7。`SERVER_INFO`=10
+> （9 被 `CLOSE` 占用）。
 
 ```protobuf
 // shm_protocol.proto (新增)
@@ -470,11 +471,11 @@ v1 已实现：`WELCOME` / `INSERT_ACK` / `SAMPLE_RESP` / `ALLOCATE_RESP` / `ERR
 | 106 | `MUTATE_ACK` | `MutatePrioritiesResponse`（复用） | | ✓（⑩） |
 | 107 | `RESET_ACK` | `ResetResponse`（复用） | | ✓（⑩） |
 | 108 | `CHECKPOINT_RESP` | `CheckpointResponse`（复用） | | ✓（⑪，走 insert 流） |
-| — | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | | 未实现（⑧ step 1 用 bootstrap piggyback 代替） |
+| 110 | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | | ✓（⑧ step 2，走 insert 流） |
 
 > 注：早期设计表把 104 预留给 `ERROR`、105 预留给 `MUTATE_ACK`。实现中 104 被
 > `ALLOCATE_RESP` 占用、`ERROR` 后移到 105，`MUTATE_ACK`=106、`RESET_ACK`=107。
-> `CHECKPOINT_RESP`/`SERVER_INFO_RESP` 未占号。
+> `SERVER_INFO_RESP`=110（与 `SERVER_INFO`=10 的 +100 对齐）。
 
 ```protobuf
 message ShmSampleResponse {
@@ -676,7 +677,7 @@ udsocket 字节流，不走 ring：
    - mmap, 初始化 RingHeader
    - 回 WelcomeResponse{pool_shm_name, insert_c2s/s2c_shm_name,
      sample_c2s/s2c_shm_name, server_info}
-     （server_info 字段 v1 未填充，供 writer 校验的 signature 暂不可用，见 S10）
+     （server_info 字段 v1 未填充；v2 ticket ⑧ step 2 改为按需 `SERVER_INFO` ring 往返，见下文）
 
 4. client 收 Welcome:
    - shm_open + mmap 五段(pool, insert_c2s/s2c, sample_c2s/s2c)

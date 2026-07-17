@@ -1135,9 +1135,10 @@ PYBIND11_MODULE(libpybind, m) {
         MaybeRaiseFromStatus(status);
         return writer.release();
       };
-  // ticket ⑧ step 1: server_info from the bootstrap snapshot cached at
-  // Connect time (no on-demand round-trip). Mirrors the InProcessClient
-  // server_info_fn binding: serialize each TableInfo to py::bytes.
+  // ticket ⑧ step 2: server_info via an on-demand SERVER_INFO ring
+  // round-trip (replaces the step-1 bootstrap snapshot). Mirrors the
+  // InProcessClient server_info_fn binding: serialize each TableInfo to
+  // py::bytes. The round-trip happens under the GIL-released section.
   auto shm_server_info_fn = [](ShmClient* client)
       -> std::vector<py::bytes> {
     std::vector<TableInfo> table_info;

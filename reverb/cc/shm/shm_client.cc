@@ -307,10 +307,7 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
 
 ShmClient::~ShmClient() = default;
 
-ShmClient::ShmClient(ShmConnection conn,
-                     std::vector<TableInfo> cached_server_info)
-    : conn_(std::move(conn)),
-      cached_server_info_(std::move(cached_server_info)) {}
+ShmClient::ShmClient(ShmConnection conn) : conn_(std::move(conn)) {}
 
 // static
 absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
@@ -358,26 +355,54 @@ absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
   conn.control_fd = fd_guard.fd;  // ~ShmConnection closes it
   fd_guard.fd = -1;               // conn owns it now
 
-  // ticket ⑧ step 1: cache the TableInfo piggybacked on the bootstrap
-  // WelcomeResponse so server_info() can return a real snapshot without a
-  // new round-trip (step 2 deferred). One table per v1 ShmServer.
-  std::vector<TableInfo> cached_server_info;
-  cached_server_info.reserve(w->welcome.server_info().table_info_size());
-  for (const auto& info : w->welcome.server_info().table_info()) {
-    cached_server_info.push_back(info);
-  }
-
-  return absl::WrapUnique(
-      new ShmClient(std::move(conn), std::move(cached_server_info)));
+  return absl::WrapUnique(new ShmClient(std::move(conn)));
 }
 
 absl::Status ShmClient::ServerInfo(std::vector<TableInfo>* table_info) {
-  // ticket ⑧ step 1: return the bootstrap-time snapshot. ponytail: bootstrap
-  // snapshot only — does NOT reflect mid-session Table.replace / signature
-  // changes. Ceiling: a long-lived client whose table is replaced mid-session
-  // sees stale info. Upgrade path: SERVER_INFO/SERVER_INFO_RESP MsgType +
-  // HandleServerInfo on-demand round-trip (ticket ⑧ step 2).
-  *table_info = cached_server_info_;
+  // ticket ⑧ step 2: on-demand SERVER_INFO round-trip (replaces the step-1
+  // bootstrap snapshot). Rides the INSERT flow under insert_flow_mu like
+  // ⑩/⑪'s control-plane ops — see MutatePriorities for the mutex rationale.
+  // ServerInfoRequest is empty; ServerInfoResponse carries repeated TableInfo.
+  // Always succeeds server-side (HandleServerInfo has no error path).
+  ServerInfoRequest req;
+  std::string body;
+  req.SerializeToString(&body);
+
+  absl::MutexLock lock(&conn_.insert_flow_mu);
+  REVERB_RETURN_IF_ERROR(
+      conn_.insert_c2s.Write(SERVER_INFO, absl::MakeSpan(body)));
+
+  MsgType resp_type;
+  std::string resp_body;
+  // Same kReadBlockingHardCap cap as ⑩/⑪'s control-plane ACKs.
+  REVERB_RETURN_IF_ERROR(
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
+                   kReadBlockingHardCap));
+
+  if (resp_type == ERROR) {
+    // HandleServerInfo has no error path, but defend against future ones.
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError(
+          "ShmClient::ServerInfo: malformed ShmError");
+    }
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::ServerInfo: server error: ", err.message()));
+  }
+  if (resp_type != SERVER_INFO_RESP) {
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::ServerInfo: unexpected response type ", resp_type));
+  }
+  ServerInfoResponse resp;
+  if (!resp.ParseFromString(resp_body)) {
+    return absl::InternalError(
+        "ShmClient::ServerInfo: malformed ServerInfoResponse");
+  }
+  table_info->clear();
+  table_info->reserve(resp.table_info_size());
+  for (const auto& info : resp.table_info()) {
+    table_info->push_back(info);
+  }
   return absl::OkStatus();
 }
 
@@ -533,20 +558,17 @@ absl::Status ShmClient::NewTrajectoryWriter(
     std::unique_ptr<TrajectoryWriter>* writer) {
   REVERB_RETURN_IF_ERROR(options.Validate());
   // SHM mode: the writer's RunShmWorker sends inserts over conn_. No local
-  // tables — the server owns the Table. ticket ⑧ step 2b: populate
-  // flat_signature_map from the bootstrap-time cached_server_info_ so that
+  // tables — the server owns the Table. ticket ⑧ step 2: populate
+  // flat_signature_map from a live SERVER_INFO round-trip so that
   // CreateItem's ItemAndRefs::Validate runs the same signature check as
   // gRPC/LocalClient. Each table occupies one entry; a table with no
   // signature gets nullopt (Validate skips it). A table absent from the
-  // snapshot is treated as "unknown table" by Validate.
-  // ponytail: snapshot is connect-time only; does NOT reflect mid-session
-  // Table.replace / signature changes — upgrade via a SERVER_INFO ring
-  // round-trip (ticket ⑧ step 2). For now a stale signature blocks a
-  // mismatched trajectory (safe-fail); a replaced-but-compatible signature
-  // is not auto-picked up.
+  // response is treated as "unknown table" by Validate.
   TrajectoryWriter::Options effective_options = options;
+  std::vector<TableInfo> server_info;
+  REVERB_RETURN_IF_ERROR(ServerInfo(&server_info));
   internal::FlatSignatureMap signatures;
-  for (const auto& info : cached_server_info_) {
+  for (const auto& info : server_info) {
     internal::DtypesAndShapes& entry = signatures[info.name()];
     REVERB_RETURN_IF_ERROR(
         internal::FlatSignatureFromTableInfo(info, &entry));

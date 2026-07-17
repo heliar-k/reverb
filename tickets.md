@@ -13,7 +13,7 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > 支持。优先级 P0→P4 标在各 ticket 标题；依赖链与批次建议见文末「v2 依赖图」。
 > v1 依据 `docs/client-transports.md` §1 对比表与 `docs/numpy-shm-spec.md` §6。
 >
-> **当前进度（已提交至 `e7d5367`，2026-07-17）：**
+> **当前进度（v2 全部完成，2026-07-17）：**
 >
 > - ✅ ⑧ `server_info`（bootstrap 快照）、✅ ⑨ 多表、✅ ⑩ `mutate_priorities`+`reset`
 >   ——三 ticket 同批落地，已提交 `74608c1`。C++ `//reverb/cc/shm:*` 8/8、Python
@@ -33,7 +33,14 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > - ✅ ⑧-2b `validate_items` wiring——`ShmClient::NewTrajectoryWriter` 从
 >   `cached_server_info_` 填 `flat_signature_map`（镜像 InProcessClient），
 >   `trajectory_writer` 的 signature 校验真正生效。测试
->   `ShmClientValidateItemsTest`（3 例）落地。⑧-2 的按需 `SERVER_INFO` 往返仍 deferred。
+>   `ShmClientValidateItemsTest`（3 例）落地。
+> - ✅ ⑧-2 按需 `SERVER_INFO` 往返——v2 路线图最后剩余项落地。
+>   `SERVER_INFO=10`/`SERVER_INFO_RESP=110` 走 INSERT 流 + `insert_flow_mu`，
+>   复用现有 `ServerInfoRequest`/`ServerInfoResponse` proto。`HandleServerInfo`
+>   遍历 `tables_` 调 `table->info()` 返实时 `TableInfo`；`ShmClient::ServerInfo`
+>   改往返，**删除** `cached_server_info_` + Connect piggyback（Step 1 退场）；
+>   `NewTrajectoryWriter` 改调 `ServerInfo()` 拿实时签名。pybind/Python 零改动。
+>   测试 `test_server_info_reflects_mid_session_inserts` 落地。
 > - ✅ ⑪ `checkpoint`——v2 路线图最后一个功能 ticket 落地，已提交 `e729da5`+`e7d5367`。
 >   镜像 ⑩ 控制面模式：`CHECKPOINT=8`/`CHECKPOINT_RESP=108` 走 INSERT 流
 >   （`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化 send→read-ACK。
@@ -45,9 +52,8 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   同一批 `Table` 对象，构造时 `LoadLatest` 已对它们恢复，SHM 自动看到。测试
 >   `ShmClientCheckpointTest`（2 例：save→load 数据一致 / corrupt 报错）落地。
 >
-> **新 session 入口**：v2 路线图全部完成（⑧-⑬，仅 ⑧-2 按需 SERVER_INFO 往返
->   仍 deferred，无用户撞过，`ponytail:` 标注）。所有改动已提交
->   （`adcfab9`/`6b008f4`/`f911245`/`740591a`/`e729da5`/`e7d5367`）。
+> **新 session 入口**：v2 路线图全部完成（⑧-⑬ 全部落地，含 ⑧-2 按需
+>   SERVER_INFO 往返）。所有改动已提交。
 
 ---
 
@@ -190,7 +196,7 @@ grab。
 这是当前最坏的失败模式——静默返回空，用户不知道它坏了，且连锁导致
 `sample(unpack_as_table_signature=True)` 抛 `ValueError`、
 `trajectory_writer(validate_items=True)` 形同虚设（`flat_signature_map` 永远空）。
-（`validate_items` 形同虚设已于 ⑧-2b 修复——`NewTrajectoryWriter` 从缓存快照填 map。）
+（`validate_items` 形同虚设已于 ⑧-2b 修复，⑧-2 进一步改为按需往返拿实时签名填 map。）
 
 分两步交付：先 bootstrap 时填一次（覆盖表签名 rarely change 的场景，零新消息
 类型），再加 `SERVER_INFO` 往返支持按需刷新（对齐 gRPC「每次调用刷新」语义）。
@@ -200,7 +206,7 @@ grab。
 
 **Step 1 状态：已完成。** bootstrap piggyback 落地，`server_info()` 返回连接时快照，
 `sample(unpack_as_table_signature=True)` 修复。C++ 8/8 + Python 19/19 绿。
-Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
+Step 2（按需 SERVER_INFO 往返）已完成，见下。
 
 ### Step 1 — bootstrap 快照  [已完成]
 
@@ -213,14 +219,28 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 - [x] 更新 `docs/client-transports.md` §1 表 + §2 + §5.2；`README.md` 同步
 - [x] `ponytail:` 注释标注上限：快照不反映会话中途 `Table.replace`/签名变更；升级路径 = step 2
 
-### Step 2 — 按需 `SERVER_INFO` 往返  [deferred]
+### Step 2 — 按需 `SERVER_INFO` 往返  [已完成]
 
-- [ ] `shm_protocol.proto` 分配 `SERVER_INFO` / `SERVER_INFO_RESP` type 值（spec §8.3 未占号；注意 5 已被 `ALLOCATE` 占用）
-- [ ] `ShmServer` dispatch 增 `HandleServerInfo`：序列化各表**当前** `TableInfo` 写 S→C
-- [ ] `ShmClient._fetch_server_info_proto` 改为发 `SERVER_INFO` 阻塞读 `SERVER_INFO_RESP`（按需刷新，对齐 gRPC「每次调用刷新签名缓存」）
-- [ ] 表签名变更（`Table.replace`）后 `server_info()` 能反映新签名
-- [x] `NewTrajectoryWriter` 把缓存的 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效（step 1 已暴露数据，但 writer options 未接，需后续 wiring）——**已完成（⑧-2b）**：`ShmClient::NewTrajectoryWriter` 遍历 `cached_server_info_`，经 `FlatSignatureFromTableInfo` 填 map（镜像 `InProcessClient`）；无签名表设 nullopt 跳过校验。测试 `ShmClientValidateItemsTest` 3 例（匹配通过 / dtype 不匹配拒 / 无签名表跳过）。副作用：未知表现在 client 侧 `create_item` 拒为 `ValueError`（对齐 InProcessClient/gRPC），不再到 server 才 `FileNotFoundError`。`ponytail:` 上限：快照不反映会话中途签名变更，不匹配安全失败。
-- [ ] 测试：`Table.replace` 后 `server_info()` 反映新签名（仍 deferred，需 step 2 往返）；`trajectory_writer(validate_items=True)` 拒绝不匹配 trajectory——✅ 已由 ⑧-2b 覆盖（`ShmClientValidateItemsTest`）
+**状态：已完成。** `SERVER_INFO=10`/`SERVER_INFO_RESP=110` 落地，复用现有
+`ServerInfoRequest`/`ServerInfoResponse` proto（零新消息体）。走 INSERT 流
+（`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化，镜像 ⑩/⑪ 控制面模式。
+`HandleServerInfo` 遍历 `tables_` 调 `table->info()`（实时 `current_size`/`signature`
+等）填 `ServerInfoResponse`；`ShmClient::ServerInfo` 改为往返，**删除**
+`cached_server_info_` 字段 + `Connect` 的 piggyback 缓存代码（Step 1 退场）。
+`NewTrajectoryWriter` 改为调 `ServerInfo()` 拿实时签名填 `flat_signature_map`
+（⑧-2b 的 `ponytail:` 升级路径兑现）。pybind/Python 零改动（lambda 早已调
+`client->ServerInfo(&table_info)`，签名未变）。测试
+`test_server_info_reflects_mid_session_inserts` 落地：连接后插 N 条，后续
+`server_info()` 看到 `current_size==N`——证明是实时往返而非连接时快照。
+（`Table.replace` 返回新空表、server 无热替换 API，故测试用 `current_size`
+而非签名变更作为 live-state 信号。）
+
+- [x] `shm_protocol.proto` 分配 `SERVER_INFO=10` / `SERVER_INFO_RESP=110` type 值（9 被 `CLOSE` 占用；+100 对齐）
+- [x] `ShmServer` dispatch 增 `HandleServerInfo`：遍历 `tables_` 调 `table->info()` 序列化各表**当前** `TableInfo` 写 S→C（`SERVER_INFO_RESP` 走 insert 流）
+- [x] `ShmClient::ServerInfo` 改为发 `SERVER_INFO` 阻塞读 `SERVER_INFO_RESP`（按需刷新，对齐 gRPC「每次调用刷新签名缓存」）；删除 `cached_server_info_` 字段 + `Connect` piggyback 缓存
+- [x] 表签名变更（`Table.replace`）后 `server_info()` 能反映新签名——理论上成立（往返读实时 `table->info()`）；但 `Table.replace` 返回新空表、server 无热替换 API，无法在测试中原地触发，改用 `current_size` 验证 live 往返
+- [x] `NewTrajectoryWriter` 把 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效——改为调 `ServerInfo()` 往返拿实时签名（⑧-2b 的 cached 快照代码随 Step 2 退场）；测试 `ShmClientValidateItemsTest` 3 例仍绿（匹配通过 / dtype 不匹配拒 / 无签名表跳过）。未知表 client 侧 `create_item` 拒为 `ValueError`。
+- [x] 测试：`test_server_info_reflects_mid_session_inserts`（连接后插入 → `server_info()` 看到 `current_size` 增长，证明 live 往返）；`trajectory_writer(validate_items=True)` 拒绝不匹配 trajectory——✅ 已由 ⑧-2b 覆盖（`ShmClientValidateItemsTest`）
 
 ---
 
@@ -468,5 +488,5 @@ insert 抛错 / trajectory_writer 不受影响）。
 ⑪ 独立一轮（需 checkpointer 集成）——✅ 已完成。
 
 **关键判断**：⑧/⑨/⑩ 是「让 ShmClient 成为可用客户端」的必经三步（已完成）；
-⑫/⑬ 是锦上添花（已完成）；⑪ 是最后一个 v2 功能 ticket（已完成）。v2 路线图
-全部落地，仅 ⑧-2 按需 SERVER_INFO 往返仍 deferred（可继续 defer）。
+⑫/⑬ 是锦上添花（已完成）；⑪ 是最后一个 v2 功能 ticket（已完成）；⑧-2 按需
+SERVER_INFO 往返是 v2 的收尾项（已完成）。v2 路线图全部落地。

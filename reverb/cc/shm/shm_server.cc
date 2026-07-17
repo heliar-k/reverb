@@ -457,6 +457,18 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
         }
         break;
       }
+      case SERVER_INFO: {
+        // ticket ⑧ step 2: on-demand server_info round-trip. Request body is
+        // empty (like CheckpointRequest); HandleServerInfo returns the live
+        // ServerInfoResponse in SERVER_INFO_RESP.
+        auto st = HandleServerInfo(state);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleServerInfo failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
       default:
         // Unknown msg type on this flow: ignore (forward-compat).
         break;
@@ -947,6 +959,22 @@ absl::Status ShmServer::HandleCheckpoint(ClientState& state) {
   std::string body;
   resp.SerializeToString(&body);
   return EnqueueInsertS2C(state, CHECKPOINT_RESP, body);
+}
+
+absl::Status ShmServer::HandleServerInfo(ClientState& state) {
+  // ticket ⑧ step 2: on-demand server_info round-trip. Gathers each table's
+  // live TableInfo (current_size / signature / rate_limiter_info reflect
+  // mid-session state, unlike the step-1 bootstrap snapshot) into a
+  // ServerInfoResponse and returns it as SERVER_INFO_RESP on the insert s2c
+  // flow. Cross-table and always succeeds — no FindTable routing, no error
+  // path. Mirrors TryAccept's welcome.server_info fill but on demand.
+  ServerInfoResponse resp;
+  for (const auto& [name, table] : tables_) {
+    *resp.add_table_info() = table->info();
+  }
+  std::string body;
+  resp.SerializeToString(&body);
+  return EnqueueInsertS2C(state, SERVER_INFO_RESP, body);
 }
 
 absl::Status ShmServer::HandleInsert(ClientState& state,

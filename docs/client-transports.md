@@ -32,7 +32,7 @@
 | 多表 | ✅ 全部表 | ✅ 全部表 | ✅ 全部表（按表名路由，ticket ⑨） |
 | `sample` 的 `timeout_ms` | ⚠️ **静默忽略**（gRPC `NewSampler` 无 timeout 参数） | ✅ 生效（超时抛 `DeadlineExceededError`） | ✅ 生效（超时抛 `DeadlineExceededError`） |
 | `sample` 默认 `emit_timesteps` | `True` | `True` | `True`（三者统一） |
-| `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ✅ **bootstrap 快照**（连接时缓存，无往返） |
+| `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ✅ 真实（每次调用 `SERVER_INFO` ring 往返，ticket ⑧ step 2） |
 | `mutate_priorities` / `reset` | ✅ | ✅ | ✅（ticket ⑩，走 insert 流 + 客户端互斥锁） |
 | `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ✅（ticket ⑪，走 insert 流；恢复经共享 Table 的 `LoadLatest` 搭车 gRPC/InProcess） |
 | `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM；`validate_items` 总是开，⑧-2b） |
@@ -160,21 +160,20 @@ with client.trajectory_writer(3) as w: ...   # ✅
 
 ### 5.2 `ShmClient.server_info()` 返回 bootstrap 快照
 
-`server_info()` 返回**连接时的 bootstrap 快照**——真实的 `TableInfo`（`max_size`/
-`sampler_options`/`remover_options`/`signature`/`current_size` 等），由 SHM 握手的
-`WelcomeResponse.server_info` 随手捎带，无额外往返。`timeout` 参数被接受（与
-gRPC/Local hook 对齐）但忽略——数据在 `Connect` 时已缓存。
-
-**限制**：快照在连接那一刻固定，**不反映会话中途的 `Table.replace` / 签名变更**
-（ticket ⑧ step 2 会补一个按需 `SERVER_INFO` ring 往返解决）。需要实时元数据时用
-gRPC / `LocalClient`。
+`server_info()` 走按需 `SERVER_INFO` ring 往返（ticket ⑧ step 2）——每次调用都
+从服务端取实时 `TableInfo`（`max_size`/`sampler_options`/`remover_options`/
+`signature`/`current_size` 等），反映会话中途的插入/状态变化。往返走 INSERT 流
+（`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化，镜像 ⑩/⑪ 的控制面模式。
+`timeout` 参数被接受（与 gRPC/Local hook 对齐）但忽略——SHM 往返用自有硬上限
+（`kReadBlockingHardCap=60s`，见 `ShmClient::ServerInfo`）。
 
 **`sample(unpack_as_table_signature=True)` 现在可用**：此前因 `server_info()` 返回 `{}`
 导致签名缓存为空、抛 `ValueError: Could not find table`；快照填入缓存后，带签名的表
 可正常按签名解包。
 
-**`trajectory_writer` 的 signature 校验现已生效**（ticket ⑧-2b）：`NewTrajectoryWriter`
-从缓存快照填 `flat_signature_map`，`create_item` 经 `ItemAndRefs::Validate` 校验
+**`trajectory_writer` 的 signature 校验现已生效**（ticket ⑧-2b → step 2）：
+`NewTrajectoryWriter` 调 `ServerInfo()` 往返拿实时 `TableInfo`，填
+`flat_signature_map`，`create_item` 经 `ItemAndRefs::Validate` 校验
 trajectory 与表签名（列数/dtype/shape），不匹配抛 `ValueError`——与 `LocalClient`
 一致（总是校验，无 `validate_items=False` 开关）。无签名的表跳过校验。同样的快照
 限制适用：会话中途 `Table.replace` 改签名后，旧 writer 仍持旧签名，需重连刷新。

@@ -217,6 +217,13 @@ class ShmServer {
   // InProcessClient). Checkpoint is cross-table, so no FindTable routing.
   absl::Status HandleCheckpoint(ClientState& state);
 
+  // ticket ⑧ step 2: on-demand server_info round-trip. Gathers each table's
+  // live TableInfo (current_size, signature, etc.) into a ServerInfoResponse
+  // and returns it as SERVER_INFO_RESP on the insert s2c flow. Replaces the
+  // step-1 bootstrap snapshot so server_info() reflects mid-session state.
+  // Cross-table, always succeeds — no FindTable routing, no error path.
+  absl::Status HandleServerInfo(ClientState& state);
+
   // Enqueue a S→C message on the INSERT flow's s2c ring: try a non-blocking
   // write, stash in insert_outbox if full.
   absl::Status EnqueueInsertS2C(ClientState& state, MsgType type,

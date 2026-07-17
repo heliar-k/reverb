@@ -206,8 +206,8 @@ for sample in client.sample('my_table', num_samples=4):
 
 - SHM 是**附加**传输层,可与 `in_process` 或 gRPC 共存,`shm=True` 不隐含
   `in_process=True`。
-- v1 限制:`server_info()` 返回连接时的 bootstrap 快照(真实 `TableInfo`),不反映会话中途的
-  `Table.replace`(用 gRPC/Local 取实时)。`ShmClient` 可 pickle(存 `socket_path` 反
+- v2: `server_info()` 走按需 `SERVER_INFO` ring 往返(ticket ⑧ step 2),返回实时
+  `TableInfo`,反映会话中途的插入/状态变化。`ShmClient` 可 pickle(存 `socket_path` 反
   序列化重连,见 ticket ⑫);legacy `writer`/`insert` 抛 `NotImplementedError`(用
   `trajectory_writer`/`structured_writer`,见 ticket ⑬)。SHM 支持全部表(按表名路由,
   见 ticket ⑨);`mutate_priorities`/`reset` 已支持(ticket ⑩,走 insert 流 +

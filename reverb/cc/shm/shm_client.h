@@ -119,12 +119,11 @@ class ShmClient {
 
   // Constructs a TrajectoryWriter in SHM mode: the chunker/column/backpressure
   // logic runs client-side, but inserts go over SHM to the server's Table
-  // (appendix A4). ticket ⑧ step 2b: flat_signature_map is populated from
-  // cached_server_info_ (bootstrap snapshot) so ItemAndRefs::Validate checks
-  // trajectory signatures against the table signatures — same path as
-  // gRPC/LocalClient. ponytail: snapshot is connect-time only; a mid-session
-  // Table.replace / signature change is not reflected until reconnect (upgrade
-  // via SERVER_INFO round-trip, ticket ⑧ step 2).
+  // (appendix A4). ticket ⑧ step 2: flat_signature_map is populated from a
+  // live SERVER_INFO round-trip so ItemAndRefs::Validate checks trajectory
+  // signatures against the table's current signature — same path as
+  // gRPC/LocalClient. Each call fetches fresh TableInfo, so a mid-session
+  // Table.replace / signature change is reflected on the next writer.
   absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
                                    std::unique_ptr<TrajectoryWriter>* writer);
 
@@ -148,15 +147,12 @@ class ShmClient {
                          bool delta_encoded, int max_in_flight_items,
                          std::unique_ptr<Writer>* writer);
 
-  // Returns the bootstrap-time snapshot of the server's TableInfo (one entry
-  // per table the server held at Connect time). ticket ⑧ step 1: this is
-  // piggybacked on the SHM bootstrap handshake — there is no on-demand
-  // SERVER_INFO ring round-trip (that is step 2, deferred).
-  // ponytail: bootstrap-time snapshot only; does NOT reflect mid-session
-  // Table.replace / signature changes. Ceiling: a long-lived client whose
-  // table is replaced mid-session sees stale info. Upgrade path: add a
-  // SERVER_INFO/SERVER_INFO_RESP MsgType + HandleServerInfo for an on-demand
-  // round-trip (ticket ⑧ step 2).
+  // Returns the server's current TableInfo (one entry per table) via an
+  // on-demand SERVER_INFO ring round-trip. ticket ⑧ step 2: replaces the
+  // step-1 bootstrap snapshot so server_info() reflects mid-session state
+  // (current_size after inserts, signature changes, etc.). Mirrors gRPC's
+  // "refresh signature cache on every call" semantics. Rides the INSERT flow
+  // under insert_flow_mu like the other control-plane ops (⑩/⑪).
   absl::Status ServerInfo(std::vector<TableInfo>* table_info);
 
   // ticket ⑩: control-plane ops, mirroring InProcessClient::MutatePriorities /
@@ -181,11 +177,9 @@ class ShmClient {
   ShmConnection* connection() { return &conn_; }
 
  private:
-  explicit ShmClient(ShmConnection conn,
-                     std::vector<TableInfo> cached_server_info);
+  explicit ShmClient(ShmConnection conn);
 
   ShmConnection conn_;
-  std::vector<TableInfo> cached_server_info_;
 };
 
 }  // namespace shm

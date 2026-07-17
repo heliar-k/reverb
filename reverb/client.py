@@ -875,11 +875,10 @@ class ShmClient(_BaseClient):
         )
 
     def _fetch_server_info_proto(self, timeout: Optional[int]):
-        # Bootstrap-time snapshot of TableInfo (ticket ⑧ step 1). `timeout` is
-        # accepted for parity with the gRPC hook but ignored — the data is
-        # cached at Connect time, no round-trip. ponytail: does not reflect
-        # mid-session Table.replace / signature changes; upgrade via a
-        # SERVER_INFO ring round-trip (ticket ⑧ step 2).
+        # ticket ⑧ step 2: on-demand SERVER_INFO ring round-trip. `timeout` is
+        # accepted for parity with the gRPC hook but ignored (the SHM round-trip
+        # uses a hard cap, see ShmClient::ServerInfo). Returns live TableInfo
+        # reflecting mid-session state (inserts, signature changes).
         return self._client.ServerInfo()
 
     def _new_sampler(

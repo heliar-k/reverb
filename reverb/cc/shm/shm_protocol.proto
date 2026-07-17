@@ -39,6 +39,11 @@ enum MsgType {
   // Reuses the existing reverb_service.proto CheckpointRequest/CheckpointResponse.
   CHECKPOINT = 8;
   CLOSE = 9;
+  // ticket ⑧ step 2: on-demand server_info round-trip so server_info() reflects
+  // mid-session state (e.g. current_size after inserts) instead of the
+  // connect-time bootstrap snapshot. Reuses reverb_service.proto
+  // ServerInfoResponse (empty request, like CheckpointRequest).
+  SERVER_INFO = 10;
   // S→C
   WELCOME = 101;
   INSERT_ACK = 102;
@@ -50,6 +55,9 @@ enum MsgType {
   RESET_ACK = 107;
   // ticket ⑪: carries CheckpointResponse.checkpoint_path back to the client.
   CHECKPOINT_RESP = 108;
+  // ticket ⑧ step 2: carries ServerInfoResponse (repeated TableInfo) back to
+  // the client. Rides the INSERT flow like the other control-plane ACKs.
+  SERVER_INFO_RESP = 110;
   ERROR = 105;
 }
 
