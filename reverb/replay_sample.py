@@ -24,13 +24,12 @@ class SampleInfo(NamedTuple):
 
     Fields:
       key: Key of the item that was sampled. Used for updating the priority.
-        Typically a python `int` (for output of Client.sample) or
-        `tf.uint64` Tensor (for output of TF Client.sample).
+        Typically a python `int` or `np.ndarray` (uint64).
       probability: Probability of selecting the item at the time of sampling.
-        A python `float` or `tf.float64` Tensor.
+        A python `float` or `np.ndarray` (float64).
       table_size: The total number of items present in the table at sample time.
-      priority: Priority of the item at the time of sampling. A python `float` or
-        `tf.float64` Tensor.
+      priority: Priority of the item at the time of sampling. A python `float`
+        or `np.ndarray` (float64).
       times_sampled: Number of times this item has been sampled (including this
         time).
     """

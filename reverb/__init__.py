@@ -26,11 +26,6 @@ Reverb supports two modes:
     C++ `client.cc`/`writer.cc`/`streaming_trajectory_writer.cc` were de-TF'd
     (data flows as numpy-backed `TensorBuffer`), so the gRPC bindings are
     restored and `Client`/`Writer` no longer raise `NotImplementedError`.
-
-TensorFlow is intentionally NOT imported at module load time: TF is only
-needed to encode `tf.TypeSpec`-based table signatures, and importing it
-eagerly would load TF's bundled gRPC and conflict with Reverb's own gRPC
-statically linked into `libreverb.so` (duplicate flag registration).
 """
 
 # pylint: disable=g-import-notat-top

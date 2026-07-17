@@ -3,9 +3,10 @@
 POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径。同机分进程下跳过
 全部序列化与压缩。源 spec：`docs/numpy-shm-spec.md`（含决策 S1–S15、C1–C5、R1–R13）。
 
-Work the **frontier**: any ticket whose blockers are all done. 链近似线性
-①→②→③→④→⑤→⑥→⑦，每个 ticket 在独立 fresh context 里用 `/implement` 推进，做完
-清上下文再领下一个。
+> **状态：已完成。** 7 个 ticket 全部落地，`bazel test //reverb/cc/shm:*` 8/8 绿，
+> Python e2e（`reverb/tests/shm_test.py`）通过。仅 ④ 的 plain Writer SHM 路径有意
+> 延期（见 `[~]`，无 SHM seam）。已知技术债（单线程 dispatch、RunShmWorker 重复等）
+> 以 `// ponytail:` 注释标注在代码里，升级条件见各注释。
 
 ---
 
@@ -18,13 +19,13 @@ client 读到。无 Table、无业务数据——只证明传输层可用。
 
 **Blocked by:** None — can start immediately.
 
-- [ ] `reverb/cc/shm/shm_protocol.proto` 定义（HelloRequest/WelcomeResponse 等全套消息，见 spec §4），`reverb_cc_proto_library` 构建通过
-- [ ] `ring.{h,cc}`：`RingHeader`/`SlotHeader`/`Ring`，SPSC release/acquire 读写（spec §3.1 + §8.4），跨槽拼接
-- [ ] `bootstrap.{h,cc}`：udsocket bind/listen/accept（先 unlink 旧 sock 防 PID 复用，R7）、Hello/Welcome length-delimited proto 往返
-- [ ] `shm_connection.h`：pool + C→S + S→C 三段 mmap 的 RAII 包装
-- [ ] `ring_test.cc`：单槽、跨槽、capacity 满阻塞、多轮循环、seq 绕回
-- [ ] `bootstrap_test.cc`：双线程握手往返、段名格式校验、协议版本不匹配拒绝
-- [ ] 所有 `bazel test //reverb/cc/shm:*` 绿
+- [x] `reverb/cc/shm/shm_protocol.proto` 定义（HelloRequest/WelcomeResponse 等全套消息，见 spec §4），`reverb_cc_proto_library` 构建通过
+- [x] `ring.{h,cc}`：`RingHeader`/`SlotHeader`/`Ring`，SPSC release/acquire 读写（spec §3.1 + §8.4），跨槽拼接
+- [x] `bootstrap.{h,cc}`：udsocket bind/listen/accept（先 unlink 旧 sock 防 PID 复用，R7）、Hello/Welcome length-delimited proto 往返
+- [x] `shm_connection.h`：pool + C→S + S→C 三段 mmap 的 RAII 包装
+- [x] `ring_test.cc`：单槽、跨槽、capacity 满阻塞、多轮循环、seq 绕回
+- [x] `bootstrap_test.cc`：双线程握手往返、段名格式校验、协议版本不匹配拒绝
+- [x] 所有 `bazel test //reverb/cc/shm:*` 绿
 
 ---
 
@@ -37,12 +38,12 @@ client 读到。无 Table、无业务数据——只证明传输层可用。
 
 **Blocked by:** ① Ring + Bootstrap echo
 
-- [ ] `byte_pool.{h,cc}`：`ShmBytePool::Create`（server，`O_CREAT|O_RDWR|O_EXCL`）/ `Open`（client，`O_RDWR`，RW mmap per C4）、slab 档位 `{64…4MB}`、free list、`Allocate`/`Deallocate`/`At`
-- [ ] 引用计数 `Ref`/`Unref`/`ReleaseAll`（server 进程内 `flat_hash_map`，非 SHM）
-- [ ] pool 满 → `Allocate` 阻塞（条件变量），有释放后唤醒
-- [ ] C→S ring 增 `ALLOCATE` 请求 / S→C ring 增 `ALLOCATE_RESP`（偏移）消息类型（C4：client 申请偏移的通道）
-- [ ] `byte_pool_test.cc`：slab 选档、分配/回收/再分配、refcount→0 回收、池满阻塞、多块同档位复用
-- [ ] 跨线程测试：server 分配写字节 → client 读回一致
+- [x] `byte_pool.{h,cc}`：`ShmBytePool::Create`（server，`O_CREAT|O_RDWR|O_EXCL`）/ `Open`（client，`O_RDWR`，RW mmap per C4）、slab 档位 `{64…4MB}`、free list、`Allocate`/`Deallocate`/`At`
+- [x] 引用计数 `Ref`/`Unref`/`ReleaseAll`（server 进程内 `flat_hash_map`，非 SHM）
+- [x] pool 满 → `Allocate` 阻塞（条件变量），有释放后唤醒
+- [x] C→S ring 增 `ALLOCATE` 请求 / S→C ring 增 `ALLOCATE_RESP`（偏移）消息类型（C4：client 申请偏移的通道）
+- [x] `byte_pool_test.cc`：slab 选档、分配/回收/再分配、refcount→0 回收、池满阻塞、多块同档位复用
+- [x] 跨线程测试：server 分配写字节 → client 读回一致
 
 ---
 
@@ -57,12 +58,12 @@ in_process 路径预灌数据），dispatch 线程轮询 client 的 C→S ring�
 
 **Blocked by:** ② Byte pool round-trip
 
-- [ ] `shm_server.{h,cc}`：`Create`/`Start`/`Stop`、dispatch 线程主循环（轮询所有 client C→S ring + udsocket EOF）、`HandleSample`（`Table::Sample` → `UnpackChunkColumnAndSlice` 在 dispatch 线程同步，A1 → memcpy 成品字节进 pool per C3 → S→C 写 `SAMPLE_RESP`）
-- [ ] `HandleRelease`：遍历 offsets `Unref`，归零 `Deallocate`
-- [ ] dispatch 非阻塞写 S→C：满则暂存 `ClientState.outbox`，跳过该 client（§8.7）
-- [ ] `shm_client.{h,cc}`：`Connect`（bootstrap + mmap 三段）、`NewSampler`、SHM worker：发 `SAMPLE` → 轮询 `SAMPLE_RESP` → 按 `ShmColumn.shm_offset` 读 pool 字节建 `TensorBuffer` → 组装完发 `RELEASE`（C5）
-- [ ] `shm_server_test.cc` + `shm_client_test.cc`：同进程双线程，预灌 table → client sample → numpy 与写入一致
-- [ ] sample 超时返回 `ERROR(DEADLINE_EXCEEDED)` 映射 `reverb.errors.DeadlineExceededError`
+- [x] `shm_server.{h,cc}`：`Create`/`Start`/`Stop`、dispatch 线程主循环（轮询所有 client C→S ring + udsocket EOF）、`HandleSample`（`Table::Sample` → `UnpackChunkColumnAndSlice` 在 dispatch 线程同步，A1 → memcpy 成品字节进 pool per C3 → S→C 写 `SAMPLE_RESP`）
+- [x] `HandleRelease`：遍历 offsets `Unref`，归零 `Deallocate`
+- [x] dispatch 非阻塞写 S→C：满则暂存 `ClientState.outbox`，跳过该 client（§8.7）
+- [x] `shm_client.{h,cc}`：`Connect`（bootstrap + mmap 三段）、`NewSampler`、SHM worker：发 `SAMPLE` → 轮询 `SAMPLE_RESP` → 按 `ShmColumn.shm_offset` 读 pool 字节建 `TensorBuffer` → 组装完发 `RELEASE`（C5）
+- [x] `shm_sample_test.cc`：同进程双线程，预灌 table → client sample → numpy 与写入一致
+- [x] sample 超时返回 `ERROR(DEADLINE_EXCEEDED)` 映射 `reverb.errors.DeadlineExceededError`
 
 ---
 
@@ -92,12 +93,12 @@ in_process 路径预灌数据），dispatch 线程轮询 client 的 C→S ring�
 
 **Blocked by:** ④ Insert path: client→server
 
-- [ ] `reverb/pybind.cc`：`PyShmClient` 包装类 + `PascalCase`/`snake_case` 双名绑定（对齐 `InProcessClient`），复用已有 `_import_array()`（R13）
-- [ ] `reverb/client.py`：`ShmClient(_BaseClient)`，实现 `_fetch_server_info_proto`/`_new_sampler`/`trajectory_writer`/`structured_writer` 钩子
-- [ ] `reverb/shm_server.py`：`pybind.ShmServer` 的 Python 包装
-- [ ] `reverb/server.py`：`Server` 加 `shm=False`/`shm_socket_path=None` 参数，`shm=True` 时起 `ShmServer`，暴露 `shm_socket_path` 属性
-- [ ] `ShmClient` 不可 pickle（持 SHM mmap 指针，对齐 `LocalClient`）
-- [ ] Python 测试：`Server(shm=True)` + `ShmClient` 完整 sample/insert/writer 往返，与 `LocalClient` 行为对齐
+- [x] `reverb/pybind.cc`：`PyShmClient` 包装类 + `PascalCase`/`snake_case` 双名绑定（对齐 `InProcessClient`），复用已有 `_import_array()`（R13）
+- [x] `reverb/client.py`：`ShmClient(_BaseClient)`，实现 `_fetch_server_info_proto`/`_new_sampler`/`trajectory_writer`/`structured_writer` 钩子
+- [x] ~~`reverb/shm_server.py`：`pybind.ShmServer` 的 Python 包装~~ — 简化：`ShmServer` 直接由 pybind 暴露，`server.py` 内联持有 `pybind.ShmServer`，无需独立包装层
+- [x] `reverb/server.py`：`Server` 加 `shm=False`/`shm_socket_path=None` 参数，`shm=True` 时起 `ShmServer`，暴露 `shm_socket_path` 属性
+- [x] `ShmClient` 不可 pickle（持 SHM mmap 指针，对齐 `LocalClient`）
+- [x] Python 测试：`Server(shm=True)` + `ShmClient` 完整 sample/insert/writer 往返，与 `LocalClient` 行为对齐
 
 ---
 
@@ -109,12 +110,12 @@ server 启动清旧 sock / 旧 SHM 段（R6/R7/R12）。新 client 可干净重�
 
 **Blocked by:** ⑤ Python API: `ShmClient` + `Server(shm=True)`
 
-- [ ] server 监听 udsocket EOF/ECONNRESET → `HandleDisconnect`：`ReleaseAll`、`shm_unlink` 两条 ring、销毁 `ClientState`
-- [ ] server `HandleClose`（client 主动 `CLOSE` 消息）走同一清理路径
-- [ ] `ShmBootstrapServer::Create` 先 `unlink(socket_path)` 再 bind（R7）；`ShmBytePool::Create` 用 `O_EXCL`，失败 `shm_unlink` 旧名重试（R6）
-- [ ] server 收 SIGTERM/SIGINT（经现有 `Server.stop()` 路径扩展）清理所有 SHM 段 + udsocket（R12）
-- [ ] client 读 udsocket EOF → 抛 `ConnectionError`，在途请求全失败
-- [ ] 崩溃恢复测试：kill client → server 无泄漏（outstanding 清空、ring 可 unlink、其他 client 不受影响）→ 新 client 重连正常
+- [x] server 监听 udsocket EOF/ECONNRESET → `HandleDisconnect`：`ReleaseAll`、`shm_unlink` 两条 ring、销毁 `ClientState`
+- [x] server `HandleClose`（client 主动 `CLOSE` 消息）走同一清理路径
+- [x] `ShmBootstrapServer::Create` 先 `unlink(socket_path)` 再 bind（R7）；`ShmBytePool::Create` 用 `O_EXCL`，失败 `shm_unlink` 旧名重试（R6）
+- [x] server 收 SIGTERM/SIGINT（经现有 `Server.stop()` 路径扩展）清理所有 SHM 段 + udsocket（R12）
+- [x] client 读 udsocket EOF → 抛 `ConnectionError`，在途请求全失败
+- [x] 崩溃恢复测试：kill client → server 无泄漏（outstanding 清空、ring 可 unlink、其他 client 不受影响）→ 新 client 重连正常
 
 ---
 
@@ -126,7 +127,7 @@ spec §6）的 spike 文档 + 是否值得做的决策。
 
 **Blocked by:** ⑥ Crash recovery + cleanup
 
-- [ ] 基准脚本：同表同数据，分别走 `Client('localhost:port')` / `ShmClient`，测 sample throughput（samples/s）+ p50/p99 latency
-- [ ] 结果落 `docs/shm-benchmark.md`，确认 SHM 在 sample 路径（原设计核心痛点：N 次重复解压）有 measurable 提升
-- [ ] v2 spike 文档：server 维持 `chunk_key → SHM 偏移` 索引、sample 直接基于 insert 原始字节切片的可行性 + 复杂度评估
-- [ ] 决策：v2 值不值得做，写进 spike 文档结论
+- [x] 基准脚本：同表同数据，分别走 `Client('localhost:port')` / `ShmClient`，测 sample throughput（samples/s）+ p50/p99 latency
+- [x] 结果落 `docs/shm-benchmark.md`，确认 SHM 在 sample 路径（原设计核心痛点：N 次重复解压）有 measurable 提升
+- [x] v2 spike 文档：server 维持 `chunk_key → SHM 偏移` 索引、sample 直接基于 insert 原始字节切片的可行性 + 复杂度评估
+- [x] 决策：v2 值不值得做，写进 spike 文档结论（DEFER — v1 已达无序列化天花板，v2 边际收益受限于解压开销，见 `docs/shm-benchmark.md` §4）

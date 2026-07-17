@@ -65,10 +65,6 @@ build --copt="-DEIGEN_MAX_ALIGN_BYTES=64"
 
 test --test_env="GTEST_INSTALL_FAILURE_SIGNAL_HANDLER=1"
 
-# TF isn't built in dbg mode, so our dbg builds will segfault due to inconsistency
-# of defines when using tf's headers.  In particular in refcount.h.
-# common --cxxopt="-DNDEBUG"
-
 # ponytail: clang_local 原本用来切回系统工具链(关闭 hermetic cc)。现在默认
 # 已是系统工具链(noincompatible_enable_cc_toolchain_resolution),此 config 保留
 # 仅为兼容既有调用(oss_build / macos config),flags 与默认一致。
