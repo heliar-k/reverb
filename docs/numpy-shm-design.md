@@ -13,9 +13,10 @@
   留在 server 进程，SHM 只承载 chunk 字节，控制面走 per-client 双向 SPSC ring
   buffer（每流一对，决策 D）+ server 轮询，bootstrap 用 Unix domain socket。
 - **API**：新增 `ShmClient`，镜像 `_BaseClient` 的热路径（sample /
-  trajectory_writer / structured_writer），语义与 gRPC / LocalClient 一致。
-  v1 未实现冷路径控制面（checkpoint / mutate_priorities / reset / server_info），
-  见 §6。
+  trajectory_writer / structured_writer）+ 冷路径控制面（`mutate_priorities`/
+  `reset` ticket ⑩、`server_info` bootstrap 快照 ticket ⑧），语义与 gRPC /
+  LocalClient 一致。`pickle` 已支持（ticket ⑫）；`checkpoint` 未实现（ticket ⑪）；
+  legacy `writer`/`insert` won't fix（ticket ⑬，Python 层 `NotImplementedError`）。见 §6。
 
 ## 1. 动机与边界
 
@@ -388,23 +389,25 @@ struct SlotHeader {
 #### C→S 请求（client 写，server 读）
 
 v1 已实现：`HELLO` / `INSERT` / `SAMPLE` / `RELEASE` / `ALLOCATE` / `CLOSE`。
-`MUTATE_PRIORITIES` / `RESET` / `CHECKPOINT` / `SERVER_INFO` 未实现（v2 补，见 S10）。
+`MUTATE_PRIORITIES`（⑩）/ `RESET`（⑩）已实现；`SERVER_INFO` 按需往返未实现（⑧ step 1
+走 bootstrap piggyback，无需独立消息）；`CHECKPOINT` 未实现（⑪）。
 
-| type 值 | msg_type 名 | body proto | 对应现有 RPC | v1 |
+| type 值 | msg_type 名 | body proto | 对应现有 RPC | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | `HELLO` | `HelloRequest{client_pid, protocol_version}` | bootstrap（仅初始一次，走 udsocket，见 §8.6） | ✓ |
 | 2 | `INSERT` | `ShmInsertRequest`（见下） | InsertStream | ✓ |
 | 3 | `SAMPLE` | `ShmSampleRequest{table, num_samples, timeout_ms, emit_timesteps}` | SampleStream | ✓ |
 | 4 | `RELEASE` | `ShmReleaseRequest{repeated uint64 offsets}` | SHM 专有（回收字节池偏移，insert/sample 流均可收） | ✓ |
 | 5 | `ALLOCATE` | `ShmAllocateRequest{num_bytes}` | SHM 专有（C4：client 向 server 申请字节池偏移） | ✓ |
+| 6 | `MUTATE_PRIORITIES` | `MutatePrioritiesRequest`（复用现有 proto） | MutatePriorities | ✓（⑩） |
+| 7 | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset | ✓（⑩） |
 | 9 | `CLOSE` | 空 | client 主动关闭 | ✓ |
-| — | `MUTATE_PRIORITIES` | `MutatePrioritiesRequest`（复用现有 proto） | MutatePriorities | 未实现 |
-| — | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset | 未实现 |
-| — | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint | 未实现 |
-| — | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | 未实现 |
+| — | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint | 未实现（⑪） |
+| — | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | 未实现（⑧ step 1 用 bootstrap piggyback 代替） |
 
 > 注：早期设计表把 type 5 预留给 `MUTATE_PRIORITIES`，实现中 5 被用于 `ALLOCATE`
-> （C4 集中分配流程）。`RESET`/`CHECKPOINT`/`SERVER_INFO` 未占号，待 v2 统一分配。
+> （C4 集中分配流程），故 `MUTATE_PRIORITIES`=6、`RESET`=7。`CHECKPOINT`/
+> `SERVER_INFO` 未占号。
 
 ```protobuf
 // shm_protocol.proto (新增)
@@ -451,22 +454,24 @@ message ShmAllocateRequest {
 #### S→C 响应（server 写，client 读）
 
 v1 已实现：`WELCOME` / `INSERT_ACK` / `SAMPLE_RESP` / `ALLOCATE_RESP` / `ERROR`。
-`MUTATE_ACK` / `RESET_ACK` / `CHECKPOINT_RESP` / `SERVER_INFO_RESP` 未实现。
+`MUTATE_ACK`（⑩）/ `RESET_ACK`（⑩）已实现；`CHECKPOINT_RESP` / `SERVER_INFO_RESP`
+未实现。
 
-| type 值 | msg_type 名 | body proto | 对应 | v1 |
+| type 值 | msg_type 名 | body proto | 对应 | 状态 |
 | --- | --- | --- | --- | --- |
 | 101 | `WELCOME` | `WelcomeResponse{pool_shm_name, insert_c2s/s2c_shm_name, sample_c2s/s2c_shm_name, server_info}` | bootstrap 响应 | ✓ |
 | 102 | `INSERT_ACK` | `InsertAck{repeated uint64 keys, repeated uint64 offsets_to_release}` | InsertStreamResponse + SHM 偏移回收 | ✓ |
 | 103 | `SAMPLE_RESP` | `ShmSampleResponse`（见下） | SampleStream | ✓ |
 | 104 | `ALLOCATE_RESP` | `ShmAllocateResponse{shm_offset}` | SHM 专有（C4：返回授予的偏移） | ✓ |
 | 105 | `ERROR` | `ShmError{code, message, request_seq}` | 统一错误 | ✓ |
-| — | `MUTATE_ACK` | `MutatePrioritiesResponse`（复用） | | 未实现 |
-| — | `RESET_ACK` | `ResetResponse`（复用） | | 未实现 |
-| — | `CHECKPOINT_RESP` | `CheckpointResponse`（复用） | | 未实现 |
-| — | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | | 未实现 |
+| 106 | `MUTATE_ACK` | `MutatePrioritiesResponse`（复用） | | ✓（⑩） |
+| 107 | `RESET_ACK` | `ResetResponse`（复用） | | ✓（⑩） |
+| — | `CHECKPOINT_RESP` | `CheckpointResponse`（复用） | | 未实现（⑪） |
+| — | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | | 未实现（⑧ step 1 用 bootstrap piggyback 代替） |
 
 > 注：早期设计表把 104 预留给 `ERROR`、105 预留给 `MUTATE_ACK`。实现中 104 被
-> `ALLOCATE_RESP` 占用、`ERROR` 后移到 105（值偏移），未实现项未占号。
+> `ALLOCATE_RESP` 占用、`ERROR` 后移到 105，`MUTATE_ACK`=106、`RESET_ACK`=107。
+> `CHECKPOINT_RESP`/`SERVER_INFO_RESP` 未占号。
 
 ```protobuf
 message ShmSampleResponse {

@@ -708,7 +708,7 @@ DispatchLoop()
   │   ├── RELEASE → 遍历 offsets, Unref, 归零则 Deallocate
   │   ├── MUTATE_PRIORITIES → Table::MutateItems → S→C MUTATE_ACK
   │   ├── RESET → Table::Reset → S→C RESET_ACK
-  │   ├── CHECKPOINT → checkpointer_->Save → S→C CHECKPOINT_RESP
+  │   ├── CHECKPOINT → checkpointer_->Save → S→C CHECKPOINT_RESP  (未实现, ticket ⑪)
   │   └── CLOSE → HandleDisconnect
   ├── 对每个 client: DrainPendingSamples + 尝试 FlushOutbox (非阻塞写 S→C)
   ├── 检查 udsocket EOF (断连检测)
@@ -1034,6 +1034,23 @@ class ShmClient(_BaseClient):
     def __repr__(self):
         return f"ShmClient(socket_path={self._socket_path})"
 
+    def __reduce__(self):
+        # ticket ⑫: pickle by socket_path, re-connect on unpickle.
+        return self.__class__, (self._socket_path,)
+
+    def writer(self, *args, **kwargs):
+        # ticket ⑬: legacy Writer has no SHM seam.
+        raise NotImplementedError(
+            "ShmClient does not support the legacy writer/insert; use "
+            "trajectory_writer or structured_writer instead."
+        )
+
+    def insert(self, data, priorities):
+        raise NotImplementedError(
+            "ShmClient does not support the legacy writer/insert; use "
+            "trajectory_writer or structured_writer instead."
+        )
+
     def _fetch_server_info_proto(self, timeout: Optional[int]):
         return self._client.ServerInfo()
 
@@ -1157,7 +1174,7 @@ class Server:
 | `ShmClient + TrajectoryWriter` | writer append → create_item → sample 读出 |
 | `ShmClient::MutatePriorities` | 更新优先级后 sample 概率变化 （已实现，ticket ⑩） |
 | `ShmClient::Reset` | 重置后 table 为空 （已实现，ticket ⑩） |
-| `ShmClient::Checkpoint + Load` | checkpoint → 新建 server load → sample 恢复数据 |
+| `ShmClient::Checkpoint + Load` | checkpoint → 新建 server load → sample 恢复数据 （未实现，ticket ⑪） |
 
 ### 双进程测试
 
