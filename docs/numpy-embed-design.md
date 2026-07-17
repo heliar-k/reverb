@@ -479,40 +479,42 @@ server2 = reverb.Server(
 
 ## 5. 架构总览
 
+```mermaid
+flowchart TD
+  subgraph PY["Python API"]
+    SRV["server.py<br/>(Server + Table)"]
+    CL["client.py<br/>(Client / LocalClient<br/> 共享 _BaseClient)"]
+    TW["trajectory_writer.py<br/>(TrajectoryWriter /<br/> TrajectoryColumn)"]
+  end
+  PY -->|"pybind11<br/>(type_caster&lt;TensorBuffer&gt;<br/>自动 ndarray 互转)"| IPC
+  subgraph IPC["C++ 客户端层"]
+    InC["InProcessClient<br/>(零网络直连)"]
+    GrpC["Client<br/>(localhost:port)<br/>gRPC 路径,分布式"]
+    InC -.可选 gRPC.-> GrpC
+  end
+  InC -->|"直接持有"| TBL
+  GrpC -->|"gRPC stream"| TBL
+  subgraph TBL["Table"]
+    direction TB
+    WK["mutex + table_worker + ext_worker (零 GIL)"]
+    SEL["ItemSelector<br/>(Fifo/Lifo/Uniform/<br/>Prioritized/Heap x2)"]
+    RL["RateLimiter"]
+    CS["ChunkStore<br/>(持有 TensorBuffer bytes)"]
+    WK --> SEL
+    WK --> RL
+    WK --> CS
+  end
+  TBL -->|"InsertOrAssignAsync"| LWT["TrajectoryWriter(tables_)<br/>本地路径分支 (is_local_=true)<br/>├ Chunker (TensorBuffer)<br/>└ 列式 append → create_item → flush → Table"]
 ```
-Python API
-  server.py            client.py            trajectory_writer.py
-  (Server+Table)       (Client/LocalClient  (TrajectoryWriter/
-                       共享 _BaseClient)     TrajectoryColumn)
-       │ pybind11 (type_caster<TensorBuffer> 自动 ndarray 互转)
-       ▼
-  ┌─────────────┐   gRPC    ┌──────────────┐
-  │InProcessClient│────────▶│   Client     │  (gRPC 路径,分布式)
-  │ (零网络直连)  │         │ (localhost:port)│
-  └──────┬──────┘          └──────┬───────┘
-         │ 直接持有               │ gRPC stream
-         ▼                        ▼
-  ┌──────────────────────────────────┐
-  │             Table                │
-  │  mutex + table_worker + ext_worker (零 GIL)
-  │  ├── ItemSelector (Fifo/Lifo/Uniform/Prioritized/Heap x2)
-  │  ├── RateLimiter
-  │  └── ChunkStore (持有 TensorBuffer bytes)
-  └──────────┬───────────────────────┘
-             │ InsertOrAssignAsync
-             ▼
-  TrajectoryWriter(tables_)   ← 本地路径分支 (is_local_=true)
-    ├── Chunker (TensorBuffer)
-    └── 列式 append → create_item → flush → Table
 
-数据载体: TensorBuffer (std::string bytes + TensorSpec{DataType, shape})
-  - FromNdArray: 强制 C-contiguous, memcpy
-  - worker 线程读 bytes(), 零 GIL
-  - 拷贝语义 (ponytail: 预留零拷贝升级路径)
+**数据载体**: `TensorBuffer` (`std::string` bytes + `TensorSpec{DataType, shape}`)
 
-proto: third_party/reverb_tensor (自研 fork, 切断 @org_tensorflow)
-checkpoint: SimpleCheckpointer (length-delimited protobuf, 非 TFRecord)
-```
+- `FromNdArray`: 强制 C-contiguous, memcpy
+- worker 线程读 `bytes()`, 零 GIL
+- 拷贝语义 (`ponytail:` 预留零拷贝升级路径)
+
+**proto**: `third_party/reverb_tensor` (自研 fork, 切断 `@org_tensorflow`)
+**checkpoint**: `SimpleCheckpointer` (length-delimited protobuf, 非 TFRecord)
 
 **两种模式的数据流**：
 

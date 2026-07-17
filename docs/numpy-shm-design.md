@@ -10,11 +10,12 @@
   snappy 压缩/解压，CPU 与内存带宽是瓶颈。sample 路径尤甚——server 存的
   chunk 是压缩的，**每次采样都解压一次**，同一 chunk 解压 N 次。
 - **方案**：新增独立 SHM 传输层，与 gRPC / in_process 三路并存。Table 逻辑
-  留在 server 进程，SHM 只承载 chunk 字节，控制面走 per-client 双向 SPSC
-  ring buffer + server 轮询，bootstrap 用 Unix domain socket。
-- **API**：新增 `ShmClient`，镜像 `_BaseClient`（sample / insert /
-  trajectory_writer / structured_writer），语义与 gRPC / LocalClient 完全一致，
-  用户代码三路可无缝迁移。
+  留在 server 进程，SHM 只承载 chunk 字节，控制面走 per-client 双向 SPSC ring
+  buffer（每流一对，决策 D）+ server 轮询，bootstrap 用 Unix domain socket。
+- **API**：新增 `ShmClient`，镜像 `_BaseClient` 的热路径（sample /
+  trajectory_writer / structured_writer），语义与 gRPC / LocalClient 一致。
+  v1 未实现冷路径控制面（checkpoint / mutate_priorities / reset / server_info），
+  见 §6。
 
 ## 1. 动机与边界
 
@@ -33,7 +34,13 @@ client ndarray
 ```
 
 核心浪费：proto 序列化 + snappy 压缩/解压的 CPU 与内存带宽开销，sample 路径
-重复解压尤甚。SHM 直接共享未压缩字节，跳过全部序列化与压缩。
+重复解压尤甚。SHM 共享字节，跳过 gRPC 的网络栈与双端序列化往返。
+
+> **实现现状**：sample 路径上 server 仍需从 ChunkStore 解压一次成品字节进
+> SHM（每采样一次），但跳过了 gRPC 序列化回传 + client 反序列化。insert 路径上
+> 压缩在 client chunker 完成（复用现有 `CompressTensorAsProto`），client 把序列化的
+> `ChunkData` proto memcpy 进 SHM，server 反序列化后直接入 ChunkStore，不再二次压缩。
+> 即“跳过 gRPC 网络与双端序列化”，而非“全路径零序列化零压缩”。详见 §4.4 与 §8.5。
 
 ### 1.2 不解决的
 
@@ -48,9 +55,9 @@ client ndarray
 | --- | --- | --- |
 | 进程关系 | 同进程 | 同机不同进程 |
 | Table 访问 | `shared_ptr<Table>` 直接指针 | server 进程独占，client 经控制 ring 请求 |
-| chunk 字节 | `shared_ptr<ChunkStore::Chunk>` 共享 | SHM 段共享字节 + server 集中引用计数 |
-| 序列化 | 零 | 零（控制消息除外） |
-| 压缩 | 零（in_process 走 `AsSample(SampledItem)` 直接读 `shared_ptr`） | 零数据面；server 内部仍压缩存 ChunkStore |
+| chunk 字节 | `shared_ptr<ChunkStore::Chunk>` 共享 | SHM 段共享字节 + server 集中引用计数（瞬态：用完即 RELEASE） |
+| 序列化 | 零 | 零网络序列化（控制消息 + insert 走 length-delimited proto） |
+| 压缩 | 零（in_process 走 `AsSample(SampledItem)` 直接读 `shared_ptr`） | insert 复用 client chunker 压缩；sample 仍由 server 从 ChunkStore 解压一次进 SHM |
 
 > 注：in_process 的 sample 走 `sampler.cc::AsSample(const Table::SampledItem&)`
 > 路径，直接 `shared_ptr<Chunk>` 零拷贝读，本就不压缩。SHM 复刻这套"零压缩读"
@@ -62,61 +69,93 @@ client ndarray
 | --- | --- | --- |
 | S1 | 新增独立 SHM 传输层，与 gRPC / in_process 三路并存 | 不侵入现有 C++ 核心；用户显式选传输 |
 | S2 | SHM 只放 chunk 字节，Table 逻辑留 server 进程 | 复杂度量级最低；避免跨进程 shared_ptr / 互斥锁 / worker 调度 |
-| S3 | 控制面走 per-client 双向 SPSC ring buffer + server 轮询 | SPSC 无锁成熟；崩溃隔离好（某 client ring 坏不影响其他） |
+| S3 | 控制面走 per-client 双向 SPSC ring buffer + server 轮询；每 client **两对** ring（insert 流一对 + sample 流一对） | SPSC 无锁成熟；崩溃隔离好（某 client ring 坏不影响其他）。两对而非一对：insert worker 与 sample worker 是两条后台线程，单对 ring 会违反 SPSC 不变式（两个生产者写同一 `head`，无 CAS → 数据损坏），见决策 D |
 | S4 | bootstrap 用 Unix domain socket | POSIX 标准、同机专用、可检测断连 |
-| S5 | 字节池用固定档位 slab 分配 | 碎片少、回收简单（归位即可） |
+| S5 | 字节池用固定档位 slab 分配（9 档：64B/256B/1KB/4KB/16KB/64KB/256KB/1MB/4MB） | 碎片少、回收简单（归位即可） |
 | S6 | server 集中管理 SHM 字节引用计数，client 只读不释放 | 语义清晰；client 崩溃时 server 集中释放 |
-| S7 | SHM 池与现有 ChunkStore 并存（双份内存：压缩 proto + 未压缩字节） | 现有 Table / ChunkStore / sampler 零改动 |
-| S8 | insert：client 送原始字节进 SHM，server 压缩存档 | client 端零压缩（动机核心） |
+| S7 | SHM 池与现有 ChunkStore 并存，但 SHM 字节是**瞬态传输缓冲**（insert 字节在 INSERT_ACK 后 RELEASE 回收，sample 字节在 client 读后 RELEASE 回收），仅在传输瞬间与 ChunkStore 双份 | 现有 Table / ChunkStore / sampler 零改动；避免 SHM 池永久占双份内存 |
+| S8 | insert：client 把 chunker 已压缩的 `ChunkData` proto 序列化后 memcpy 进 SHM，server 反序列化存档（不再二次压缩） | 复用 chunker 现有压缩；server 零压缩。注：与早期“client 送原始字节、server 压缩”设想不同，实现采用 proto 序列化简化多列处理（见 §8.5） |
 | S9 | sample：server 预切片成成品字节进 SHM，client 直接读 | client 侧零计算；每次独立分配不复用 |
-| S10 | rate limiter / backpressure / checkpoint 语义完全对齐现有 | 用户代码三路无缝迁移 |
+| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 |
 | S11 | Python 新增 `ShmClient`，镜像 `_BaseClient` | API 一致；三路并列 |
-| S12 | 支持 trajectory_writer / structured_writer；insert 后补 | writer backpressure 经反向 ring confirm |
+| S12 | 支持 trajectory_writer / structured_writer（insert 经 trajectory_writer 的 SHM 路径实现）；plain `Writer` 仍未实现（v2 补） | writer backpressure 经反向 ring confirm |
 | S13 | 崩溃恢复：udsocket 断连检测 + 集中释放该 client SHM 偏移 | 简单可靠 |
 | S14 | 字节池满：阻塞等待，对齐全语义 | 不报错、不丢数据 |
 | S15 | SHM 用 POSIX `shm_open` | 跨平台、与 udsocket 配合自然 |
+| D | 每 client **两对** ring（insert 流 C→S/S→C + sample 流 C→S/S→C），共 4 条 ring + 1 个 pool = 5 个 SHM 段 | insert worker 与 sample worker 是两条后台线程，单对 ring 会违反 SPSC 不变式（两个生产者写同一 `head`，无 CAS → 数据损坏）。两对 ring 让每流保持单生产者，无需跨线程同步 |
 
 ## 3. 架构总览
 
+```mermaid
+flowchart LR
+  subgraph C["Client 进程"]
+    direction TB
+    SC["ShmClient (pybind)<br/> trajectory_writer (chunker 在 client)<br/> structured_writer<br/> sample / insert"]
+    CN["ShmConnection"]
+    SC --> CN
+  end
+  subgraph S["Server 进程"]
+    direction TB
+    SS["ShmServer (dispatch 线程)"]
+    T["Table (selector/RL/worker)<br/> ChunkStore (压缩 proto)"]
+    BP["ShmBytePool (未压缩字节)<br/> server 分配/回收/引用计数"]
+    SS --> T
+    SS -.分配/回收.-> BP
+  end
+  CN <-->|"udsocket (bootstrap + 断连检测)<br/> + 控制消息"| SS
+  CN -->|"insert ring C→S/S→C (SPSC, 每流一对)<br/> sample ring C→S/S→C (SPSC, 每流一对)"| SS
+  CN -->|"byte pool (POSIX shm, 共享)<br/> client RW 字节, C4 分配需经 server"| BP
+  T --> BP
 ```
-┌─────────────── Client 进程 ───────────────┐   ┌──────── Server 进程 ────────┐
-│                                             │   │                              │
-│  ShmClient (pybind)                         │   │  Table (selector/RL/worker)  │
-│   ├── trajectory_writer (chunker 在 client) │   │  ChunkStore (压缩 proto)     │
-│   ├── structured_writer                     │   │  ShmBytePool (未压缩字节)    │
-│   └── sample / insert                       │   │  ShmServer (dispatch 线程)   │
-│        │                                    │   │        ▲                     │
-│        ▼                                    │   │        │ 控制消息             │
-│  ShmConnection                              │   │        │                     │
-│   ├── udsocket (bootstrap + 断连检测) ◄─────┼───┼────────┼─────────────────────│
-│   ├── ctrl ring C→S (SPSC, client 写)       │   │        │                     │
-│   ├── ctrl ring S→C (SPSC, server 写)       │   │        │                     │
-│   └── byte pool (POSIX shm, 共享) ◄─────────┼───┼────────┴─────────────────────│
-│        (client 只读字节)                    │   │  (server 分配/回收/引用计数) │
-└─────────────────────────────────────────────┘   └──────────────────────────────┘
-```
+
+> 决策 D：每个 client 连接建立**两对** SPSC ring（insert 流一对 + sample 流一对）
+> 加 1 个共享 byte pool，共 5 个 SHM 段。单对 ring 会让 insert/sample 两条后台线程
+> 同时写同一 `head`，违反 SPSC 不变式（见 §2 决策 D）。
 
 **数据流（insert）**：
 
+```mermaid
+sequenceDiagram
+  participant CW as Client writer<br/>(RunShmWorker)
+  participant CR as Client ShmConnection
+  participant SS as Server ShmServer
+  participant T as Table / ChunkStore
+  CW->>CR: ALLOCATE{num_bytes} (insert ring C→S)
+  CR->>SS: 读 ring
+  SS-->>CR: ALLOCATE_RESP{shm_offset} (insert ring S→C)
+  Note over CW: chunker CompressTensorAsProto 压缩 ChunkData<br/>SerializeToString → memcpy 进 SHM 档位块
+  CW->>CR: INSERT{偏移+chunk_key+items+flat_trajectory} (insert ring C→S)
+  CR->>SS: 读 ring
+  SS->>SS: ParseFromArray 反序列化 ChunkData
+  SS->>T: InsertOrAssignAsync (带 InsertCallback)
+  T-->>SS: callback 触发
+  SS-->>CR: INSERT_ACK{item keys + offsets_to_release} (insert ring S→C)
+  Note over CW: 递减 num_items_in_flight (backpressure)
+  CW->>CR: RELEASE{offsets} (insert ring C→S)
+  CR->>SS: 回收 chunk 偏移
 ```
-client ndarray → memcpy 进 SHM 字节池档位块
-  → ctrl ring C→S 发 insert 请求(含 SHM 偏移+spec+table+priority+flat_trajectory)
-  → server ShmServer 线程读 ring
-  → 用 SHM 字节构造压缩 ChunkData → InsertOrAssignAsync 进 Table/ChunkStore
-  → 反向 ring S→C 发 confirm(item key)
-  → client writer 递减 num_items_in_flight(backpressure)
-```
+
+> 注：实现采用 ALLOCATE/ALLOCATE_RESP 两步先向 server 申请偏移（C4，集中分配保证
+> server 单线程无锁），再 memcpy + INSERT。早期设想“client 送原始字节、server 压缩”
+> 未采用——压缩复用 chunker 既有逻辑，server 不再二次压缩。
 
 **数据流（sample）**：
 
-```
-client → ctrl ring C→S 发 sample 请求(table, num_samples, timeout)
-  → server ShmServer → Table::Sample(走现有 rate limiter/selector)
-  → 对每个 SampledItem: UnpackChunkColumnAndSlice 解压+切片(现有逻辑)
-    → 成品 TensorBuffer 字节 memcpy 进 SHM 字节池
-  → 反向 ring S→C 发 sample 响应(各列的 SHM 偏移+spec+shape+SampleInfo)
-  → client 按偏移从 SHM 读字节 → ToNdArray → 组装 Sample
-  → client 读完发 release 请求(C→S ring) → server 回收偏移
+```mermaid
+sequenceDiagram
+  participant CS as Client sampler
+  participant CR as Client ShmConnection
+  participant SS as Server ShmServer
+  participant T as Table / ChunkStore
+  CS->>CR: SAMPLE{table, num_samples, timeout, emit_timesteps} (sample ring C→S)
+  CR->>SS: 读 ring
+  SS->>T: Table::Sample (走现有 rate limiter/selector)
+  T-->>SS: SampledItem[]
+  Note over SS: 每个 SampledItem: UnpackChunkColumnAndSlice 解压+切片<br/>成品 TensorBuffer 字节 memcpy 进 SHM 池 (refcount +1)
+  SS-->>CR: SAMPLE_RESP{各列偏移+spec+shape+SampleInfo} (sample ring S→C)
+  Note over CS: 按偏移从 SHM 读字节 → ToNdArray → 组装 Sample
+  CS->>CR: RELEASE{offsets} (sample ring C→S)
+  CR->>SS: Unref 回收偏移
 ```
 
 ## 4. 组件设计
@@ -125,72 +164,93 @@ client → ctrl ring C→S 发 sample 请求(table, num_samples, timeout)
 
 - **技术**：POSIX `shm_open` + `ftruncate` + `mmap`，固定路径名（由 server 生成，
   bootstrap 时传 client）。
-- **布局**：固定档位 slab。档位如 64B / 1KB / 16KB / 256KB / 4MB（可配）。每
-  档位一个 free list（偏移链表）。server 单线程分配/回收（无需跨进程锁）。
-- **分配**：按请求大小选最小够用档位，从该档位 free list 取一块返回偏移。无空闲
-  则向上取更大档位或报池满。
+- **布局**：固定档位 slab。实际档位 9 种：64B / 256B / 1KB / 4KB / 16KB /
+  64KB / 256KB / 1MB / 4MB（`kDefaultSlabSizes`，可配）。每档位一个 free list
+  （偏移链表，`SlabMeta.free_head_offset`）。server 单线程分配/回收（无需跨进程锁）。
+  默认每档 256 块（`kDefaultBlocksPerSlab`）。
+- **分配（C4）**：client 不自选偏移，而是发 `ALLOCATE{num_bytes}` 请求经
+  insert ring C→S，server 单线程选最小够用档位从 free list 取一块返回偏移
+  （`ALLOCATE_RESP{shm_offset}`）。无空闲则池满阻塞（S14）。集中分配保证
+  server 单线程无锁，client 拿到偏移后再 memcpy。
 - **回收**：偏移归还所属档位 free list。
 - **引用计数**：server 维护 `map<偏移, refcount>`。sample 发 N 列则各偏移 +1；
   client release 则 -1；归零回收。
 - **池满**：阻塞等待（S14）。server 端 `ShmServer` 线程在池满时阻塞，对应的
   client 请求排队（控制 ring 自然背压）。
-- **容量**：默认 2x 所有表 max_size × 平均 chunk 字节，可配。
+- **容量**：默认每档 256 块（`kDefaultBlocksPerSlab`）× 9 档，总约 1.3 GB
+  （档位与块数均可配）。`slab_sizes` 空时用 `kDefaultSlabSizes`。
 
 > `ponytail:` slab 档位是经验值，profile 后可调。跨进程分配单线程化是简化——
 > 若 server dispatch 成瓶颈，升级为 per-档位 spinlock。
 
-### 4.2 控制面 `ShmCtrlRing`（per-client 双向 SPSC）
+### 4.2 控制面 `ShmCtrlRing`（per-client 双向 SPSC，每流一对）
 
-- **结构**：每个 client 连接时，server 为其创建两条 SPSC ring（POSIX shm）：
-  - `C→S`：client 写，server 读（insert / sample / release / reset 等请求）
-  - `S→C`：server 写，client 读（sample 响应 / confirm / 错误）
-- **SPSC 实现**：经典无锁单生产者单消费者 ring，`head`/`tail` 原子变量，cache line
-  对齐防 false sharing。容量固定（如 1024 槽），每槽定长（放控制消息，大数据用
-  SHM 偏移引用）。
-- **消息类型**：定长 header（type + length + seq）+ 变长 body（proto 或自定义
-  二进制）。body 超单槽时跨槽拼接。
-- **server 轮询**：`ShmServer` 单线程轮询所有 client 的 C→S ring，dispatch 到
-  Table。响应写回对应 client 的 S→C ring。
+- **结构**：每个 client 连接时，server 为其创建**两对** SPSC ring（POSIX shm，
+  决策 D）：
+  - insert 流：`insert_c2s`（client 写 ALLOCATE/INSERT/RELEASE，server 读）/ `insert_s2c`（server 写 ALLOCATE_RESP/INSERT_ACK，client 读）
+  - sample 流：`sample_c2s`（client 写 SAMPLE/RELEASE，server 读）/ `sample_s2c`（server 写 SAMPLE_RESP/ERROR，client 读）
+- **为何两对**：insert worker 与 sample worker 是 client 进程内两条独立后台线程。
+  单对 ring 会让两个生产者写同一 `head`，违反 SPSC 不变式（无 CAS → 数据损坏）。
+  拆成两对后每流单生产者/单消费者，无需跨线程同步。
+- **SPSC 实现**：经典无锁单生产者单消费者 ring，`head`/`tail` 原子变量，各自
+  独占 cache line（`RingHeader` 128B = 2 cache line）防 false sharing。容量默认
+  1024 槽，每槽默认 256B（含 16B `SlotHeader`）。大数据用 SHM 偏移引用。
+- **消息类型**：定长 `SlotHeader`（seq + msg_type + flags + body_len）+ 变长 body
+  （length-delimited proto）。body 超单槽时跨槽拼接（HAS_CONT/IS_CONT flags）。
+- **server 轮询**：`ShmServer` 单 dispatch 线程轮询所有 client 的两条 C→S ring
+  （insert + sample），dispatch 到 Table。响应写回对应流的 S→C ring。
 
 > `ponytail:` SPSC ring 不用信号量（避免崩溃泄漏），靠 server 主动轮询。延迟
-> 由轮询间隔决定（默认忙等或微秒级 sleep）。若延迟敏感，升级为 eventfd 通知。
+> 由轮询间隔决定（默认忙等或 `sched_yield`）。若延迟敏感，升级为 eventfd 通知。
 
 ### 4.3 Bootstrap 与连接 `ShmBootstrap`
 
 - **server 侧**：启动时创建主 SHM 字节池段（POSIX shm，生成唯一路径名如
   `/reverb_shm_pool_<pid>`），并在一个 Unix domain socket 路径上 listen。
-- **client 侧**：连 udsocket，发送 `Hello{client_id}`。server 回
-  `Welcome{pool_shm_name}`，并为该 client 创建 C→S / S→C 两条 ring 段，回
-  `{c2s_shm_name, s2c_shm_name}`。client `mmap` 三段（pool + 两条 ring）。
-- **断连检测**：server 监听 udsocket EOF，判定 client 断连，集中释放该 client
-  所有未 release 的 SHM 偏移，销毁其 ring 段。
+- **client 侧**：连 udsocket，发送 `Hello{client_pid, protocol_version}`。
+  server `accept` 时用 `SO_PEERCRED` 核验 client pid，为该 client 创建**两对**
+  ring 段（`/reverb_shm_insert_c2s_<spid>_<cpid>` 等 4 条），回
+  `Welcome{pool_shm_name, insert_c2s/s2c_shm_name, sample_c2s/s2c_shm_name,
+  server_info}`。client `mmap` 五段（pool + 4 条 ring）。
+  （旧 `c2s_shm_name`/`s2c_shm_name` 字段保留但 `deprecated`。）
+- **断连检测**：server 监听 udsocket EOF（`poll`+`MSG_PEEK`），判定 client 断连，
+  集中释放该 client 所有未 release 的 SHM 偏移（`outstanding_offsets_` 集合），
+  `shm_unlink` 四条 ring 段。
 
 ### 4.4 server 侧 `ShmServer`
 
-- **线程模型**：一个 dispatch 线程轮询所有 client C→S ring + 一个表 worker 池
-  （复用现有 `Table::table_worker_`）。
-- **insert 处理**：读 ring 请求 → 用 SHM 字节构造压缩 `ChunkData`（调现有
-  `CompressTensorAsProto`）→ `Table::InsertOrAssignAsync`（带 `InsertCallback`）
-  → callback 触发时往该 client S→C ring 写 confirm。
-- **sample 处理**：读 ring 请求 → `Table::Sample`（现有 rate limiter/selector）
-  → 对每个 `SampledItem` 调 `UnpackChunkColumnAndSlice`（现有逻辑）解压切片 →
-  成品字节进 SHM 池 → S→C ring 写响应（偏移列表 + SampleInfo）。
-- **与 ChunkStore 关系**：SHM 池是 ChunkStore 之外的并行数据面。insert 时 server
-  既存压缩 proto 进 ChunkStore，也保留 SHM 字节供 sample 解压来源（或直接用
-  insert 时 client 送来的原始 SHM 字节做 sample 切片源，省一次解压——见 §6）。
+- **线程模型**：一个 dispatch 线程轮询所有 client 的两条 C→S ring（insert +
+  sample）+ 借用现有 `Table::table_worker_`（经 `InsertOrAssignAsync` 回调）。
+- **insert 处理**：读 insert ring C→S 请求 → ALLOCATE 时从池选档位返回偏移 →
+  INSERT 时从 SHM 偏移读字节 `ParseFromArray` 反序列化 `ChunkData`（client 已压缩，
+  server 不再二次压缩）→ 构造 `ChunkStore::Chunk` → `Table::InsertOrAssignAsync`
+  （带 `InsertCallback`，回调存 `ClientState.pending_insert_callbacks` 保活）
+  → callback 全部触发后往 insert ring S→C 写 `INSERT_ACK`（item keys +
+  `offsets_to_release`）。
+- **sample 处理**：读 sample ring C→S 请求 → `Table::Sample`（现有 rate
+  limiter/selector）→ 对每个 `SampledItem` 调 `UnpackChunkColumnAndSlice`（现有
+  逻辑）解压切片 → 成品字节 memcpy 进 SHM 池（refcount +1）→ sample ring S→C 写
+  `SAMPLE_RESP`（各列偏移 + spec + shape + `SampleInfo`）。
+- **与 ChunkStore 关系**：SHM 池是 ChunkStore 之外的**瞬态**数据面。insert 时
+  server 反序列化进 ChunkStore 后，SHM 偏移随 `INSERT_ACK` 的 `offsets_to_release`
+  回收；sample 时 server 从 ChunkStore 解压成品进 SHM，client 读后 RELEASE 回收。
+  两者仅在传输瞬间双份，不作永久第二副本。（早期设想的“insert 字节复用于 sample
+  切片源”见 §6，未采用。）
 
 ### 4.5 client 侧 `ShmClient`（C++ + pybind）
 
-- **C++ `ShmClient`**：持 `ShmConnection`（udsocket + 三段 mmap 指针 + C→S/S→C
-  ring 读写器）。方法镜像 `InProcessClient`：`Sample` / `Insert` /
-  `NewTrajectoryWriter` / `NewStructuredWriter` / `MutatePriorities` / `Reset` /
-  `Checkpoint` / `ServerInfo`。
+- **C++ `ShmClient`**：持 `ShmConnection`（udsocket fd + 五段 mmap：pool +
+  insert_c2s/s2c + sample_c2s/s2c ring 读写器）。方法镜像 `InProcessClient`：
+  `Sample` / `NewTrajectoryWriter` / `NewStructuredWriter` / `NewSampler`。
+  v1 **未实现** `Insert`（plain `Writer`）/ `MutatePriorities` / `Reset` /
+  `Checkpoint` / `ServerInfo`（返回空，见 S10）。
 - **trajectory_writer**：chunker/column 逻辑在 client 进程（复用现有
-  `TrajectoryWriter` 的大部分，只把 `RunLocalWorker` 的 `InsertOrAssignAsync`
-  换成"字节进 SHM 池 + C→S ring 发 insert + 等 S→C confirm"）。backpressure：
-  `local_can_insert_more_` 等 confirm 信号（对齐 D2）。
-- **sample**：发请求 → 轮询 S→C ring → 按偏移读 SHM 字节 → `TensorBuffer`
-  → `ToNdArray` → 组装 `Sample`（复用 `sampler.cc::AsSample` 的 `Sample` 构造）。
+  `TrajectoryWriter`，只把 `RunLocalWorker` 的 `InsertOrAssignAsync` 换成
+  `RunShmWorker`：ALLOCATE 申请偏移 → memcpy 序列化 `ChunkData` proto → INSERT →
+  等 ALLOCATE_RESP/INSERT_ACK → RELEASE）。backpressure：`local_can_insert_more_`
+  等 confirm 信号（对齐 D2）。
+- **sample**：发请求到 sample ring C→S → 轮询 sample ring S→C → 按偏移读 SHM
+  字节 → `TensorBuffer` → `ToNdArray` → 组装 `Sample`。读完发 RELEASE 回收偏移。
 - **pybind**：暴露 `ShmClient(udsocket_path)`，snake_case + PascalCase 双名别名
   （对齐 §3.3 的 gRPC/LocalClient 共享路径策略）。
 
@@ -202,7 +262,8 @@ client → ctrl ring C→S 发 sample 请求(table, num_samples, timeout)
   `structured_writer` 不收 table 参数（对齐 gRPC/LocalClient）。
 - `reverb/server.py`：`Server` 新增 `shm=True` / `shm_socket_path=...` 参数。
   `shm=True` 时起 `ShmServer`（含 udsocket + 字节池），`server.shm_socket_path`
-  供 client 连。可与 `in_process` / `port` 组合或互斥（见 §5）。
+  供 client 连。可与 `in_process` / `port` 组合或互斥（见 §5）。v1 `ShmServer` 只
+  持一张表（`tables[0]`），多表待后续。
 - 无 pickle（同 LocalClient，持 SHM mmap 指针不可序列化）。
 
 ## 5. 模式组合矩阵
@@ -220,13 +281,19 @@ client → ctrl ring C→S 发 sample 请求(table, num_samples, timeout)
 
 ## 6. 未决 / 后续
 
-- **insert 字节复用于 sample 切片源**：client insert 时送的原始 SHM 字节，sample
-  时 server 可直接基于它切片，省去"压缩进 ChunkStore 再解压"的一次往返。需 server
-  维持 `chunk_key → SHM 偏移` 索引（在 ChunkStore 之外）。这是 S7"并存"的优化变
-  体，可作为 v2。v1 先按"server 从压缩 ChunkStore 解压到 SHM"实现，行为正确后再
-  优化。
-- **insert（单步）API**：依赖 writer，v2 补。
-- **多 server 进程**：本文档不涉及（一个 server 进程，多 client）。
+- **insert 字节复用于 sample 切片源（未采用）**：早期设想 client insert 时送的
+  SHM 字节，sample 时 server 可直接基于它切片，省去“压缩进 ChunkStore 再解压”
+  的一次往返。需 server 维持 `chunk_key → SHM 偏移` 索引。v1 实现中 insert 字节
+  是瞬态（INSERT_ACK 后即 RELEASE），未做此复用，sample 仍从 ChunkStore 解压。
+  可作为 v2 优化。
+- **insert（单步）API**：经 `trajectory_writer` 的 `RunShmWorker` 路径已实现
+  （ALLOCATE → memcpy 序列化 proto → INSERT → INSERT_ACK → RELEASE）；plain
+  `Writer` 类的 SHM 路径仍未实现（`NewWriter` 返回 `UnimplementedError`），v2 补。
+- **控制面冷路径**：`mutate_priorities` / `reset` / `checkpoint` / `server_info`
+  在 SHM 路径未实现（`ShmClient.server_info()` 返回空），v2 补。热路径
+  （sample/insert）已完整。
+- **多 server 进程**：本文档不涉及（一个 server 进程，多 client）。v1 `ShmServer`
+  只持一张表（`tables[0]`），多表待后续。
 - **SHM 段权限**：POSIX shm 默认仅同用户。跨用户场景需 `chmod`/`chown`，后续按需。
 
 ## 7. 与 numpy-embed-design.md 的关系
@@ -250,25 +317,35 @@ client → ctrl ring C→S 发 sample 请求(table, num_samples, timeout)
 （POD，无指针，跨进程安全）：
 
 ```c
-// 段头(64 字节, 单 cache line)
+// 段头(128 字节 = 2 cache lines)。
+// head(生产者)在 line 0，tail(消费者)在 line 1，两者不共享 cache line
+// 防 false sharing。均从 1 开始(seq 0 表示槽从未写过)。
+// 显式字段布局 + pad，不靠 alignas(64) 成员（那会肨大结构体）。
 struct RingHeader {
+  // Line 0 (offset 0..63).
   uint64_t magic;          // 0x524556524253484D ("REVRBSHM")
   uint32_t version;        // 协议版本, 当前 1
-  uint32_t capacity;       // 槽位数(2 的幂)
-  uint32_t slot_size;      // 每槽字节数(含 SlotHeader)
+  uint32_t capacity;       // 槽位数(2 的幂), 默认 1024
+  uint32_t slot_size;      // 每槽字节数(含 SlotHeader), 默认 256
   uint32_t reserved;       // 对齐填充
-  // 生产者/消费者各占独立 cache line, 防 false sharing
+  uint64_t capacity_mask;  // capacity - 1, 用于 seq & capacity_mask
   // ponytail: 这两个必须是 atomic, SPSC 无锁靠 release/acquire 配对
-  std::atomic<uint64_t> producer_seq  // 下一个要写的槽的 seq(从 1 开始)  __attribute__((aligned(64)));
-  std::atomic<uint64_t> consumer_seq; // 下一个要读的槽的 seq              __attribute__((aligned(64)));
-  uint64_t capacity_mask;  // capacity - 1, 用于 seq % capacity
-  uint64_t padding[5];     // 填满 cache line
+  std::atomic<uint64_t> head;   // 生产者: 下一个要写的槽的 seq(从 1 开始)
+  uint64_t pad0[3];             // 填满 line 0 到 64 字节
+  // Line 1 (offset 64..127).
+  std::atomic<uint64_t> tail;   // 消费者: 下一个要读的槽的 seq
+  uint64_t pad1[7];             // 填满 line 1 到 64 字节
 };
+static_assert(sizeof(RingHeader) == 128);  // 必须 2 cache lines
 // 紧随其后的 slots 区: capacity 个 slot_size 槽
-// 注: SlotHeader.seq 是普通 uint64_t(非 atomic), 靠 producer_seq/consumer_seq
-//     的 release/acquire 建立可见性; 但写入时先置 0 再置 seq 的顺序需保证,
+// 注: SlotHeader.seq 是普通 uint64_t(非 atomic), 靠 head/tail 的
+//     release/acquire 建立可见性; 但写入时先填 body 最后置 seq 的顺序需保证,
 //     见 §8.4 说明
 ```
+
+> **命名说明**：实现中用 `head`/`tail` 而非本节早期描述的 `producer_seq`/
+> `consumer_seq`，语义完全等价（head = 生产者下一个 seq，tail = 消费者下一个 seq）。
+> §8.4 的伪代码保留 `producer_seq`/`consumer_seq` 名以贴近 SPSC 通用术语。
 
 - **seq 而非 index**：用单调递增的 `seq`（从 1 开始），槽位 = `seq & capacity_mask`。
   比裸 index 多一位冗余，能区分"空"与"满"（满: producer_seq - consumer_seq ==
@@ -305,17 +382,24 @@ struct SlotHeader {
 
 #### C→S 请求（client 写，server 读）
 
-| type 值 | msg_type 名 | body proto | 对应现有 RPC |
-| --- | --- | --- | --- |
-| 1 | `HELLO` | `HelloRequest{client_pid, client_protocol_version}` | bootstrap（仅初始一次，见 §8.6） |
-| 2 | `INSERT` | `ShmInsertRequest`（见下） | InsertStream |
-| 3 | `SAMPLE` | `ShmSampleRequest{table, num_samples, timeout_ms, emit_timesteps}` | SampleStream |
-| 4 | `RELEASE` | `ShmReleaseRequest{repeated uint64 offsets}` | SHM 专有（回收字节池偏移） |
-| 5 | `MUTATE_PRIORITIES` | `MutatePrioritiesRequest`（复用现有 proto） | MutatePriorities |
-| 6 | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset |
-| 7 | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint |
-| 8 | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo |
-| 9 | `CLOSE` | 空 | client 主动关闭 |
+v1 已实现：`HELLO` / `INSERT` / `SAMPLE` / `RELEASE` / `ALLOCATE` / `CLOSE`。
+`MUTATE_PRIORITIES` / `RESET` / `CHECKPOINT` / `SERVER_INFO` 未实现（v2 补，见 S10）。
+
+| type 值 | msg_type 名 | body proto | 对应现有 RPC | v1 |
+| --- | --- | --- | --- | --- |
+| 1 | `HELLO` | `HelloRequest{client_pid, protocol_version}` | bootstrap（仅初始一次，走 udsocket，见 §8.6） | ✓ |
+| 2 | `INSERT` | `ShmInsertRequest`（见下） | InsertStream | ✓ |
+| 3 | `SAMPLE` | `ShmSampleRequest{table, num_samples, timeout_ms, emit_timesteps}` | SampleStream | ✓ |
+| 4 | `RELEASE` | `ShmReleaseRequest{repeated uint64 offsets}` | SHM 专有（回收字节池偏移，insert/sample 流均可收） | ✓ |
+| 5 | `ALLOCATE` | `ShmAllocateRequest{num_bytes}` | SHM 专有（C4：client 向 server 申请字节池偏移） | ✓ |
+| 9 | `CLOSE` | 空 | client 主动关闭 | ✓ |
+| — | `MUTATE_PRIORITIES` | `MutatePrioritiesRequest`（复用现有 proto） | MutatePriorities | 未实现 |
+| — | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset | 未实现 |
+| — | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint | 未实现 |
+| — | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | 未实现 |
+
+> 注：早期设计表把 type 5 预留给 `MUTATE_PRIORITIES`，实现中 5 被用于 `ALLOCATE`
+> （C4 集中分配流程）。`RESET`/`CHECKPOINT`/`SERVER_INFO` 未占号，待 v2 统一分配。
 
 ```protobuf
 // shm_protocol.proto (新增)
@@ -347,20 +431,37 @@ message HelloRequest {
   int32 client_pid = 1;
   uint32 protocol_version = 2;
 }
+// C4: client 向 server 申请字节池偏移
+message ShmAllocateRequest {
+  uint64 num_bytes = 1;
+}
 ```
+
+> **实现现状**：`ShmChunkRef` 的 `spec`/`sequence_range`/`delta_encoded`/`num_columns`
+> 字段在实现中**不填充**（client `RunShmWorker` 仅设 `chunk_key`/`shm_offset`/
+> `total_length`），因为传输的是序列化的 `ChunkData` proto 本身，server 直接
+> `ParseFromArray` 反序列化拿到全部列信息，无需按 spec 拆列（`ponytail:` 标注冗余）。
+> proto 定义保留以对齐 §8.5 的多列设想。
 
 #### S→C 响应（server 写，client 读）
 
-| type 值 | msg_type 名 | body proto | 对应 |
-| --- | --- | --- | --- |
-| 101 | `WELCOME` | `WelcomeResponse{pool_shm_name, c2s_shm_name, s2c_shm_name, server_info}` | bootstrap 响应 |
-| 102 | `INSERT_ACK` | `InsertAck{repeated uint64 keys, repeated uint64 offsets_to_release}` | InsertStreamResponse + SHM 偏移回收 |
-| 103 | `SAMPLE_RESP` | `ShmSampleResponse`（见下） | SampleStream |
-| 104 | `ERROR` | `ShmError{code, message, request_seq}` | 统一错误 |
-| 105 | `MUTATE_ACK` | `MutatePrioritiesResponse`（复用） | |
-| 106 | `RESET_ACK` | `ResetResponse`（复用） | |
-| 107 | `CHECKPOINT_RESP` | `CheckpointResponse`（复用） | |
-| 108 | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | |
+v1 已实现：`WELCOME` / `INSERT_ACK` / `SAMPLE_RESP` / `ALLOCATE_RESP` / `ERROR`。
+`MUTATE_ACK` / `RESET_ACK` / `CHECKPOINT_RESP` / `SERVER_INFO_RESP` 未实现。
+
+| type 值 | msg_type 名 | body proto | 对应 | v1 |
+| --- | --- | --- | --- | --- |
+| 101 | `WELCOME` | `WelcomeResponse{pool_shm_name, insert_c2s/s2c_shm_name, sample_c2s/s2c_shm_name, server_info}` | bootstrap 响应 | ✓ |
+| 102 | `INSERT_ACK` | `InsertAck{repeated uint64 keys, repeated uint64 offsets_to_release}` | InsertStreamResponse + SHM 偏移回收 | ✓ |
+| 103 | `SAMPLE_RESP` | `ShmSampleResponse`（见下） | SampleStream | ✓ |
+| 104 | `ALLOCATE_RESP` | `ShmAllocateResponse{shm_offset}` | SHM 专有（C4：返回授予的偏移） | ✓ |
+| 105 | `ERROR` | `ShmError{code, message, request_seq}` | 统一错误 | ✓ |
+| — | `MUTATE_ACK` | `MutatePrioritiesResponse`（复用） | | 未实现 |
+| — | `RESET_ACK` | `ResetResponse`（复用） | | 未实现 |
+| — | `CHECKPOINT_RESP` | `CheckpointResponse`（复用） | | 未实现 |
+| — | `SERVER_INFO_RESP` | `ServerInfoResponse`（复用） | | 未实现 |
+
+> 注：早期设计表把 104 预留给 `ERROR`、105 预留给 `MUTATE_ACK`。实现中 104 被
+> `ALLOCATE_RESP` 占用、`ERROR` 后移到 105（值偏移），未实现项未占号。
 
 ```protobuf
 message ShmSampleResponse {
@@ -378,13 +479,21 @@ message ShmColumn {
 }
 message WelcomeResponse {
   string pool_shm_name = 1;
-  string c2s_shm_name = 2;
-  string s2c_shm_name = 3;
+  string c2s_shm_name = 2 [deprecated = true];   // 旧单对 ring 字段, 保留兼容
+  string s2c_shm_name = 3 [deprecated = true];
   ServerInfoResponse server_info = 4;  // 含各表 signature, 供 writer 校验
+  string insert_c2s_shm_name = 5;      // 决策 D: insert 流 ring
+  string insert_s2c_shm_name = 6;
+  string sample_c2s_shm_name = 7;      // 决策 D: sample 流 ring
+  string sample_s2c_shm_name = 8;
 }
 message InsertAck {
   repeated uint64 keys = 1;                 // 已插入 item key
   repeated uint64 offsets_to_release = 2;   // insert 用完的 chunk SHM 偏移, client 可释放
+}
+// C4: server 返回授予的偏移
+message ShmAllocateResponse {
+  uint64 shm_offset = 1;
 }
 message ShmError {
   enum Code {
@@ -491,14 +600,12 @@ Status Read(Ring* r, uint16_t* msg_type, std::string* body) {
 一个 `ChunkData` 含多列 tensor（`repeated TensorProto tensors`）。SHM 下一个
 chunk 的多列字节布局：
 
-- **方案**：一个 `ShmChunkRef` 对应一个 chunk，但其 `shm_offset/length` 指向的
-  SHM 区域是**多列拼接**的连续字节（每列紧跟上一列）。`spec` 字段改为
-  `repeated TensorSpecProto specs`（每列一个），各列长度由 `spec.shape + dtype`
-  算出。server 端按 spec 拆列，调 `CompressTensorAsProto` 各列压缩，组装
-  `ChunkData.data.tensors`。
+- **设计方案（未采用）**：一个 `ShmChunkRef` 对应一个 chunk，其 `shm_offset`/
+  `total_length` 指向多列拼接的连续字节，`spec` 字段为 `repeated TensorSpecProto
+  specs`（每列一个），server 端按 spec 拆列、调 `CompressTensorAsProto` 各列压缩。
 
 ```protobuf
-// 修正 ShmChunkRef
+// 设计中的 ShmChunkRef（多列拼接版）
 message ShmChunkRef {
   uint64 chunk_key = 1;
   uint64 shm_offset = 2;
@@ -509,27 +616,28 @@ message ShmChunkRef {
 }
 ```
 
-server 侧伪代码：
+- **实现现状（采用）**：client `RunShmWorker` 直接把 chunker 产出的 `ChunkData`
+  （已含压缩后的 `repeated TensorProto tensors`）`SerializeToString` 成一段连续
+  字节 memcpy 进 SHM，`ShmChunkRef` 只填 `chunk_key`/`shm_offset`/`total_length`，
+  `specs`/`sequence_range`/`delta_encoded` 留空（`ponytail:` 标注冗余——
+  ChunkData 自描述）。server 端不按 spec 拆列，直接 `ParseFromArray` 还原
+  `ChunkData` 入 ChunkStore。多列信息隐含在序列化的 proto 里，语义等价但路径更简：
 
 ```c
-Status HandleInsert(ShmInsertRequest req, ShmConnection* conn) {
-  for (auto& ref : req.chunks) {
-    ChunkData chunk;
-    chunk.set_chunk_key(ref.chunk_key());
-    *chunk.mutable_sequence_range() = ref.sequence_range();
-    uint64 off = ref.shm_offset();
-    for (auto& spec : ref.specs()) {
-      int64_t bytes = NumElems(spec) * SizeOf(spec.dtype());
-      TensorBuffer buf(spec, string_view(pool_ + off, bytes));
-      TensorProto* t = chunk.mutable_data()->add_tensors();
-      CompressTensorAsProto(buf, t);  // 现有函数
-      off += bytes;
-    }
-    // 走现有路径: chunks 存 ChunkStore, items 走 InsertOrAssignAsync
-    ...
+// 实际 HandleInsert（简化）
+Status HandleInsert(ShmInsertRequest req, ClientState* cs) {
+  for (auto& ref : req.chunks()) {
+    ChunkData cd;
+    cd.ParseFromArray(pool_.At(ref.shm_offset()), ref.total_length());
+    // cd 已含压缩后的 tensors（client chunker 压好），无需再压缩
+    auto chunk = std::make_shared<ChunkStore::Chunk>(cd);
+    // chunks 存 ChunkStore, items 走 InsertOrAssignAsync...
   }
 }
 ```
+
+> 代价：SHM 上传的是序列化 proto 字节（含 proto 开销），而非裸 numpy 字节。
+> 换来的是多列/压缩/delta 等逻辑全复用 chunker 现有实现，server 零解析压力。
 
 ### 8.6 Bootstrap 握手时序（udsocket + 初始 ring）
 
@@ -538,24 +646,28 @@ udsocket 字节流，不走 ring：
 
 ```
 1. server 启动:
-   - shm_open 创建 pool 段 /reverb_shm_pool_<pid>, ftruncate 设容量, mmap
+   - shm_open 创建 pool 段 /reverb_shm_pool_<server_pid>, ftruncate 设容量, mmap
    - unix socket bind+listen 在 /tmp/reverb_shm_<pid>.sock (路径传给 client)
 
 2. client 连接:
    - connect udsocket
-   - 发 HelloRequest{client_pid, protocol_version} (length-delimited proto)
+   - 发 HelloRequest{client_pid, protocol_version} (4 字节大端长度前缀 + proto)
 
-3. server 收 Hello:
-   - 为该 client 创建两条 ring 段: /reverb_shm_c2s_<server_pid>_<client_pid>,
-     /reverb_shm_s2c_<server_pid>_<client_pid>
+3. server 收 Hello (accept 时 SO_PEERCRED 核验 client pid):
+   - 为该 client 创建**四条** ring 段（决策 D，每流一对）:
+     /reverb_shm_insert_c2s_<server_pid>_<client_pid>,
+     /reverb_shm_insert_s2c_<server_pid>_<client_pid>,
+     /reverb_shm_sample_c2s_<server_pid>_<client_pid>,
+     /reverb_shm_sample_s2c_<server_pid>_<client_pid>
    - ftruncate 各 ring 段(RingHeader + capacity*slot_size)
    - mmap, 初始化 RingHeader
-   - 回 WelcomeResponse{pool_shm_name, c2s_shm_name, s2c_shm_name, server_info}
-     (含各表 signature, 供 client writer 校验, 对齐 gRPC InitializeConnection)
+   - 回 WelcomeResponse{pool_shm_name, insert_c2s/s2c_shm_name,
+     sample_c2s/s2c_shm_name, server_info}
+     （server_info 字段 v1 未填充，供 writer 校验的 signature 暂不可用，见 S10）
 
 4. client 收 Welcome:
-   - shm_open + mmap 三段(pool, c2s, s2c)
-   - 之后所有控制消息走 ring, udsocket 仅保留用于断连检测(§8.8)
+   - shm_open + mmap 五段(pool, insert_c2s/s2c, sample_c2s/s2c)
+   - 之后所有控制消息走对应流的 ring, udsocket fd 保留用于断连检测(§8.8)
 ```
 
 > `ponytail:` ring 段名含 server_pid + client_pid，避免多 server/多 client 冲突。
@@ -571,21 +683,24 @@ ring 满时的阻塞行为，对齐 §S10（语义对齐 gRPC）：
 - **S→C 满**（server 响应太快，client 读不及）：`Write` 在 server 侧阻塞。
   server dispatch 线程阻塞在此 client 的 S→C，其他 client 仍可处理（除非
   dispatch 单线程——见下）。
-- **dispatch 单线程风险**：§4.2 说 server 单线程轮询所有 client。若某 client
-  S→C 满导致 dispatch 阻塞，会饿死其他 client。**对策**：dispatch 线程对每个
-  client 的 S→C 写采用非阻塞尝试，失败则跳过该 client 继续轮询下一个，待该
-  client ring 有空间再回写（响应暂存 per-client outbox 队列）。这样 dispatch
-  不被慢 client 阻塞。
-- **字节池满**（§S14）：server 在分配 SHM 偏移时阻塞。同样采用非阻塞尝试 +
-  暂存：sample 请求若池满，暂存该请求，先处理其他请求，待池有空间再完成。
+- **dispatch 单线程风险**：§4.2 说 server 单线程轮询所有 client 的两条 C→S ring。
+  若某 client S→C 满导致 dispatch 阻塞，会饿死其他 client。**对策（已实现）**：
+  dispatch 线程对每个 client 的 S→C 写采用非阻塞 `TryWrite`，失败则跳过该 client
+  继续轮询下一个，待该 client ring 有空间再回写（响应暂存 per-client per-flow
+  outbox 队列：`insert_outbox` + `sample_outbox`）。这样 dispatch 不被慢 client
+  阻塞。
+- **字节池满**（§S14）：`ShmBytePool::Allocate` 在 server dispatch 线程上用
+  `Mutex`+`CondVar` 阻塞等待 free list 有块（`ponytail:` 简化——v1 dispatch 单
+  线程，池满时阻塞该请求直到有空间；这会暂停所有 client 的 insert 分配，但
+  sample 路径不分配故不受影响）。§8.7 设想的“非阻塞尝试 + 暂存请求”未采用。
 
 ### 8.8 断连检测与崩溃恢复
 
-- **正常关闭**：client 发 `CLOSE` 消息（C→S），server 收到后释放该 client 所有
-  未 release 偏移，销毁 ring 段（shm_unlink），关闭 udsocket。
-- **client 崩溃**：udsocket 上 server `recv` 返回 EOF/ECONNRESET。server 判定
-  client 断，执行集中释放：遍历该 client 的 `outstanding_offsets_` 集合，逐个
-  递减引用计数并回收，shm_unlink 两条 ring 段。
+- **正常关闭**：client 发 `CLOSE` 消息（insert C→S ring），server 收到后释放该
+  client 所有未 release 偏移，销毁 ring 段（`shm_unlink` 四条 ring），关闭 udsocket。
+- **client 崩溃**：udsocket 上 server `poll`+`recv(MSG_PEEK)` 返回 EOF/HUP。server
+  判定 client 断，执行集中释放：遍历该 client 的 `outstanding_offsets_` 集合，
+  逐个递减引用计数并回收，`shm_unlink` 四条 ring 段。
 - **server 崩溃**：client 的 udsocket `recv` 返回 EOF。client 侧报
   `ConnectionError`（所有在途请求失败）。client 持有的 SHM mmap 指针失效。
 - **outstanding_offsets_ 追踪**：server 为每 client 维护
@@ -599,8 +714,11 @@ SHM 是异步 ring，不像 gRPC 一请求一响应同步。匹配靠 `request_s
 - client 每发一个请求，记录其 `producer_seq` 作为 `request_seq`。
 - 响应（`SAMPLE_RESP`/`INSERT_ACK`/`ERROR` 等）的 body proto 里带 `request_seq`
   字段（或在 `ShmError` 里显式带；成功响应可隐式按顺序匹配，因 SPSC 保序）。
-- **简化**：SPSC 保序，同一 client 的响应顺序与请求顺序一致。client 可用 FIFO
-  队列按序匹配，不必每响应带 seq。仅 `ERROR` 显式带 `request_seq` 便于定位。
+- **简化**：SPSC 保序，同一流的响应顺序与请求顺序一致。client 用阻塞 `read` 按序
+  匹配，不必每响应带 seq。
 
-> `ponytail:` 靠 SPSC 保序做隐式匹配，省掉每响应的 seq 字段。若未来要支持
-> 乱序响应（如多 worker 并发处理），再加显式 seq。
+> **实现现状**：`ShmError.request_seq` 字段在 proto 中保留，但 v1 server 构造
+> `ShmError` 时**未填充**该字段，client 也不匹配——完全依赖 SPSC 保序隐式匹配
+> （insert worker 发 INSERT 后阻塞读 `INSERT_ACK`，sample worker 发 SAMPLE 后
+> 阻塞读 `SAMPLE_RESP`，两流各自保序）。`ponytail:` 若未来要支持乱序响应
+> （如多 worker 并发处理），再启用显式 seq。

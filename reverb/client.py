@@ -392,8 +392,8 @@ class _BaseClient:
             `ReplaySample`, each representing a single step within the trajectory.
             If False, a single `ReplaySample` per sampled item is yielded. If
             `None` (default), falls back to the client's
-            `_default_emit_timesteps` (`True` for the gRPC `Client`, `False` for
-            the in-process `LocalClient`).
+            `_default_emit_timesteps`, which is `True` for all built-in clients
+            (`Client`, `LocalClient`, `ShmClient`).
           unpack_as_table_signature: If True then the sampled data is unpacked
             according to the structure of the table signature. If the table does
             not have a signature then flat data is returned.
@@ -823,8 +823,9 @@ class LocalClient(_BaseClient):
 class ShmClient(_BaseClient):
     """SHM (POSIX shared memory) client for same-machine cross-process access.
 
-    Connects to a `Server(shm=True)` over a udsocket and mmaps the three SHM
-    segments (pool + two rings). `sample`/`trajectory_writer`/`structured_writer`
+    Connects to a `Server(shm=True)` over a udsocket and mmaps the five SHM
+    segments (pool + two ring pairs: insert C→S/S→C + sample C→S/S→C, one
+    pair per flow so each flow keeps its own SPSC producer). `sample`/`trajectory_writer`/`structured_writer`
     match `Client`/`LocalClient` exactly, so user code is transport-agnostic.
 
     v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles only
