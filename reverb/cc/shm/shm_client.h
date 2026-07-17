@@ -170,6 +170,14 @@ class ShmClient {
                                 const std::vector<uint64_t>& deletes);
   absl::Status Reset(const std::string& table);
 
+  // ticket ⑪: trigger a server-side checkpoint and return the saved path.
+  // Mirrors InProcessClient::Checkpoint / Client::Checkpoint. Rides the INSERT
+  // flow (insert_c2s/insert_s2c) under insert_flow_mu like ⑩'s control-plane
+  // ops. Reuses the existing reverb_service.proto CheckpointRequest (empty) /
+  // CheckpointResponse{checkpoint_path}. Server-side errors (no checkpointer,
+  // Save failure) arrive as ShmError::INTERNAL -> absl::InternalError.
+  absl::Status Checkpoint(std::string* path);
+
   ShmConnection* connection() { return &conn_; }
 
  private:

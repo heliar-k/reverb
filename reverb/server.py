@@ -423,6 +423,7 @@ class Server:
             self._shm_server = pybind.ShmServer(
                 tables=[t.internal_table for t in tables],
                 socket_path=shm_socket_path,
+                checkpointer=checkpointer.internal_checkpointer(),
             )
             self._shm_server.Start()
             self._shm_socket_path = self._shm_server.socket_path

@@ -1182,6 +1182,18 @@ PYBIND11_MODULE(libpybind, m) {
     }
     MaybeRaiseFromStatus(status);
   };
+  // ticket ⑪: Checkpoint over SHM. Mirrors the gRPC Client / InProcessClient
+  // bindings — release GIL, return the saved path string.
+  auto shm_checkpoint_fn = [](ShmClient* client) -> std::string {
+    std::string path;
+    absl::Status status;
+    {
+      py::gil_scoped_release g;
+      status = client->Checkpoint(&path);
+    }
+    MaybeRaiseFromStatus(status);
+    return path;
+  };
 
   py::class_<ShmClient, std::shared_ptr<ShmClient>>(m, "ShmClient")
       .def(py::init(shm_connect_fn), py::arg("socket_path"))
@@ -1211,7 +1223,9 @@ PYBIND11_MODULE(libpybind, m) {
       .def("MutatePriorities", shm_mutate_priorities_fn,
            py::arg("table"), py::arg("updates"), py::arg("deletes"))
       .def("reset", shm_reset_fn, py::arg("table"))
-      .def("Reset", shm_reset_fn, py::arg("table"));
+      .def("Reset", shm_reset_fn, py::arg("table"))
+      .def("checkpoint", shm_checkpoint_fn)
+      .def("Checkpoint", shm_checkpoint_fn);
 
   // ShmSampler mirrors Sampler's GetNextTrajectory: release the GIL for the C++
   // call, re-acquire to build the info+data tensor vector (GIL needed for the
@@ -1243,29 +1257,35 @@ PYBIND11_MODULE(libpybind, m) {
   // one.
   py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
       .def(py::init([](std::vector<std::shared_ptr<Table>> tables,
-                      const std::string& socket_path) {
+                      const std::string& socket_path,
+                      std::shared_ptr<Checkpointer> checkpointer) {
              absl::StatusOr<std::unique_ptr<ShmServer>> result;
              {
                py::gil_scoped_release g;
-               result = ShmServer::Create(std::move(tables), socket_path);
+               result = ShmServer::Create(std::move(tables), socket_path,
+                                         std::move(checkpointer));
              }
              MaybeRaiseFromStatus(result.status());
              return std::shared_ptr<ShmServer>(std::move(*result));
            }),
-           py::arg("tables"), py::arg("socket_path") = "")
+           py::arg("tables"), py::arg("socket_path") = "",
+           py::arg("checkpointer") = nullptr)
       .def_static(
           "Create",
           [](std::vector<std::shared_ptr<Table>> tables,
-             const std::string& socket_path) {
+             const std::string& socket_path,
+             std::shared_ptr<Checkpointer> checkpointer) {
             absl::StatusOr<std::unique_ptr<ShmServer>> result;
             {
               py::gil_scoped_release g;
-              result = ShmServer::Create(std::move(tables), socket_path);
+              result = ShmServer::Create(std::move(tables), socket_path,
+                                        std::move(checkpointer));
             }
             MaybeRaiseFromStatus(result.status());
             return std::shared_ptr<ShmServer>(std::move(*result));
           },
-          py::arg("tables"), py::arg("socket_path") = "")
+          py::arg("tables"), py::arg("socket_path") = "",
+          py::arg("checkpointer") = nullptr)
       .def("Start",
            [](ShmServer* server) {
              absl::Status status;

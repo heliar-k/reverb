@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/checkpointing/interface.h"
 #include "reverb/cc/platform/hash_map.h"
 #include "reverb/cc/platform/hash_set.h"
 #include "reverb/cc/shm/bootstrap.h"
@@ -116,10 +117,14 @@ class ShmServer {
  public:
   // Create the pool + bootstrap server. `socket_path` is the udsocket path.
   // `tables` must be non-empty with unique names (validated here; the Python
-  // `Server` also checks, but C++ defends itself).
+  // `Server` also checks, but C++ defends itself). `checkpointer` is optional
+  // (ticket ⑪): when provided, HandleCheckpoint saves all tables and returns
+  // the path; when null, HandleCheckpoint returns FailedPreconditionError
+  // (mirrors InProcessClient::Checkpoint).
   static absl::StatusOr<std::unique_ptr<ShmServer>> Create(
       std::vector<std::shared_ptr<Table>> tables,
-      const std::string& socket_path);
+      const std::string& socket_path,
+      std::shared_ptr<Checkpointer> checkpointer = nullptr);
 
   ~ShmServer();
 
@@ -145,7 +150,8 @@ class ShmServer {
 
  private:
   ShmServer(std::vector<std::shared_ptr<Table>> tables, std::string socket_path,
-            ShmBytePool pool, ShmBootstrapServer bootstrap);
+            ShmBytePool pool, ShmBootstrapServer bootstrap,
+            std::shared_ptr<Checkpointer> checkpointer);
 
   // dispatch thread main loop
   void DispatchLoop();
@@ -203,6 +209,14 @@ class ShmServer {
                                      const MutatePrioritiesRequest& req);
   absl::Status HandleReset(ClientState& state, const ResetRequest& req);
 
+  // ticket ⑪: checkpoint all tables via the injected checkpointer. Mirrors
+  // InProcessClient::Checkpoint / ReverbServiceImpl::Checkpoint — gathers all
+  // tables_, calls checkpointer_->Save(tables, keep_latest=1, path), returns
+  // the path in CheckpointResponse (CHECKPOINT_RESP on the insert s2c flow).
+  // No checkpointer -> FailedPreconditionError as ShmError::INTERNAL (mirrors
+  // InProcessClient). Checkpoint is cross-table, so no FindTable routing.
+  absl::Status HandleCheckpoint(ClientState& state);
+
   // Enqueue a S→C message on the INSERT flow's s2c ring: try a non-blocking
   // write, stash in insert_outbox if full.
   absl::Status EnqueueInsertS2C(ClientState& state, MsgType type,
@@ -242,6 +256,10 @@ class ShmServer {
   std::string socket_path_;
   ShmBytePool pool_;
   ShmBootstrapServer bootstrap_;
+  // ticket ⑪: optional, injected at Create. nullptr when the Python Server
+  // constructs ShmServer without one (shouldn't happen in practice — Server
+  // always builds a default checkpointer — but C++ defends itself).
+  std::shared_ptr<Checkpointer> checkpointer_;
   std::vector<std::unique_ptr<ClientState>> clients_;
 
   std::thread dispatch_thread_;

@@ -82,10 +82,12 @@ void InstallSignalHandlers() {
 
 ShmServer::ShmServer(std::vector<std::shared_ptr<Table>> tables,
                      std::string socket_path, ShmBytePool pool,
-                     ShmBootstrapServer bootstrap)
+                     ShmBootstrapServer bootstrap,
+                     std::shared_ptr<Checkpointer> checkpointer)
     : socket_path_(std::move(socket_path)),
       pool_(std::move(pool)),
-      bootstrap_(std::move(bootstrap)) {
+      bootstrap_(std::move(bootstrap)),
+      checkpointer_(std::move(checkpointer)) {
   // ticket ⑨: build the name→Table map. Uniqueness is validated in Create,
   // so here we just move each table into the map by its own name.
   tables_.reserve(tables.size());
@@ -96,7 +98,8 @@ ShmServer::ShmServer(std::vector<std::shared_ptr<Table>> tables,
 
 // static
 absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
-    std::vector<std::shared_ptr<Table>> tables, const std::string& socket_path) {
+    std::vector<std::shared_ptr<Table>> tables, const std::string& socket_path,
+    std::shared_ptr<Checkpointer> checkpointer) {
   if (tables.empty()) {
     return absl::InvalidArgumentError("tables must not be empty");
   }
@@ -123,7 +126,7 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
       ShmBytePool pool, ShmBytePool::Create(pool_name));
   return absl::WrapUnique(
       new ShmServer(std::move(tables), socket_path, std::move(pool),
-                    std::move(bootstrap)));
+                    std::move(bootstrap), std::move(checkpointer)));
 }
 
 ShmServer::~ShmServer() { Stop(); }
@@ -438,6 +441,18 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
         if (!st.ok()) {
           REVERB_LOG(REVERB_WARNING)
               << "ShmServer: HandleReset failed for client " << client_id
+              << ": " << st;
+        }
+        break;
+      }
+      case CHECKPOINT: {
+        // ticket ⑪: checkpoint rides the insert flow like ⑩'s control-plane
+        // ops. CheckpointRequest is empty; HandleCheckpoint returns the path
+        // in CHECKPOINT_RESP (or ShmError on failure).
+        auto st = HandleCheckpoint(state);
+        if (!st.ok()) {
+          REVERB_LOG(REVERB_WARNING)
+              << "ShmServer: HandleCheckpoint failed for client " << client_id
               << ": " << st;
         }
         break;
@@ -895,6 +910,43 @@ absl::Status ShmServer::HandleReset(ClientState& state,
     return EnqueueInsertS2C(state, ERROR, body);
   }
   return EnqueueInsertS2C(state, RESET_ACK, "");  // empty ack
+}
+
+absl::Status ShmServer::HandleCheckpoint(ClientState& state) {
+  // ticket ⑪: cross-table checkpoint, mirroring InProcessClient::Checkpoint /
+  // ReverbServiceImpl::Checkpoint. No checkpointer -> FailedPreconditionError
+  // surfaced as ShmError::INTERNAL (the ShmError::Code enum has no
+  // FAILED_PRECONDITION; INTERNAL is the catch-all the client maps to
+  // InternalError -> Python RuntimeError, close enough to LocalClient's
+  // FailedPreconditionError surfacing). CheckpointResponse carries the path.
+  if (checkpointer_ == nullptr) {
+    ShmError err;
+    err.set_code(ShmError::INTERNAL);
+    err.set_message("ShmServer: no checkpointer provided");
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  std::vector<Table*> raw_tables;
+  raw_tables.reserve(tables_.size());
+  for (auto& [_, table] : tables_) {
+    raw_tables.push_back(table.get());
+  }
+  CheckpointResponse resp;
+  absl::Status s =
+      checkpointer_->Save(std::move(raw_tables), /*keep_latest=*/1,
+                           resp.mutable_checkpoint_path());
+  if (!s.ok()) {
+    ShmError err;
+    err.set_code(ShmError::INTERNAL);
+    err.set_message(std::string(s.message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  std::string body;
+  resp.SerializeToString(&body);
+  return EnqueueInsertS2C(state, CHECKPOINT_RESP, body);
 }
 
 absl::Status ShmServer::HandleInsert(ClientState& state,

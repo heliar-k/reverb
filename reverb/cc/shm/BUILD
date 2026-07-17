@@ -177,6 +177,7 @@ reverb_cc_library(
         ":ring",
         ":shm_connection",
         ":shm_protocol_cc_proto",
+        "//reverb/cc/checkpointing:interface",
         "//reverb/cc:chunk_store",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:table",

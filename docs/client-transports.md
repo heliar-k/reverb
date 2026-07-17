@@ -14,7 +14,7 @@
 | 同机跨进程，要最快采样 | `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` |
 | 跨机 / 分布式 / 需要全套控制面 | gRPC `Client` | `reverb.Client('host:port')` |
 | 需 pickle 客户端（如多进程 worker 持有） | gRPC `Client` 或 `ShmClient` | — |
-| 需要 `checkpoint` | gRPC 或 `LocalClient` | — |
+| 需要 `checkpoint` | gRPC 或 `LocalClient` 或 `ShmClient`（ticket ⑪） | — |
 | 需要实时 `server_info`（反映 `Table.replace`） | gRPC 或 `LocalClient` | — |
 
 一句话：**能内嵌就 `LocalClient`；要跨进程就要么 gRPC（图省事/要全套 API）要么
@@ -34,7 +34,7 @@
 | `sample` 默认 `emit_timesteps` | `True` | `True` | `True`（三者统一） |
 | `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ✅ **bootstrap 快照**（连接时缓存，无往返） |
 | `mutate_priorities` / `reset` | ✅ | ✅ | ✅（ticket ⑩，走 insert 流 + 客户端互斥锁） |
-| `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ❌ 不支持 |
+| `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ✅（ticket ⑪，走 insert 流；恢复经共享 Table 的 `LoadLatest` 搭车 gRPC/InProcess） |
 | `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM；`validate_items` 总是开，⑧-2b） |
 | `writer`（legacy）/ `insert` | ✅ | ✅ | ❌ **Python 层抛 `NotImplementedError`**（ticket ⑬） |
 
@@ -52,7 +52,7 @@ insert              ✅          ✅              ❌ NotImplementedError (Pytho
 mutate_priorities   ✅          ✅              ✅（ticket ⑩）
 reset               ✅          ✅              ✅（ticket ⑩）
 server_info         ✅ 真实      ✅ 真实          ✅ bootstrap 快照
-checkpoint          ✅          ✅              ❌
+checkpoint          ✅          ✅              ✅（ticket ⑪）
 ```
 
 **`ShmClient` 覆盖了 `insert`/`writer`**：因为 legacy `Writer`（writer.h）没有
@@ -212,6 +212,16 @@ mmap 五段 SHM），原进程的 mmap/ring 状态留在原进程、随原 clien
 
 三者 `_default_emit_timesteps` 都是 `True`（早期 `LocalClient` 曾默认 `False`，
 已修正）。显式传 `emit_timesteps=False` 取整条 trajectory。
+
+### 5.7 `ShmClient.checkpoint()` 走 insert 流（ticket ⑪）
+
+`checkpoint()` 与 ⑩ 的 `mutate_priorities`/`reset` 同走 INSERT 流
+（`insert_c2s`/`insert_s2c`），在 `ShmConnection::insert_flow_mu` 下串行化
+send→read-ACK。服务端 `HandleCheckpoint` 调注入的 `checkpointer_->Save`
+落盘所有表，经 `CHECKPOINT_RESP` 返回路径。恢复路径无新代码：`ShmServer`
+与 gRPC/InProcess 共享同一批 `Table` 对象，构造时 `ReverbServiceImpl::
+Initialize` 或 `InProcessClient::LoadLatest` 已对它们 `LoadLatest`，SHM
+自动看到恢复态。
 
 ## 6. 传输层差异速查（实现层）
 

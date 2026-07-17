@@ -35,12 +35,22 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 >   `cached_server_info_` 填 `flat_signature_map`（镜像 InProcessClient），
 >   `trajectory_writer` 的 signature 校验真正生效。测试
 >   `ShmClientValidateItemsTest`（3 例）落地。⑧-2 的按需 `SERVER_INFO` 往返仍 deferred。
-> - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）——v2 唯一剩余，需 checkpointer
->   集成，单独一轮。
+> - ✅ ⑪ `checkpoint`——v2 路线图最后一个功能 ticket 落地（工作区未提交）。
+>   镜像 ⑩ 控制面模式：`CHECKPOINT=8`/`CHECKPOINT_RESP=108` 走 INSERT 流
+>   （`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化 send→read-ACK。
+>   `ShmServer::Create` 增可选 `shared_ptr<Checkpointer>` 参数；`HandleCheckpoint`
+>   收集全部 `tables_` 调 `Save(keep_latest=1, path)`，路径经
+>   `CheckpointResponse` 返回；无 checkpointer → `ShmError::INTERNAL` →
+>   Python `RuntimeError`。复用现有 `CheckpointRequest`/`CheckpointResponse`
+>   proto，零新消息体。恢复路径无新代码：`ShmServer` 与 gRPC/InProcess 共享
+>   同一批 `Table` 对象，构造时 `LoadLatest` 已对它们恢复，SHM 自动看到。测试
+>   `ShmClientCheckpointTest`（2 例：save→load 数据一致 / corrupt 报错）落地。
 >
-> **新 session 入口**：⑫⑬⑧-2b 已落地，v2 仅剩 ⑪ `checkpoint` + ⑧-2 按需
-> SERVER_INFO（可继续 defer）。本会话改动未提交（`shm_client.{h,cc}`/
->   `shm_test.py`/`tickets.md`），跑 `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
+> **新 session 入口**：v2 路线图全部完成（⑧-⑬，仅 ⑧-2 按需 SERVER_INFO 往返
+>   仍 deferred，无用户撞过，`ponytail:` 标注）。本会话改动未提交
+>   （`shm_protocol.proto`/`shm_server.{h,cc}`/`shm_client.{h,cc}`/`BUILD`/
+>   `pybind.cc`/`pybind.pyi`/`server.py`/`shm_test.py`/`tickets.md`/docs），
+>   跑 `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
 
 ---
 
@@ -365,7 +375,7 @@ dispatch 线程（spec §8.7 原始升级路径）。
 
 ---
 
-## ⑪ `checkpoint` / 恢复  [P3]
+## ⑪ `checkpoint` / 恢复  [P3]  [已完成]
 
 **What to build:** `ShmClient.checkpoint()` 触发 server 落盘并返回路径。难点不在
 协议，而在集成：checkpointer 现归 Python `Server` 对象所有，不在 `ShmServer`——
@@ -375,13 +385,25 @@ dispatch 线程（spec §8.7 原始升级路径）。
 
 **Blocked by:** ⑩（同属控制面冷路径，复用协议扩展模式 + ⑨ 的 table 路由）。
 
-- [ ] `ShmServer` 持 checkpointer 引用或 `std::function<string()>` 回调（由 `Server` Python 侧注入，对齐 `LocalClient` 路径）
-- [ ] `shm_protocol.proto` 分配 `CHECKPOINT` / `CHECKPOINT_RESP` type 值，复用现有 `CheckpointRequest`/`CheckpointResponse`
-- [ ] `HandleCheckpoint`：调 checkpointer → 返回路径
-- [ ] `ShmClient` pybind + Python 暴露 `Checkpoint`，`_BaseClient.checkpoint` 走通
-- [ ] 恢复路径：`Server(shm=True)` 构造时 `LoadLatest`（对齐 `LocalClient`，见 `docs/numpy-embed-design.md`）
-- [ ] 测试：checkpoint → 新 server load → sample 恢复数据一致
-- [ ] 更新 `docs/client-transports.md` §1 表（`checkpoint` 从 ❌ 改 ✅）
+**状态：已完成。** 镜像 ⑩ 的控制面模式：`CHECKPOINT=8`/`CHECKPOINT_RESP=108`
+走 INSERT 流（`insert_c2s`/`insert_s2c`）+ `insert_flow_mu` 串行化 send→read-ACK。
+`ShmServer::Create` 增可选 `std::shared_ptr<Checkpointer>` 参数；`HandleCheckpoint`
+收集全部 `tables_` 调 `checkpointer_->Save(tables, keep_latest=1, path)`，路径经
+`CheckpointResponse` 返回；无 checkpointer → `ShmError::INTERNAL` → Python
+`RuntimeError`。复用现有 `CheckpointRequest`/`CheckpointResponse` proto，零新消息
+体。C++ 8/8 绿。恢复路径无新代码：`ShmServer` 与 gRPC/InProcess 共享同一批
+`Table` 对象，构造时 `ReverbServiceImpl::Initialize` / `InProcessClient::
+LoadLatest` 已对它们 `LoadLatest`，SHM 自动看到恢复态。测试
+`ShmClientCheckpointTest` 2 例（save→load 数据一致 / corrupt checkpoint 构造报错）
+镜像 `InProcessCheckpointTest`。
+
+- [x] `ShmServer` 持 checkpointer 引用或 `std::function<string()>` 回调（由 `Server` Python 侧注入，对齐 `LocalClient` 路径）——`std::shared_ptr<Checkpointer>` 注入 `Create`
+- [x] `shm_protocol.proto` 分配 `CHECKPOINT=8` / `CHECKPOINT_RESP=108` type 值，复用现有 `CheckpointRequest`/`CheckpointResponse`
+- [x] `HandleCheckpoint`：调 checkpointer → 返回路径
+- [x] `ShmClient` pybind + Python 暴露 `Checkpoint`，`_BaseClient.checkpoint` 走通——pybind 双名绑定，Python 层继承 `_BaseClient.checkpoint` 无改动
+- [x] 恢复路径：`Server(shm=True)` 构造时 `LoadLatest`（对齐 `LocalClient`）——经共享 Table 搭车 gRPC/InProcess 的 `LoadLatest`，无新代码
+- [x] 测试：checkpoint → 新 server load → sample 恢复数据一致
+- [x] 更新 `docs/client-transports.md` §0/§1/§2/§5.7（`checkpoint` 从 ❌ 改 ✅）；`docs/numpy-shm-design.md` §1/§6/§8.3；`docs/numpy-shm-spec.md` §8.3/§11
 
 ---
 
@@ -438,7 +460,7 @@ insert 抛错 / trajectory_writer 不受影响）。
                         │
 ⑩ mutate/reset [P2]  ───┘  blockedBy ⑨
         │
-        └── ⑪ checkpoint [P3]  blockedBy ⑩
+        └── ⑪ checkpoint [P3]  blockedBy ⑩  ✅ 已完成
 
 ⑫ pickle      [P4]  ──  ✅ 已完成（独立）
 ⑬ deprecate   [清理] ──  ✅ 已完成（独立，不实现）
@@ -446,7 +468,8 @@ insert 抛错 / trajectory_writer 不受影响）。
 
 **批次建议**：⑧+⑨+⑩ 一轮（dispatch 扩展，做完 ShmClient 对齐 gRPC/LocalClient
 常用面）——✅ 已完成；⑫+⑬ 一轮（可用性尾巴，pickle + deprecate）——✅ 已完成；
-⑪ 独立一轮（需 checkpointer 集成）——⬜ 待做。
+⑪ 独立一轮（需 checkpointer 集成）——✅ 已完成。
 
 **关键判断**：⑧/⑨/⑩ 是「让 ShmClient 成为可用客户端」的必经三步（已完成）；
-⑫/⑬ 是锦上添花（已完成）；⑪ 是最后一个未做的 v2 ticket，需 checkpointer 集成。
+⑫/⑬ 是锦上添花（已完成）；⑪ 是最后一个 v2 功能 ticket（已完成）。v2 路线图
+全部落地，仅 ⑧-2 按需 SERVER_INFO 往返仍 deferred（可继续 defer）。

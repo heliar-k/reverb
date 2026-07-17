@@ -206,13 +206,13 @@ for sample in client.sample('my_table', num_samples=4):
 
 - SHM 是**附加**传输层,可与 `in_process` 或 gRPC 共存,`shm=True` 不隐含
   `in_process=True`。
-- v1 限制:checkpoint 暂不支持 SHM 回环(用 gRPC/in_process 路径);
-  `server_info()` 返回连接时的 bootstrap 快照(真实 `TableInfo`),不反映会话中途的
+- v1 限制:`server_info()` 返回连接时的 bootstrap 快照(真实 `TableInfo`),不反映会话中途的
   `Table.replace`(用 gRPC/Local 取实时)。`ShmClient` 可 pickle(存 `socket_path` 反
   序列化重连,见 ticket ⑫);legacy `writer`/`insert` 抛 `NotImplementedError`(用
   `trajectory_writer`/`structured_writer`,见 ticket ⑬)。SHM 支持全部表(按表名路由,
   见 ticket ⑨);`mutate_priorities`/`reset` 已支持(ticket ⑩,走 insert 流 +
-  客户端互斥锁)。
+  客户端互斥锁);`checkpoint` 已支持(ticket ⑪,走 insert 流 + 注入 checkpointer,
+  恢复经共享 Table 搭车 gRPC/InProcess `LoadLatest`)。
 - `shm_socket_path` 默认生成 `/tmp/reverb_shm_<pid>.sock`,`stop()` 时清理。
 
 ## Detailed overview

@@ -476,6 +476,49 @@ absl::Status ShmClient::Reset(const std::string& table) {
   return absl::OkStatus();  // RESET_ACK is empty
 }
 
+absl::Status ShmClient::Checkpoint(std::string* path) {
+  // ticket ⑪: same insert-flow round-trip as MutatePriorities/Reset (see
+  // MutatePriorities for the insert_flow_mu rationale). CheckpointRequest is
+  // empty; CheckpointResponse carries checkpoint_path. No table routing —
+  // checkpoint is cross-table.
+  CheckpointRequest req;
+  std::string body;
+  req.SerializeToString(&body);
+
+  absl::MutexLock lock(&conn_.insert_flow_mu);
+  REVERB_RETURN_IF_ERROR(
+      conn_.insert_c2s.Write(CHECKPOINT, absl::MakeSpan(body)));
+
+  MsgType resp_type;
+  std::string resp_body;
+  // ticket ⑪: same kReadBlockingHardCap cap as ⑩'s control-plane ACKs.
+  REVERB_RETURN_IF_ERROR(
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
+                   kReadBlockingHardCap));
+
+  if (resp_type == ERROR) {
+    // Server maps no-checkpointer / Save failure to ShmError::INTERNAL.
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError(
+          "ShmClient::Checkpoint: malformed ShmError");
+    }
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::Checkpoint: server error: ", err.message()));
+  }
+  if (resp_type != CHECKPOINT_RESP) {
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::Checkpoint: unexpected response type ", resp_type));
+  }
+  CheckpointResponse resp;
+  if (!resp.ParseFromString(resp_body)) {
+    return absl::InternalError(
+        "ShmClient::Checkpoint: malformed CheckpointResponse");
+  }
+  *path = resp.checkpoint_path();
+  return absl::OkStatus();
+}
+
 absl::Status ShmClient::NewSampler(const std::string& table_name,
                                    const Sampler::Options& options,
                                    std::unique_ptr<ShmSampler>* sampler) {

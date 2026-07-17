@@ -36,6 +36,7 @@ from absl.testing import absltest
 
 import reverb
 from reverb import errors, signature_codec, structured_writer
+from reverb.platform.default import checkpointers
 
 
 def _make_table(
@@ -835,6 +836,91 @@ class ShmMutateResetTest(absltest.TestCase):
             pass  # table drained / rate-limiter timeout — fine
         self.assertTrue(seen.issubset(written_set), f"corruption: {seen - written_set}")
         server.stop()
+
+
+class ShmClientCheckpointTest(absltest.TestCase):
+    """ticket ⑪: checkpoint() over the SHM transport.
+
+    Mirrors in_process_test.py's InProcessCheckpointTest. checkpoint() rides
+    the INSERT flow (insert_c2s/insert_s2c) like ⑩'s control-plane ops; the
+    server-side HandleCheckpoint calls the injected checkpointer_->Save over
+    ALL tables and returns the path in CheckpointResponse. Restoration is free
+    via the shared Table objects (gRPC/InProcess LoadLatest on the same tables
+    the SHM server also exposes), so a fresh Server with the same checkpointer
+    sees the saved state.
+    """
+
+    def _table(self):
+        return reverb.Table(
+            name="c",
+            sampler=reverb.selectors.Fifo(),
+            remover=reverb.selectors.Fifo(),
+            max_size=10,
+            max_times_sampled=1,
+            rate_limiter=reverb.rate_limiters.MinSize(1),
+        )
+
+    def test_checkpoint_save_load(self):
+        root = tempfile.mkdtemp()
+        values = [float(i) for i in range(3)]
+
+        server_a = reverb.Server(
+            tables=[self._table()],
+            in_process=True,
+            shm=True,
+            checkpointer=checkpointers.DefaultCheckpointer(path=root),
+        )
+        client_a = reverb.ShmClient(server_a.shm_socket_path)
+        for v in values:
+            _insert_one(client_a, "c", np.array([v], dtype=np.float32))
+
+        ckpt_path = client_a.checkpoint()
+        self.assertTrue(ckpt_path and os.path.isdir(ckpt_path), ckpt_path)
+        for name in ("tables.ckpt", "items.ckpt", "chunks.ckpt", "DONE"):
+            self.assertTrue(os.path.exists(os.path.join(ckpt_path, name)), name)
+
+        server_a.stop()
+
+        # Fresh server with the same checkpointer restores the saved state via
+        # LoadLatest on the shared Table objects (mirrors InProcessCheckpointTest).
+        server_b = reverb.Server(
+            tables=[self._table()],
+            in_process=True,
+            shm=True,
+            checkpointer=checkpointers.DefaultCheckpointer(path=root),
+        )
+        client_b = reverb.ShmClient(server_b.shm_socket_path)
+        restored = [
+            float(np.asarray(sample.data[0]).reshape(-1)[0])
+            for sample in client_b.sample(
+                "c", num_samples=len(values), emit_timesteps=False
+            )
+        ]
+        self.assertEqual(restored, values)
+        server_b.stop()
+
+    def test_checkpoint_corrupt_raises(self):
+        # A CORRUPT checkpoint must surface on Server construction, not be
+        # silently swallowed (mirrors InProcessCheckpointTest).
+        root = tempfile.mkdtemp()
+        server = reverb.Server(
+            tables=[self._table()],
+            in_process=True,
+            shm=True,
+            checkpointer=checkpointers.DefaultCheckpointer(path=root),
+        )
+        client = reverb.ShmClient(server.shm_socket_path)
+        ckpt_path = client.checkpoint()
+        server.stop()
+        with open(os.path.join(ckpt_path, "tables.ckpt"), "wb") as f:
+            f.write(b"corrupt-garbage-not-a-proto")
+        with self.assertRaises(Exception):
+            reverb.Server(
+                tables=[self._table()],
+                in_process=True,
+                shm=True,
+                checkpointer=checkpointers.DefaultCheckpointer(path=root),
+            )
 
 
 class ShmSampleDeadlockRegressionTest(absltest.TestCase):

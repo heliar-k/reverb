@@ -35,6 +35,9 @@ enum MsgType {
   // reserved 5 for MUTATE_PRIORITIES, but v1 reassigned 5 to ALLOCATE (C4).
   MUTATE_PRIORITIES = 6;
   RESET = 7;
+  // ticket ⑪: checkpoint rides the INSERT flow like ⑩'s control-plane ops.
+  // Reuses the existing reverb_service.proto CheckpointRequest/CheckpointResponse.
+  CHECKPOINT = 8;
   CLOSE = 9;
   // S→C
   WELCOME = 101;
@@ -45,6 +48,8 @@ enum MsgType {
   // MutatePrioritiesRequest/ResetRequest protos from reverb_service.proto).
   MUTATE_ACK = 106;
   RESET_ACK = 107;
+  // ticket ⑪: carries CheckpointResponse.checkpoint_path back to the client.
+  CHECKPOINT_RESP = 108;
   ERROR = 105;
 }
 
