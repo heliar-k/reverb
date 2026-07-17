@@ -866,20 +866,33 @@ absl::Status TrajectoryWriter::RunShmWorker() {
   // blast radius to this worker only.
   using namespace ::deepmind::reverb::shm;
 
+  // ticket ⑩ 死锁修复（方向 C）：加有限超时，避免服务端 dispatch 被卡时
+  // RunShmWorker 无限忙等 insert ACK。方向 A 修了 sample 路径根因，但 insert
+  // ACK 仍可能因 ring 满 / outbox 堆积而延迟；硬上限作健壮性兜底。超时后
+  // 返 DeadlineExceededError，Flush/EndEpisode 会把它作为 unrecoverable_status_
+  // 表面给调用者。ponytail: 60s 是宽松上限——正常 ACK 应在 ms 级返回。
+  constexpr absl::Duration kInsertAckTimeout = absl::Seconds(60);
+
   auto read_blocking = [](Ring* ring, MsgType* type,
                           std::string* payload,
-                          int control_fd) -> absl::Status {
+                          int control_fd,
+                          absl::Duration timeout) -> absl::Status {
     // poll non-blocking Read + sched_yield (spec R5: blocking policy is the
     // caller's job, not Ring's). Same helper as ShmSampler/ShmClient.
     // ticket ⑥ (spec §8.8): if the liveness fd (control_fd) shows EOF/HUP the
     // server is gone — return UnavailableError so in-flight inserts fail fast
     // instead of spinning forever on a dead server.
+    absl::Time deadline = absl::Now() + timeout;
     while (true) {
       absl::Status s = ring->Read(type, payload);
       if (s.ok()) return absl::OkStatus();
       if (!absl::IsNotFound(s)) return s;
       if (control_fd >= 0 && IsPeerClosed(control_fd)) {
         return absl::UnavailableError("SHM server closed connection");
+      }
+      if (absl::Now() >= deadline) {
+        return absl::DeadlineExceededError(
+            "RunShmWorker: insert response timed out");
       }
       sched_yield();
     }
@@ -1010,7 +1023,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       MsgType atype;
       std::string aresp_body;
       absl::Status rs = read_blocking(&shm_conn_->insert_s2c, &atype, &aresp_body,
-                                       shm_conn_->control_fd);
+                                       shm_conn_->control_fd, kInsertAckTimeout);
       if (!rs.ok()) {
         alloc_failed = true;
         absl::MutexLock l(&mu_);
@@ -1105,7 +1118,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     MsgType ack_type;
     std::string ack_body;
     absl::Status as = read_blocking(&shm_conn_->insert_s2c, &ack_type, &ack_body,
-                                     shm_conn_->control_fd);
+                                     shm_conn_->control_fd, kInsertAckTimeout);
     if (!as.ok()) {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);

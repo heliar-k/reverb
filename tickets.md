@@ -13,23 +13,27 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > 支持。优先级 P0→P4 标在各 ticket 标题；依赖链与批次建议见文末「v2 依赖图」。
 > v1 依据 `docs/client-transports.md` §1 对比表与 `docs/numpy-shm-spec.md` §6。
 >
-> **当前进度（commit `74608c1`，2026-07-17）：**
+> **当前进度（工作区未提交，2026-07-17）：**
 >
 > - ✅ ⑧ `server_info`（bootstrap 快照）、✅ ⑨ 多表、✅ ⑩ `mutate_priorities`+`reset`
 >   ——三 ticket 同批落地，已提交 `74608c1`。C++ `//reverb/cc/shm:*` 8/8、Python
 >   `shm_test.py` 35/35、`transport_parity_test.py` 5/5 全绿。
-> - ⚠️ ⑩ 留有**未查明的偶发死锁技术债**：`ShmConnection::insert_flow_mu` 锁范围
->   过大（覆盖 `RunShmWorker` 的 send→read-ACK 全程），并发 mutate+insert 时可能
->   形成「mutate 等 ACK / ACK 卡在 ring / ring 满等 worker 读 / worker 等锁」循环。
->   本会话未复现（单跑 20× 全绿），但另一 pi 会话观察到 100% CPU + 35 线程卡死
->   （`timeout` 杀不掉，主线程在 C++ `ReadBlocking` 忙等）。详见 ⑩ 的「已知技术债」
->   小节 + `shm_connection.h` 的 `ponytail:` 注释。**待办**：构建 tight loop 复现 →
->   `gdb thread apply all bt` 抓栈 → 选「缩锁范围+序号配对」或「第三条控制 ring」修。
+> - ✅ ⑩ **死锁已修**（本会话）：2026-07-17 复现并抓栈确认根因——**不是**
+>   ticket 原猜的 `insert_flow_mu` 锁范围，而是**服务端单线程 dispatch 在
+>   `HandleSample` 里阻塞于 `Table::Sample` 的 rate-limiter 无限等待**（队头阻塞），
+>   导致该 client 的所有后续 insert/mutate/sample ACK 永远排不进 ring，client
+>   `ReadBlocking` 100% CPU 忙等、`timeout` 杀不掉。按方向 A+C 修复：`HandleSample`
+>   改异步（`EnqueSampleRequest` + `DrainPendingSamples` 镜像 insert 的
+>   callback→outbox 模式）+ `ReadBlocking` 加 60s 硬上限兜底。回归测试
+>   `ShmSampleDeadlockRegressionTest` 落地。C++ 8/8 + Python `shm_test.py`
+>   31 例 + `transport_parity_test.py` 5/5 全绿，×3 跑无 flaky。决定性三栈与
+>   A/B/C/D 方向选型见 ⑩ 的「**已确认根因**」小节。
 > - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）、⑫ `pickle`（P4，一行）、⑬ deprecate
 >   legacy `Writer`/`insert`（清理）——均未开始，可任选推进。
 >
-> **新 session 入口**：读本文件顶部进度 → 看 ⑩「已知技术债」小节决定先修死锁还是
-> 先做 ⑪/⑫/⑬。工作区干净、已提交、无遗留进程。
+> **新 session 入口**：⑩ 死锁已修，可放心推进 ⑪/⑫/⑬。本会话改动未提交
+> （`shm_server.{h,cc}`/`shm_client.cc`/`trajectory_writer.cc`/`shm_test.py`/
+> `tickets.md`/`shm_connection.h`），跑 `git diff` 复核后提交。
 
 ---
 
@@ -236,7 +240,7 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 
 ---
 
-## ⑩ `mutate_priorities` + `reset`  [P2]  [已完成，带已知技术债]
+## ⑩ `mutate_priorities` + `reset`  [P2]  [已完成，死锁已修]
 
 **What to build:** PER 训练每步都要 `mutate_priorities`，算半热路径。新增两个控制
 消息对 + dispatch handler，调现有 `Table::MutateItems` / `Table::Reset`（Table 侧
@@ -292,18 +296,62 @@ round-trip（trajectory_writer.cc:973-1156，含 line 1012/1107 的
 正常顺序调用（`flush` 等 ACK 返回再 `mutate`）下循环不闭合，故单测全绿；并发
 或乱序时可能触发。
 
-**修复方向**（未实施，需 tight loop 验证）：缩小 `insert_flow_mu` 范围到**只
-保护 `insert_c2s.Write`**（SPSC 的 `head` 只被 Write 碰），不覆盖读 `insert_s2c`
-（消费者动作，SPSC 允许生产者/消费者并发）。难点：请求/ACK 配对——若 mutate
-与 RunShmWorker 的请求交错进 ring，server 的 ACK 顺序与 client 两侧的
-`read_blocking` 配对会乱。需改为「写请求 + 读自己 ACK」用条件变量/序号配对，
-而非一把大锁。`ponytail:` 注释已在 `shm_connection.h` 标注「升级路径：第三条
-专用控制 ring pair」，那也是彻底解（控制面不与 insert 争 ring，连配对问题一并
-消失）。
+> **2026-07-17 复现 + 抓栈结果：上面的 `insert_flow_mu` 分析是错的，根因另在。**
+> 见下一小节「**已确认根因**」。
 
-**待办**（新 ticket）：构建能稳定复现的 tight loop（并发 mutate + insert +
-sample，或 `flush` 不等 ACK 就 mutate），抓 `gdb thread apply all bt`，确认
-死锁路径；然后选「缩锁范围 + 序号配对」或「第三条控制 ring」修。
+### 已确认根因：单线程 dispatch 在 `HandleSample` 的 rate-limiter 阻塞，造成队头阻塞
+
+**复现**：`min_size=50` 的表只插入 1 条 → 一个线程 `sample(num_samples=1)`
+（`timeout_ms=None → InfiniteDuration`）→ 另一线程 `mutate_priorities`。
+秒级 100% CPU 双线程卡死，`timeout` 杀不掉（`ReadBlocking` 的 `sched_yield`
+忙等，GIL 已释放，Python 信号处理跑不起来）。35 线程，与 ticket 顶部观察一致。
+
+**`gdb thread apply all bt` 抓到决定性三栈**（见 `reverb/tests/shm_deadlock_repro.py`）：
+
+- **dispatch 线程**：`DispatchLoop → HandleSample → Table::Sample →
+  SampleFlexibleBatch → Notification::WaitForNotification()`——在 rate limiter
+  上**无限等待**（`InfiniteDuration`）。这一条阻塞了服务端**唯一的** dispatch
+  线程。
+- **sampler worker（100% CPU）**：`RunWorker → FetchOne → ReadBlocking`，
+  `sched_yield` 忙等 `sample_s2c` 的 `SAMPLE_RESP`——dispatch 被卡，永无响应。
+- **mutate 主线程（100% CPU）**：`MutatePriorities → ReadBlocking`，
+  `sched_yield` 忙等 `insert_s2c` 的 `MUTATE_ACK`——dispatch 被卡，永处理不到。
+
+**`insert_flow_mu` 是无辜的**——它序列化整个 round-trip 反而 *防止* 两个生产者
+同时写 `insert_c2s`。真正的循环是**服务端单线程 dispatch 在 `HandleSample` 里
+阻塞于 `Table::Sample` 的 rate-limiter 等待**（队头阻塞），导致该 client 的所有
+后续 insert/mutate/sample ACK 永远排不进 ring。gRPC 不受此害是因为它每请求一个
+独立 RPC 线程，不共享单条 dispatch 线程。
+
+**修复方向**（已选 A+C，2026-07-17 落地）：
+1. **A. 服务端 `HandleSample` 异步化** ✅ 已实施：`HandleSample` 改调
+   `Table::EnqueSampleRequest` 入 table worker 异步队列，dispatch 不阻塞；完成
+   回调在 table worker 线程把 `SampledItem`+status 攒进
+   `ClientState::pending_samples`（mutex 保护），dispatch 线程每轮
+   `DrainPendingSamples` 取出做 unpack+pool+`SAMPLE_RESP`（保持 `pool_`/
+   `outstanding_offsets_` 单线程不变式，镜像 `HandleInsert` 的 callback→outbox）。
+   keepalive `shared_ptr<SamplingCallback>` 存 `pending_sample_callbacks` vector，
+   回调触发时按裸指针 key 自清 erase（裸指针存堆上 `shared_ptr<Callback*>`
+   控制块按值捕获，解决「make_shared 后才有值 + 局部变量按引用捕获悬空」的
+   bootstrap 问题）。不用 FIFO 弹出——table worker 可能乱序完成请求（rate
+   limiter 不满足时放回 current_sampling），FIFO 会弹错 keepalive 导致
+   weak_ptr.lock() 失效、flaky hang。
+2. **B. client 默认 `rate_limiter_timeout` 改有限值** ⬜ 未做：A 已根治，无需。
+3. **C. client `ReadBlocking` 加超时** ✅ 已实施：`shm_client.cc` 的
+   `ReadBlocking` 加 `kReadBlockingHardCap=60s`（sampler 用
+   `rate_limiter_timeout_ + hardCap`，mutate/reset 用 hardCap）；
+   `trajectory_writer.cc` 的 `read_blocking` lambda 加 `kInsertAckTimeout=60s`。
+   超时返 `DeadlineExceededError`，让 `timeout` 能杀、Python 信号能跑。
+4. **D. 第三条专用控制 ring** ⬜ 未做：A 已解 sample 队头阻塞，控制面不再争
+   dispatch。控制面 throughput 真有问题时再加。
+
+**回归测试**：`ShmSampleDeadlockRegressionTest.test_sample_blocking_rate_limiter_
+does_not_deadlock_mutate`（`shm_test.py`）——`min_size=50` + 无 timeout sample +
+并发 mutate，断言 mutate 10s 内返回（远小于 60s 兜底，证明是 A 的根治而非 C
+超时）。
+
+**剩余可选**：B/D 不再必要；如未来 dispatch 单线程成吞吐瓶颈，考虑 per-client
+dispatch 线程（spec §8.7 原始升级路径）。
 
 ---
 

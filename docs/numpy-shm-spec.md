@@ -700,23 +700,28 @@ DispatchLoop()
   ├── 轮询每个 client 的 C→S ring → 解析请求类型
   │   ├── INSERT → 读 SHM 字节 → CompressTensorAsProto → Table::InsertOrAssignAsync
   │   │              → callback: 写 S→C INSERT_ACK (含 offsets_to_release)
-  │   ├── SAMPLE → Table::Sample → UnpackChunkColumnAndSlice (在 dispatch 线程同步执行)
-  │   │              → memcpy 成品字节进 SHM pool
-  │   │              → 写 S→C SAMPLE_RESP
+  │   ├── SAMPLE → Table::EnqueSampleRequest (异步入队，dispatch 不阻塞于 rate limiter)
+  │   │              → table worker 完成后回调攒进 ClientState::pending_samples
+  │   │   DrainPendingSamples (dispatch 线程): UnpackChunkColumnAndSlice →
+  │   │              memcpy 成品字节进 SHM pool → 写 S→C SAMPLE_RESP
   │   │              → client 读完发 RELEASE → server 递减 refcount
   │   ├── RELEASE → 遍历 offsets, Unref, 归零则 Deallocate
   │   ├── MUTATE_PRIORITIES → Table::MutateItems → S→C MUTATE_ACK
   │   ├── RESET → Table::Reset → S→C RESET_ACK
   │   ├── CHECKPOINT → checkpointer_->Save → S→C CHECKPOINT_RESP
   │   └── CLOSE → HandleDisconnect
-  ├── 对每个 client, 尝试 FlushOutbox (非阻塞写 S→C)
+  ├── 对每个 client: DrainPendingSamples + 尝试 FlushOutbox (非阻塞写 S→C)
   ├── 检查 udsocket EOF (断连检测)
   └── sleep(0) or sched_yield()
 ```
 
-> **注意 R11**：`UnpackChunkColumnAndSlice` 在 dispatch 线程内同步完成，
-> 不委派到 worker 池。因为 sample 成品字节需立即进 SHM 池（分配操作非线程安全）。
-> 若 dispatch 线程成为瓶颈，后续升级为 per-client dispatch 线程 + 带锁的 SHM 分配。
+> **注意 R11**：`UnpackChunkColumnAndSlice` + pool 分配在 dispatch 线程内同步完成
+> （`DrainPendingSamples`），不委派到 worker 池——sample 成品字节需立即进 SHM 池
+> （分配操作非线程安全）。ticket ⑩ 死锁修复（方向 A）后，rate-limiter 等待
+> 发生在 table worker 线程（`EnqueSampleRequest` 异步），不再阻塞 dispatch。
+> 若 dispatch 线程成为吞吐瓶颈，后续升级为 per-client dispatch 线程 + 带锁的
+> SHM 分配。client 侧 `ReadBlocking` 有 60s 硬上限兜底（方向 C），任何未来
+> 阻塞路径都不再卡死 `timeout` 命令。
 
 ### 3.5 Client 侧 `ShmClient`
 
@@ -804,7 +809,8 @@ class ShmClient {
   // 写入 C→S ring (阻塞)
   absl::Status SendRequest(uint16_t msg_type, const std::string& body);
 
-  // 从 S→C ring 读取响应 (非阻塞 + 有限重试)
+  // 从 S→C ring 读取响应 (非阻塞 + 有限重试；ticket ⑩ 方向 C：默认 60s 硬上限，
+  // 避免服务端 dispatch 被卡时 client 无限忙等、timeout 杀不掉)
   absl::StatusOr<std::pair<uint16_t, std::string>> RecvResponse(
       absl::Duration timeout = absl::InfiniteDuration());
 

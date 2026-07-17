@@ -77,6 +77,26 @@ struct ClientState {
   std::vector<std::shared_ptr<Table::InsertCallback>> pending_insert_callbacks
       ABSL_GUARDED_BY(insert_outbox_mu);
 
+  // ticket ⑩ 死锁修复（方向 A）：异步 sample 的完成回调在 table worker 线程
+  // 触发，不能直接碰 pool_/outstanding_offsets_（单线程 dispatch 不变式）。
+  // 回调把 SampledItem + 路由元数据攒进这个 mutex 保护的队列，dispatch 线程
+  // 每轮 DrainPendingSamples 取出做 unpack+pool+写 SAMPLE_RESP。镜像
+  // pending_insert_callbacks 的 callback→dispatch-drain 模式。
+  struct PendingSample {
+    ShmSampleRequest req;          // 原始请求（table 名 + 超时映射在 status 里）
+    absl::Status status;           // table worker 的结果（含 DeadlineExceeded）
+    Table::SampledItem item;       // 成功时的采样项
+  };
+  absl::Mutex pending_samples_mu;
+  std::vector<PendingSample> pending_samples ABSL_GUARDED_BY(pending_samples_mu);
+  // EnqueSampleRequest 存 weak_ptr<SamplingCallback>，table worker 在
+  // HandleSample 返回后触发回调，shared_ptr 必须存活到回调触发。存这里；回调
+  // 触发时按裸指针 key 自清 erase（裸指针存在堆上 shared_ptr 控制块里按值捕获，
+  // 避免局部变量悬空）。ponytail: O(n) scan erase，n=in-flight sample 数（<=8）。
+  // Ceil: 高并发可改 hash_set 按指针查。Upgrade: 同。
+  std::vector<std::shared_ptr<Table::SamplingCallback>> pending_sample_callbacks
+      ABSL_GUARDED_BY(pending_samples_mu);
+
   // ticket ⑥: set when the client sends an explicit CLOSE. The dispatch loop's
   // IsClientDead check then routes it through HandleDisconnect next pass.
   bool close_requested = false;
@@ -86,11 +106,12 @@ struct ClientState {
 // a ShmBytePool (sole allocator, C4), and a bootstrap udsocket. A single
 // dispatch thread polls the listen socket for new clients, then non-blocking-
 // reads each client's C→S ring: SAMPLE → FindTable(req.table) →
-// Table::Sample → UnpackChunkColumnAndSlice ON THE DISPATCH THREAD (A1) →
-// memcpy result bytes into the pool (refcount=1, C3) → write SAMPLE_RESP to
-// S→C (non-blocking, stashed in outbox if full, §8.7); RELEASE → Unref each
-// offset, →0 deallocates. Insert routes each PrioritizedItem to its named
-// table via FindTable (ticket ④ + ⑨).
+// Table::EnqueSampleRequest (ASYNC, ticket ⑩ 死锁修复：dispatch 不阻塞于 rate
+// limiter) → 完成回调攒进 pending_samples → DrainPendingSamples 在 dispatch
+// 线程做 UnpackChunkColumnAndSlice → memcpy result bytes into the pool
+// (refcount=1, C3) → write SAMPLE_RESP to S→C (non-blocking, stashed in
+// outbox if full, §8.7); RELEASE → Unref each offset, →0 deallocates. Insert
+// routes each PrioritizedItem to its named table via FindTable (ticket ④+⑨).
 class ShmServer {
  public:
   // Create the pool + bootstrap server. `socket_path` is the udsocket path.
@@ -145,8 +166,16 @@ class ShmServer {
   // Flush both per-flow outboxes with non-blocking S→C writes (§8.7).
   void FlushOutbox(ClientState& state);
 
-  // Sample path: Table::Sample → unpack (A1) → pool memcpy (C3) → SAMPLE_RESP.
+  // Sample path (ticket ⑩ 死锁修复，方向 A): 异步入队 Table::EnqueSampleRequest，
+  // dispatch 不阻塞于 rate limiter。完成回调在 table worker 线程把 SampledItem
+  // 攒进 ClientState::pending_samples；DrainPendingSamples 在 dispatch 线程做
+  // unpack+pool+SAMPLE_RESP（保持 pool_/outstanding_offsets_ 单线程不变式）。
+  // 未知表仍同步返 ERROR（不入队）。
   absl::Status HandleSample(ClientState& state, const ShmSampleRequest& req);
+
+  // 取出异步完成的 sample，在 dispatch 线程做 unpack+pool memcpy+写 SAMPLE_RESP
+  // （或写 ERROR on 失败/超时）。镜像 HandleInsert 的 callback→outbox 模式。
+  void DrainPendingSamples(ClientState& state);
 
   // Release path: Unref each offset, →0 deallocates (C3).
   absl::Status HandleRelease(ClientState& state,

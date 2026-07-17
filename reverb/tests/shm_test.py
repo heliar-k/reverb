@@ -727,5 +727,81 @@ class ShmMutateResetTest(absltest.TestCase):
         server.stop()
 
 
+class ShmSampleDeadlockRegressionTest(absltest.TestCase):
+    """Regression for ticket ⑩ 已确认根因：单线程 dispatch 在 HandleSample 的
+    rate-limiter 无限阻塞，造成队头阻塞——该 client 的所有后续 ACK 永远排不进
+    ring，client ReadBlocking 100% CPU 忙等、timeout 杀不掉。
+
+    修复（方向 A+C）：HandleSample 异步化（EnqueSampleRequest），dispatch 不阻塞；
+    client ReadBlocking 加有限超时兑底。本测试复现原卡死场景，断言不再卡死。
+    """
+
+    def _make_server(self, min_size=50):
+        table = reverb.Table(
+            name="t",
+            sampler=reverb.selectors.Fifo(),
+            remover=reverb.selectors.Fifo(),
+            max_size=10000,
+            max_times_sampled=1000000,
+            rate_limiter=reverb.rate_limiters.MinSize(min_size),
+        )
+        server = reverb.Server(tables=[table], in_process=True, shm=True)
+        return server, reverb.ShmClient(server.shm_socket_path)
+
+    def test_sample_blocking_rate_limiter_does_not_deadlock_mutate(self):
+        # min_size=50 但只插 1 条 → sample 在 rate limiter 上等待。修前：dispatch
+        # 被这个同步 sample 阻塞，后续 mutate 的 ACK 永远进不了 ring → client
+        # ReadBlocking 无限忙等 → timeout 杀不掉。修后：sample 异步入队不卡
+        # dispatch，mutate 迅速返回；且即便 dispatch 被卡，ReadBlocking 的 60s
+        # 硬上限也保证 client 不无限忙等。
+        server, client = self._make_server(min_size=50)
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": np.array([1.0], dtype=np.float32)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
+
+        result = {}
+
+        def sampler():
+            # timeout_ms=None → InfiniteDuration rate-limiter wait。修前这会卡死
+            # dispatch；修后 sample 异步入队，dispatch 不阻塞。
+            try:
+                for s in client.sample("t", num_samples=1, emit_timesteps=False):
+                    result["got"] = s
+            except Exception as e:  # noqa: BLE001
+                result["err"] = repr(e)
+
+        t_s = threading.Thread(target=sampler)
+        t_s.start()
+        time.sleep(2)  # let the sample request reach the server
+
+        def mutate():
+            try:
+                client.mutate_priorities("t", updates={0: 1.0})
+                result["mutate_ok"] = True
+            except Exception as e:  # noqa: BLE001
+                result["mutate_err"] = repr(e)
+
+        t_m = threading.Thread(target=mutate)
+        t_m.start()
+        # mutate must return promptly (well under the 60s ReadBlocking cap).
+        # 修前会无限阻塞。给 10s 上限（远小于 60s 兑底，证明是 A 的根治而非 C 的超时）。
+        t_m.join(timeout=10)
+        self.assertFalse(
+            t_m.is_alive(),
+            "mutate thread hung — dispatch head-of-line block not fixed",
+        )
+        # mutate succeeded (key 0 may be absent; MutateItems ignores it).
+        self.assertNotIn("mutate_err", result, f"mutate errored: {result}")
+        self.assertTrue(result.get("mutate_ok"), f"mutate did not complete: {result}")
+
+        # The sampler is still blocked on the rate limiter (min_size=50 never
+        # reached). Kill it cleanly via server.stop (releases the table) — the
+        # sampler should surface an error/cancel, not hang.
+        server.stop()
+        t_s.join(timeout=15)
+        self.assertFalse(t_s.is_alive(), "sampler thread hung after server stop")
+
+
 if __name__ == "__main__":
     absltest.main()

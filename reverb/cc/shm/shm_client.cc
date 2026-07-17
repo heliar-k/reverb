@@ -57,6 +57,14 @@ namespace {
 // poll below would spin forever on a dead server, leaving in-flight sample /
 // insert requests hanging. On server death return UnavailableError so the
 // caller surfaces a Python-raisable status instead of hanging.
+//
+// ticket ⑩ 死锁修复（方向 C）：`timeout` 是健壮性兜底上限，独立于请求自身的
+// rate-limiter timeout。即便服务端 dispatch 被其他请求阻塞（或未来出现新的阻塞
+// 路径），client 也不会无限忙等——超时返 DeadlineExceededError，让 Python 信号
+// 处理能跑、`timeout` 命令能杀。调用者应传有限值（请求 timeout 与一个硬上限取
+// 大者）；默认 InfiniteDuration 仅保留给无超时语义的老调用点。
+constexpr absl::Duration kReadBlockingHardCap = absl::Seconds(60);
+
 absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload,
                           int control_fd = -1,
                           absl::Duration timeout = absl::InfiniteDuration()) {
@@ -202,11 +210,17 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
 
   // 2. Poll the sample S→C ring for the response. A server-side timeout comes
   //    back as ERROR with DEADLINE_EXCEEDED; surface it so the worker/sampler
-  //    maps it.
+  //    maps it. ticket ⑩ 方向 C：传有限超时作健壮性兜底——rate_limiter_timeout_
+  //    无限时（默认）用 kReadBlockingHardCap，避免服务端 dispatch 被卡住时
+  //    client 无限忙等（方向 A 修了根因，但任何未来阻塞仍应有上限）。
   MsgType resp_type;
   std::string resp_body;
+  absl::Duration smp_timeout = (rate_limiter_timeout_ == absl::InfiniteDuration())
+                                   ? kReadBlockingHardCap
+                                   : rate_limiter_timeout_ + kReadBlockingHardCap;
   REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_->sample_s2c, &resp_type, &resp_body, conn_->control_fd));
+      ReadBlocking(&conn_->sample_s2c, &resp_type, &resp_body, conn_->control_fd,
+                   smp_timeout));
 
   if (resp_type == ERROR) {
     ShmError err;
@@ -391,8 +405,11 @@ absl::Status ShmClient::MutatePriorities(
 
   MsgType resp_type;
   std::string resp_body;
+  // ticket ⑩ 方向 C：控制面 ACK 等待用有限硬上限，避免 dispatch 被卡时 client
+  // 无限忙等（mutate/reset 本身不含超时语义，靠此兜底）。
   REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd));
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
+                   kReadBlockingHardCap));
 
   if (resp_type == ERROR) {
     // mirror FetchOne's error mapping: NOT_FOUND -> NotFoundError (Python
@@ -433,8 +450,10 @@ absl::Status ShmClient::Reset(const std::string& table) {
 
   MsgType resp_type;
   std::string resp_body;
+  // ticket ⑩ 方向 C：控制面 ACK 等待用有限硬上限（同 MutatePriorities）。
   REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd));
+      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
+                   kReadBlockingHardCap));
 
   if (resp_type == ERROR) {
     ShmError err;

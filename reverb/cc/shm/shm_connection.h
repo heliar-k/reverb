@@ -85,6 +85,12 @@ struct ShmConnection {
   // (sample_c2s/sample_s2c, ShmSampler's worker) is untouched and stays
   // lock-free — the mutex only contends when a control-plane call overlaps
   // an in-flight insert, which is rare.
+  //
+  // ticket ⑩ 死锁复盘（2026-07-17）：此 mutex 曾被静态分析怀疑为偶发死锁根因
+  // （锁范围覆盖 read ACK），但 gdb 抓栈证明无辜——真根因是服务端单线程
+  // dispatch 在 HandleSample 的 rate-limiter 无限阻塞（队头阻塞），已由方向 A
+  // （HandleSample 异步化）修复，见 shm_server.cc / tickets.md ⑩。此 mutex 保持
+  // 原样：序列化整个 round-trip 反而防止两个生产者同时写 insert_c2s，是正确的。
   // ponytail: one mutex on the existing insert flow instead of a third
   // dedicated control ring pair. Ceiling: control-plane ops (mutate/reset)
   // serialize against in-flight inserts on this client; the hot sample path

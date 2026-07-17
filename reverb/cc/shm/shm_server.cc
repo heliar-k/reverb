@@ -231,6 +231,7 @@ void ShmServer::DispatchLoop() {
       // block sample responses, and vice versa.
       HandleInsertRequests(i);
       HandleSampleRequests(i);
+      DrainPendingSamples(*clients_[i]);
       FlushOutbox(*clients_[i]);
     }
     for (auto it = dead.rbegin(); it != dead.rend(); ++it) {
@@ -594,99 +595,220 @@ absl::Status ShmServer::HandleSample(ClientState& state,
   }
   std::shared_ptr<Table> table = *std::move(table_or);
 
-  // 1. Sample from the routed Table. This may block on the rate limiter up to
-  //    `timeout_ms` (ponytail: blocks all clients while one waits; per-client
-  //    dispatch thread later, spec §8.7).
+  // ticket ⑩ 死锁修复（方向 A）：异步采样。原来的 table->Sample() 同步调用会在
+  // rate limiter 上阻塞整个 dispatch 线程（timeout_ms<0 时无限等），造成队头阻塞——
+  // 该 client 的所有后续 insert/mutate/sample ACK 永远排不进 ring，client
+  // ReadBlocking 100% CPU 忙等、timeout 杀不掉。gdb 抓栈确认（见 ⑩ 「已确认根因」）。
+  //
+  // 改用 EnqueSampleRequest 入 table worker 异步队列，dispatch 立即返回不阻塞。
+  // 完成回调在 table worker 线程触发，不能直接碰 pool_/outstanding_offsets_
+  // （单线程 dispatch 不变式），故把 SampledItem + status 攒进
+  // ClientState::pending_samples，dispatch 线程每轮 DrainPendingSamples 取出做
+  // unpack+pool+SAMPLE_RESP。镜像 HandleInsert 的 callback→dispatch-drain 模式。
+  //
+  // timeout 传给 EnqueSampleRequest（table worker 的 GetExpiredRequests 处理超时，
+  // callback 收到 DeadlineExceeded status）。timeout_ms<0 仍映射 InfiniteDuration
+  // ——但现在阻塞发生在 table worker 线程，不卡 dispatch。
   absl::Duration timeout = (req.timeout_ms() < 0)
                                ? absl::InfiniteDuration()
                                : absl::Milliseconds(req.timeout_ms());
-  Table::SampledItem item;
-  absl::Status sample_status = table->Sample(&item, timeout);
-  if (!sample_status.ok()) {
-    // Map timeout (and rate-limiter timeout) to a ShmError the client surfaces.
-    ShmError err;
-    err.set_code(absl::IsDeadlineExceeded(sample_status)
-                     ? ShmError::DEADLINE_EXCEEDED
-                     : ShmError::INTERNAL);
-    err.set_message(std::string(sample_status.message()));
-    std::string body;
-    err.SerializeToString(&body);
-    return EnqueueSampleS2C(state, ERROR, body);
+  ClientState* state_ptr = &state;
+  ShmSampleRequest req_copy = req;  // 回调攥住请求（table 名等在回调里不再用，
+                                    // 但保留以备将来按请求配对）
+  // Keepalive + 自清：shared_ptr<SamplingCallback> 存 pending_sample_callbacks
+  //（入队时 push_back，使 EnqueSampleRequest 的 weak_ptr 可 lock）。回调触发时
+  // 按裸指针 key 从 vector erase 自己的 shared_ptr 拷贝。
+  //
+  // 裸指针获取的 bootstrap 问题：cb_raw 在 make_shared 后才有值，lambda 捕获在
+  // make_shared 时冻结，按值捕获会冻结为 nullptr，按引用捕获局部变量会悬空
+  //（HandleSample 返回后栈帧销毁）。解法：把裸指针存在堆上 shared_ptr 控制块里
+  //（cb_raw_box），按值捕获该 shared_ptr；make_shared 后赋值 *cb_raw_box =
+  // cb.get()，lambda 触发时读到正确值。
+  //
+  // 安全性：erase 发生在回调体内，此时 FinalizeSampleRequest 持另一份 shared_ptr
+  // 拷贝（来自 weak_ptr.lock()），erase vector 里的拷贝不会析构正在执行的回调
+  // 对象。erase 后只剩 FinalizeSampleRequest 的拷贝，回调返回后拷贝销毁、对象析构。
+  //
+  // 这比「FIFO 弹出」正确——table worker 可能乱序完成请求（rate limiter 不满足
+  // 时把请求放回 current_sampling，后入队的可能先完成），FIFO 会弹错 keepalive
+  // 导致 weak_ptr.lock() 失败、callback 不触发、sample 永远不回来。
+  // ponytail: O(n) scan erase，n=in-flight sample 数（受 sampler 队列容量限，<=8）。
+  // Ceil: 高并发可改 hash_set 按指针查。Upgrade: 同。
+  auto cb_raw_box = std::make_shared<Table::SamplingCallback*>();
+  auto cb = std::make_shared<Table::SamplingCallback>(
+      [state_ptr, cb_raw_box, req_copy = std::move(req_copy)](
+          Table::SampleRequest* sample) mutable {
+        ClientState::PendingSample ps;
+        ps.req = std::move(req_copy);
+        ps.status = sample->status;
+        if (sample->status.ok() && !sample->samples.empty()) {
+          ps.item = std::move(sample->samples.front());
+        }
+        absl::MutexLock lock(&state_ptr->pending_samples_mu);
+        state_ptr->pending_samples.push_back(std::move(ps));
+        // 自清 keepalive：erase 指向自己的 shared_ptr 拷贝。
+        Table::SamplingCallback* raw = *cb_raw_box;
+        auto& cbs = state_ptr->pending_sample_callbacks;
+        for (auto it = cbs.begin(); it != cbs.end(); ++it) {
+          if (it->get() == raw) {
+            cbs.erase(it);
+            break;
+          }
+        }
+      });
+  *cb_raw_box = cb.get();  // make_shared 后赋值，lambda 按值捕获 cb_raw_box 读到此值
+  {
+    absl::MutexLock lock(&state.pending_samples_mu);
+    state.pending_sample_callbacks.push_back(cb);
+  }
+  table->EnqueSampleRequest(/*num_samples=*/1, cb, timeout);
+  return absl::OkStatus();
+}
+
+void ShmServer::DrainPendingSamples(ClientState& state) {
+  // ticket ⑩ 死锁修复（方向 A）：在 dispatch 线程消费异步完成的 sample。取出
+  // pending_samples，每个做 unpack+pool memcpy+写 SAMPLE_RESP（或写 ERROR on
+  // 失败/超时）。pool_/outstanding_offsets_ 仍只被 dispatch 线程碰，不变式保持。
+  //
+  // keepalive 清理：回调触发时按裸指针 key 自清 erase 自己的 shared_ptr 拷贝
+  //（见 HandleSample 的 cb_raw_box 模式）。这里只 drain pending_samples。
+  std::vector<ClientState::PendingSample> done;
+  {
+    absl::MutexLock lock(&state.pending_samples_mu);
+    done.swap(state.pending_samples);
   }
 
-  // 2. Unpack each column on the dispatch thread (A1: single-threaded alloc).
-  //    Mirror AsSample (sampler.cc): walk flat_trajectory().columns(), for each
-  //    chunk slice call UnpackChunkColumnAndSlice. Then concatenate the slices
-  //    of a column into one TensorBuffer (the trajectory view), applying the
-  //    squeeze flag — exactly as Sample::AsTrajectory does.
-  internal::flat_hash_map<uint64_t, std::shared_ptr<ChunkStore::Chunk>> chunks;
-  for (auto& chunk : item.ref->chunks()) chunks[chunk->key()] = chunk;
+  for (auto& ps : done) {
+    // 失败/超时 → ShmError on sample s2c（镜像旧路径）。
+    if (!ps.status.ok()) {
+      ShmError err;
+      err.set_code(absl::IsDeadlineExceeded(ps.status) ? ShmError::DEADLINE_EXCEEDED
+                                                        : ShmError::INTERNAL);
+      err.set_message(std::string(ps.status.message()));
+      std::string body;
+      err.SerializeToString(&body);
+      (void)EnqueueSampleS2C(state, ERROR, body);
+      continue;
+    }
+    // 成功：unpack + pool + SAMPLE_RESP。以下与原同步 HandleSample 第 2-3 步同。
+    const Table::SampledItem& item = ps.item;
+    if (item.ref == nullptr) {
+      // 空采样项（不应发生，但防御）→ INTERNAL error。
+      ShmError err;
+      err.set_code(ShmError::INTERNAL);
+      err.set_message("ShmServer: async sample returned empty item");
+      std::string body;
+      err.SerializeToString(&body);
+      (void)EnqueueSampleS2C(state, ERROR, body);
+      continue;
+    }
+    // 2. Unpack each column on the dispatch thread (A1: single-threaded alloc).
+    //    Mirror AsSample (sampler.cc): walk flat_trajectory().columns(), for each
+    //    chunk slice call UnpackChunkColumnAndSlice. Then concatenate the slices
+    //    of a column into one TensorBuffer (the trajectory view), applying the
+    //    squeeze flag — exactly as Sample::AsTrajectory does.
+    internal::flat_hash_map<uint64_t, std::shared_ptr<ChunkStore::Chunk>> chunks;
+    for (auto& chunk : item.ref->chunks()) chunks[chunk->key()] = chunk;
 
-  ShmSampleResponse resp;
-  ShmSample* sample = resp.add_samples();
+    ShmSampleResponse resp;
+    ShmSample* sample = resp.add_samples();
 
-  // SampleInfo: key, priority, times_sampled, probability, table_size,
-  // rate_limited — mirrors AsSample (sampler.cc).
-  auto* info = sample->mutable_info();
-  info->mutable_item()->set_key(item.ref->key());
-  info->mutable_item()->set_priority(item.priority);
-  info->mutable_item()->set_times_sampled(item.times_sampled);
-  info->set_probability(item.probability);
-  info->set_table_size(item.table_size);
-  info->set_rate_limited(item.rate_limited);
+    // SampleInfo: key, priority, times_sampled, probability, table_size,
+    // rate_limited — mirrors AsSample (sampler.cc).
+    auto* info = sample->mutable_info();
+    info->mutable_item()->set_key(item.ref->key());
+    info->mutable_item()->set_priority(item.priority);
+    info->mutable_item()->set_times_sampled(item.times_sampled);
+    info->set_probability(item.probability);
+    info->set_table_size(item.table_size);
+    info->set_rate_limited(item.rate_limited);
 
-  const auto& columns = item.ref->flat_trajectory().columns();
-  for (int ci = 0; ci < columns.size(); ci++) {
-    const auto& column = columns[ci];
-    // Gather the column's unpacked slices.
-    std::vector<TensorBuffer> slices;
-    slices.reserve(column.chunk_slices_size());
-    for (const auto& slice : column.chunk_slices()) {
-      auto it = chunks.find(slice.chunk_key());
-      if (it == chunks.end()) {
-        return absl::InternalError(
-            absl::StrCat("ShmServer: chunk ", slice.chunk_key(),
-                         " not found when unpacking item ", item.ref->key()));
+    const auto& columns = item.ref->flat_trajectory().columns();
+    bool unpack_ok = true;
+    absl::Status unpack_status;
+    for (int ci = 0; ci < columns.size(); ci++) {
+      const auto& column = columns[ci];
+      // Gather the column's unpacked slices.
+      std::vector<TensorBuffer> slices;
+      slices.reserve(column.chunk_slices_size());
+      for (const auto& slice : column.chunk_slices()) {
+        auto it = chunks.find(slice.chunk_key());
+        if (it == chunks.end()) {
+          unpack_status = absl::InternalError(absl::StrCat(
+              "ShmServer: chunk ", slice.chunk_key(),
+              " not found when unpacking item ", item.ref->key()));
+          unpack_ok = false;
+          break;
+        }
+        slices.emplace_back();
+        auto s = internal::UnpackChunkColumnAndSlice(
+            it->second->data(), slice, &slices.back());
+        if (!s.ok()) {
+          unpack_status = s;
+          unpack_ok = false;
+          break;
+        }
       }
-      slices.emplace_back();
-      REVERB_RETURN_IF_ERROR(internal::UnpackChunkColumnAndSlice(
-          it->second->data(), slice, &slices.back()));
+      if (!unpack_ok) break;
+
+      // Concatenate the column's slices into one batched trajectory tensor
+      // (matches Sample::AsTrajectory: single-slice columns move, multi-slice
+      // Concat along dim 0). The squeeze is applied CLIENT-side by
+      // Sample::AsTrajectory (we send the batched tensor + the squeeze flag),
+      // so the server and client mirror the local AsSample path exactly.
+      TensorBuffer column_tensor;
+      if (slices.size() == 1) {
+        column_tensor = std::move(slices[0]);
+      } else {
+        auto concat = TensorBuffer::Concat(slices);
+        if (!concat.status().ok()) {
+          unpack_status = concat.status();
+          unpack_ok = false;
+          break;
+        }
+        column_tensor = *std::move(concat);
+      }
+
+      bool squeeze = column.squeeze();
+
+      // 3. memcpy the result bytes into the pool (C3: refcount starts at 1).
+      absl::string_view bytes = column_tensor.bytes();
+      auto offset_or = pool_.Allocate(bytes.size());
+      if (!offset_or.ok()) {
+        unpack_status = offset_or.status();
+        unpack_ok = false;
+        break;
+      }
+      uint64_t offset = *offset_or;
+      pool_.Ref(offset);  // C3: refcount = 1 for the outstanding sample bytes
+      std::memcpy(pool_.At(offset), bytes.data(), bytes.size());
+
+      state.outstanding_offsets_.insert(offset);
+
+      ShmColumn* col = sample->add_columns();
+      col->set_shm_offset(offset);
+      col->set_length(bytes.size());
+      *col->mutable_spec() = TensorSpecFromBuffer(column_tensor);
+      col->set_squeeze(squeeze);
     }
 
-    // Concatenate the column's slices into one batched trajectory tensor
-    // (matches Sample::AsTrajectory: single-slice columns move, multi-slice
-    // Concat along dim 0). The squeeze is applied CLIENT-side by
-    // Sample::AsTrajectory (we send the batched tensor + the squeeze flag),
-    // so the server and client mirror the local AsSample path exactly.
-    TensorBuffer column_tensor;
-    if (slices.size() == 1) {
-      column_tensor = std::move(slices[0]);
-    } else {
-      auto concat = TensorBuffer::Concat(slices);
-      REVERB_RETURN_IF_ERROR(concat.status());
-      column_tensor = *std::move(concat);
+    if (!unpack_ok) {
+      // unpack/alloc 失败：回收本轮已分配的 offset，写 ERROR。
+      ShmError err;
+      err.set_code(ShmError::INTERNAL);
+      err.set_message(std::string(unpack_status.message()));
+      std::string body;
+      err.SerializeToString(&body);
+      (void)EnqueueSampleS2C(state, ERROR, body);
+      REVERB_LOG(REVERB_WARNING) << "ShmServer: drain sample failed: "
+                                 << unpack_status;
+      continue;
     }
 
-    bool squeeze = column.squeeze();
-
-    // 3. memcpy the result bytes into the pool (C3: refcount starts at 1).
-    absl::string_view bytes = column_tensor.bytes();
-    REVERB_ASSIGN_OR_RETURN(uint64_t offset, pool_.Allocate(bytes.size()));
-    pool_.Ref(offset);  // C3: refcount = 1 for the outstanding sample bytes
-    std::memcpy(pool_.At(offset), bytes.data(), bytes.size());
-
-    state.outstanding_offsets_.insert(offset);
-
-    ShmColumn* col = sample->add_columns();
-    col->set_shm_offset(offset);
-    col->set_length(bytes.size());
-    *col->mutable_spec() = TensorSpecFromBuffer(column_tensor);
-    col->set_squeeze(squeeze);
+    std::string body;
+    resp.SerializeToString(&body);
+    (void)EnqueueSampleS2C(state, SAMPLE_RESP, body);
   }
-
-  std::string body;
-  resp.SerializeToString(&body);
-  return EnqueueSampleS2C(state, SAMPLE_RESP, body);
 }
 
 absl::Status ShmServer::HandleRelease(ClientState& state,
