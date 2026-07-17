@@ -137,10 +137,11 @@ class ShmClient {
   // ponytail: the plain Writer (writer.h) has no SHM seam — its local ctor
   // takes a tables map, but an SHM client holds no tables (the server does).
   // Adding an SHM transport to Writer would duplicate RunShmWorker's logic for
-  // a legacy API. Deferred: callers that need SHM inserts should use
-  // NewTrajectoryWriter / NewStructuredWriter. Upgrade: either add an SHM
-  // ctor to Writer mirroring TrajectoryWriter's, or deprecate Writer for SHM
-  // clients. TODO(④): implement if a caller needs it.
+  // a legacy API. Won't fix: callers needing SHM inserts should use
+  // NewTrajectoryWriter / NewStructuredWriter. The Python layer (ShmClient)
+  // overrides `writer`/`insert` to raise NotImplementedError before reaching
+  // here; this C++ stub remains as a defensive UnimplementedError for direct
+  // pybind callers.
   absl::Status NewWriter(int chunk_length, int max_timesteps,
                          bool delta_encoded, int max_in_flight_items,
                          std::unique_ptr<Writer>* writer);

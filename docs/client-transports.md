@@ -13,12 +13,12 @@
 | 同进程内嵌训练，零开销 | `LocalClient` | `Server(in_process=True).in_process_client` |
 | 同机跨进程，要最快采样 | `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` |
 | 跨机 / 分布式 / 需要全套控制面 | gRPC `Client` | `reverb.Client('host:port')` |
-| 需 pickle 客户端（如多进程 worker 持有） | 只能 gRPC `Client` | — |
+| 需 pickle 客户端（如多进程 worker 持有） | gRPC `Client` 或 `ShmClient` | — |
 | 需要 `checkpoint` | gRPC 或 `LocalClient` | — |
 | 需要实时 `server_info`（反映 `Table.replace`） | gRPC 或 `LocalClient` | — |
 
 一句话：**能内嵌就 `LocalClient`；要跨进程就要么 gRPC（图省事/要全套 API）要么
-`ShmClient`（图采样性能）；要 pickle 只能 gRPC。**
+`ShmClient`（图采样性能）；要 pickle 用 gRPC 或 `ShmClient`（后者限同机）。**
 
 ## 1. 总览对比
 
@@ -28,7 +28,7 @@
 | 性能 | 基线 | 最快（零网络 / 零序列化） | ~9–11× gRPC loopback（见 [shm-benchmark.md](shm-benchmark.md)） |
 | 构造 | `Client('localhost:port')` | `server.in_process_client` | `reverb.ShmClient(server.shm_socket_path)` |
 | 持有 | gRPC channel | 进程内 Table 指针 | SHM mmap + ring 状态 |
-| `pickle` | ✅ 支持（存 `server_address`） | ❌ 不可（持进程内指针） | ❌ 不可（持 mmap + ring） |
+| `pickle` | ✅ 支持（存 `server_address`） | ❌ 不可（持进程内指针） | ✅ 支持（存 `socket_path`，反序列化重连，ticket ⑫） |
 | 多表 | ✅ 全部表 | ✅ 全部表 | ✅ 全部表（按表名路由，ticket ⑨） |
 | `sample` 的 `timeout_ms` | ⚠️ **静默忽略**（gRPC `NewSampler` 无 timeout 参数） | ✅ 生效（超时抛 `DeadlineExceededError`） | ✅ 生效（超时抛 `DeadlineExceededError`） |
 | `sample` 默认 `emit_timesteps` | `True` | `True` | `True`（三者统一） |
@@ -36,7 +36,7 @@
 | `mutate_priorities` / `reset` | ✅ | ✅ | ✅（ticket ⑩，走 insert 流 + 客户端互斥锁） |
 | `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ❌ 不支持 |
 | `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM） |
-| `writer`（legacy）/ `insert` | ✅ | ✅ | ❌ **`NewWriter` 返回 `UnimplementedError`** |
+| `writer`（legacy）/ `insert` | ✅ | ✅ | ❌ **Python 层抛 `NotImplementedError`**（ticket ⑬） |
 
 ## 2. API 覆盖面
 
@@ -47,18 +47,20 @@
 sample              ✅          ✅              ✅
 trajectory_writer   ✅          ✅              ✅
 structured_writer   ✅          ✅              ✅
-writer (legacy)     ✅          ✅              ❌ UnimplementedError
-insert              ✅          ✅              ❌ (内部依赖 writer)
+writer (legacy)     ✅          ✅              ❌ NotImplementedError (Python 层)
+insert              ✅          ✅              ❌ NotImplementedError (Python 层)
 mutate_priorities   ✅          ✅              ✅（ticket ⑩）
 reset               ✅          ✅              ✅（ticket ⑩）
 server_info         ✅ 真实      ✅ 真实          ✅ bootstrap 快照
 checkpoint          ✅          ✅              ❌
 ```
 
-**`ShmClient` 继承了用不了的 `insert`/`writer`**：因为 `_BaseClient.insert`
-内部调 `self.writer` → `self._client.NewWriter`，而 SHM 的 `NewWriter` 是
-`UnimplementedError`。所以 `shm_client.insert(...)` 能写、能编译，**运行时抛错**。
-SHM 写入只能走 `trajectory_writer` / `structured_writer`。
+**`ShmClient` 覆盖了 `insert`/`writer`**：因为 legacy `Writer`（writer.h）没有
+SHM seam（其本地 ctor 要 tables map，SHM client 不持表），为其复刻
+`RunShmWorker` 不划算。`ShmClient` 在 Python 层直接覆盖两者抛清晰的
+`NotImplementedError("...use trajectory_writer or structured_writer")`
+（ticket ⑬），不再走到底层 C++ 的 `UnimplementedError`。SHM 写入只能走
+`trajectory_writer` / `structured_writer`。
 
 ## 3. 三种使用样例
 
@@ -143,14 +145,16 @@ finally:
 
 ## 5. 常见陷阱
 
-### 5.1 `ShmClient.insert` / `ShmClient.writer` 运行时抛错
+### 5.1 `ShmClient.insert` / `ShmClient.writer` 抛 `NotImplementedError`
 
-`insert` 和 `writer` 是从 `_BaseClient` 继承的，但 SHM 的 `NewWriter` 返回
-`UnimplementedError`。**SHM 写入只能用 `trajectory_writer` / `structured_writer`。**
+`insert` 和 `writer` 是从 `_BaseClient` 继承的，但 legacy `Writer`（writer.h）
+没有 SHM seam（其本地 ctor 要 tables map，SHM client 不持表）。`ShmClient` 在
+Python 层覆盖两者，直接抛清晰的 `NotImplementedError`（ticket ⑬），不再走到底层
+C++ `UnimplementedError`。**SHM 写入只能用 `trajectory_writer` / `structured_writer`。**
 
 ```python
 client = reverb.ShmClient(server.shm_socket_path)
-client.insert(data, {'t': 1.0})   # ❌ 运行时 UnimplementedError
+client.insert(data, {'t': 1.0})   # ❌ NotImplementedError (Python 层)
 with client.trajectory_writer(3) as w: ...   # ✅
 ```
 
@@ -186,11 +190,15 @@ gRPC / `LocalClient`。
 跨 transport 迁移代码时注意：在 gRPC 上"能等"的调用，换 SHM/Local 加了 `timeout_ms`
 后可能开始抛超时。
 
-### 5.5 只有 gRPC `Client` 能 pickle
+### 5.5 pickle：gRPC `Client` 与 `ShmClient` 可 pickle，`LocalClient` 不可
 
-`LocalClient` / `ShmClient` 都不可 pickle（持进程内指针 / mmap 状态）。
-若要把客户端分发给多进程 worker（如 `multiprocessing.Pool` 的 initializer 持有客户端），
-只能用 gRPC `Client`——它 pickle 时只存 `server_address`，子进程反序列化后重连。
+`LocalClient` 持进程内 `Table` 指针，不可 pickle。gRPC `Client` pickle 时只存
+`server_address`，子进程反序列化后重连。`ShmClient` 同理：pickle 时只存
+`socket_path`，反序列化调用 `__init__` → `ShmClient::Connect`（重新 bootstrap +
+mmap 五段 SHM），原进程的 mmap/ring 状态留在原进程、随原 client 销毁释放，无跨
+进程泄漏（ticket ⑫）。要分发客户端到多进程 worker（如 `multiprocessing.Pool`
+的 initializer）时，`ShmClient` 现在也可 pickle——前提是 worker 与 server 同机
+（SHM 本来就只跨进程不跨机）。
 
 ### 5.6 `emit_timesteps` 默认值已统一
 

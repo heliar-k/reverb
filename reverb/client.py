@@ -21,7 +21,6 @@ possible.
 """
 
 import logging
-import pickle
 from typing import Any, Dict, Generator, List, Literal, Optional, Union, overload
 
 import numpy as np
@@ -848,11 +847,30 @@ class ShmClient(_BaseClient):
         return f"ShmClient(socket_path={self._socket_path})"
 
     def __reduce__(self):
-        # Holds SHM mmap + ring state (cross-process pointers); not picklable,
-        # mirroring LocalClient. Upgrade: re-connect by socket_path if needed.
-        raise pickle.PicklingError(
-            "ShmClient is not picklable; it holds shared-memory mmap state. "
-            "Reconnect with ShmClient(socket_path) after unpickling."
+        # Pickle stores only the socket_path; unpickle re-connects via __init__
+        # (which calls ShmClient::Connect: bootstrap + fresh mmap of the five
+        # SHM segments). The old in-process mmap/ring/fd state stays in the
+        # pickling process and is released when that process tears down the
+        # original ShmClient — no leak across the pickle boundary.
+        return self.__class__, (self._socket_path,)
+
+    def writer(self, *args, **kwargs):
+        # Legacy `Writer` (writer.h) has no SHM transport seam: its local ctor
+        # takes a tables map the SHM client doesn't hold, and wiring SHM would
+        # duplicate RunShmWorker for a deprecated API. Raise a clear Python-side
+        # error instead of letting it reach the C++ UnimplementedError. Use
+        # `trajectory_writer` / `structured_writer` for SHM inserts.
+        raise NotImplementedError(
+            "ShmClient does not support the legacy writer/insert; use "
+            "trajectory_writer or structured_writer instead."
+        )
+
+    def insert(self, data, priorities: Dict[str, float]):
+        # `insert` is sugar over `writer` (see _BaseClient.insert); the legacy
+        # writer path has no SHM seam, so block it here with the same message.
+        raise NotImplementedError(
+            "ShmClient does not support the legacy writer/insert; use "
+            "trajectory_writer or structured_writer instead."
         )
 
     def _fetch_server_info_proto(self, timeout: Optional[int]):

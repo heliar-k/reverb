@@ -76,9 +76,9 @@ client ndarray
 | S7 | SHM 池与现有 ChunkStore 并存，但 SHM 字节是**瞬态传输缓冲**（insert 字节在 INSERT_ACK 后 RELEASE 回收，sample 字节在 client 读后 RELEASE 回收），仅在传输瞬间与 ChunkStore 双份 | 现有 Table / ChunkStore / sampler 零改动；避免 SHM 池永久占双份内存 |
 | S8 | insert：client 把 chunker 已压缩的 `ChunkData` proto 序列化后 memcpy 进 SHM，server 反序列化存档（不再二次压缩） | 复用 chunker 现有压缩；server 零压缩。注：与早期“client 送原始字节、server 压缩”设想不同，实现采用 proto 序列化简化多列处理（见 §8.5） |
 | S9 | sample：server 预切片成成品字节进 SHM，client 直接读 | client 侧零计算；每次独立分配不复用 |
-| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 （`server_info` 已实现 bootstrap 快照 ticket ⑧；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；仅 `checkpoint` 待补） |
+| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 （`server_info` 已实现 bootstrap 快照 ticket ⑧；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；`ShmClient` 已可 pickle ticket ⑫；仅 `checkpoint` 待补 ticket ⑪） |
 | S11 | Python 新增 `ShmClient`，镜像 `_BaseClient` | API 一致；三路并列 |
-| S12 | 支持 trajectory_writer / structured_writer（insert 经 trajectory_writer 的 SHM 路径实现）；plain `Writer` 仍未实现（v2 补） | writer backpressure 经反向 ring confirm |
+| S12 | 支持 trajectory_writer / structured_writer（insert 经 trajectory_writer 的 SHM 路径实现）；plain `Writer` won't fix（无 SHM seam，Python 层 `NotImplementedError`，ticket ⑬） | writer backpressure 经反向 ring confirm |
 | S13 | 崩溃恢复：udsocket 断连检测 + 集中释放该 client SHM 偏移 | 简单可靠 |
 | S14 | 字节池满：阻塞等待，对齐全语义 | 不报错、不丢数据 |
 | S15 | SHM 用 POSIX `shm_open` | 跨平台、与 udsocket 配合自然 |
@@ -242,8 +242,11 @@ sequenceDiagram
 - **C++ `ShmClient`**：持 `ShmConnection`（udsocket fd + 五段 mmap：pool +
   insert_c2s/s2c + sample_c2s/s2c ring 读写器）。方法镜像 `InProcessClient`：
   `Sample` / `NewTrajectoryWriter` / `NewStructuredWriter` / `NewSampler`。
-  v1 **未实现** `Insert`（plain `Writer`）/ `MutatePriorities` / `Reset` /
-  `Checkpoint` / `ServerInfo`（返回空，见 S10）。
+  `MutatePriorities` / `Reset` 已实现（ticket ⑩，走 insert 流）；`ServerInfo`
+  返回 bootstrap 快照（ticket ⑧）；`Checkpoint` 未实现。`Insert`（plain `Writer`）
+  **won't fix**——legacy `Writer` 无 SHM seam，Python 层覆盖为 `NotImplementedError`
+  （ticket ⑬），用 `trajectory_writer` / `structured_writer`。`ShmClient` 可 pickle
+  （ticket ⑫，存 `socket_path` 重连）。
 - **trajectory_writer**：chunker/column 逻辑在 client 进程（复用现有
   `TrajectoryWriter`，只把 `RunLocalWorker` 的 `InsertOrAssignAsync` 换成
   `RunShmWorker`：ALLOCATE 申请偏移 → memcpy 序列化 `ChunkData` proto → INSERT →
@@ -264,7 +267,7 @@ sequenceDiagram
   `shm=True` 时起 `ShmServer`（含 udsocket + 字节池），`server.shm_socket_path`
   供 client 连。可与 `in_process` / `port` 组合或互斥（见 §5）。v1 `ShmServer` 只
   持一张表（`tables[0]`），多表待后续。（已实现，ticket ⑨：按表名路由全部表）
-- 无 pickle（同 LocalClient，持 SHM mmap 指针不可序列化）。
+- pickle 已支持（ticket ⑫）：`__reduce__` 返回 `(ShmClient, (socket_path,))`，反序列化重连，无跨进程泄漏。
 
 ## 5. 模式组合矩阵
 
@@ -288,14 +291,12 @@ sequenceDiagram
   可作为 v2 优化。
 - **insert（单步）API**：经 `trajectory_writer` 的 `RunShmWorker` 路径已实现
   （ALLOCATE → memcpy 序列化 proto → INSERT → INSERT_ACK → RELEASE）；plain
-  `Writer` 类的 SHM 路径仍未实现（`NewWriter` 返回 `UnimplementedError`），v2 补。
-- **控制面冷路径**：`mutate_priorities` / `reset` / `checkpoint` / `server_info`
-  在 SHM 路径未实现（`ShmClient.server_info()` 返回空），v2 补。热路径
-  （sample/insert）已完整。
-  （`mutate_priorities`/`reset` 已实现，ticket ⑩：走 insert 流 + 客户端互斥
-  锁 `ShmConnection::insert_flow_mu`，串行化控制面与 RunShmWorker 的
-  insert 轮次以保 SPSC 不变式；`server_info` 已实现 bootstrap 快照，
-  ticket ⑧；仅 `checkpoint` 仍待补。）
+  `Writer` 类的 SHM 路径 **won't fix**（无 SHM seam，Python 层覆盖为
+  `NotImplementedError`，ticket ⑬），用 `trajectory_writer` / `structured_writer`。
+- **控制面冷路径**：`mutate_priorities` / `reset` / `server_info` 已实现
+  （`mutate_priorities`/`reset` 走 insert 流 + 客户端互斥锁，ticket ⑩；
+  `server_info` 为 bootstrap 快照，ticket ⑧）；`checkpoint` 仍待补（ticket ⑪）。
+  热路径（sample/insert）已完整。
 - **多 server 进程**：本文档不涉及（一个 server 进程，多 client）。v1 `ShmServer`
   只持一张表（`tables[0]`），多表待后续。（已实现，ticket ⑨：按表名路由全部表）
 - **SHM 段权限**：POSIX shm 默认仅同用户。跨用户场景需 `chmod`/`chown`，后续按需。

@@ -265,23 +265,70 @@ class ShmServerLifecycleTest(absltest.TestCase):
         self.assertFalse(os.path.exists(path), f"socket not cleaned up: {path}")
 
 
-class ShmClientNotPicklableTest(absltest.TestCase):
-    """R13: ShmClient holds SHM mmap + ring state -> not picklable."""
+class ShmClientPicklableTest(absltest.TestCase):
+    """ticket ⑫: ShmClient pickles by socket_path and re-connects on unpickle.
 
-    def test_pickle_raises_pickling_error(self):
+    __reduce__ returns (ShmClient, (socket_path,)); unpickle calls __init__ →
+    ShmClient::Connect (fresh bootstrap + mmap). The original client's mmap/ring
+    state stays in the pickling process. No cross-process leak.
+    """
+
+    def test_pickle_roundtrip_reconnects_by_socket_path(self):
         server, client = _make_shm_server()
-        # ShmClient.__reduce__ raises pickle.PicklingError specifically (not
-        # the looser TypeError/ValueError union): the SHM mmap + ring state
-        # can't survive a pickle round-trip. Reconnect by socket_path instead.
-        with self.assertRaises(pickle.PicklingError):
-            pickle.dumps(client)
+        _insert_one(client, "t", 1.0)
+        client2 = pickle.loads(pickle.dumps(client))
+        # New connection: a fresh ShmClient sharing the same server.
+        self.assertIsInstance(client2, reverb.ShmClient)
+        self.assertEqual(client2._socket_path, client._socket_path)
+        # Original server still serves both clients.
+        samples = list(client2.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertEqual(len(samples), 1)
 
-    def test_pickle_error_message_guides_recovery(self):
+    def test_pickled_client_can_insert_and_sample(self):
+        server, client = _make_shm_server()
+        client2 = pickle.loads(pickle.dumps(client))
+        _insert_one(client2, "t", 42.0)
+        # The inserted item is visible to the original client too (same table).
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        np.testing.assert_array_equal(
+            np.asarray(samples[0].data[0]).reshape(-1), [42.0]
+        )
+
+    def test_original_client_still_usable_after_pickle(self):
+        server, client = _make_shm_server()
+        _ = pickle.dumps(client)
+        # Pickling does not tear down the source client's connection.
+        _insert_one(client, "t", 7.0)
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        np.testing.assert_array_equal(np.asarray(samples[0].data[0]).reshape(-1), [7.0])
+
+
+class ShmClientLegacyWriterInsertNotImplementedTest(absltest.TestCase):
+    """ticket ⑬: ShmClient raises clear NotImplementedError for legacy
+    writer/insert (no SHM seam for the plain Writer) instead of reaching the
+    C++ UnimplementedError at runtime."""
+
+    def test_writer_raises_not_implemented(self):
         server, client = _make_shm_server()
         with self.assertRaisesRegex(
-            pickle.PicklingError, r"Reconnect with ShmClient\(socket_path\)"
+            NotImplementedError, r"trajectory_writer or structured_writer"
         ):
-            pickle.dumps(client)
+            client.writer(max_sequence_length=1)
+
+    def test_insert_raises_not_implemented(self):
+        server, client = _make_shm_server()
+        with self.assertRaisesRegex(
+            NotImplementedError, r"trajectory_writer or structured_writer"
+        ):
+            client.insert(np.asarray(1.0), {"t": 1.0})
+
+    def test_trajectory_writer_still_works(self):
+        # The supported path is unaffected by the legacy overrides.
+        server, client = _make_shm_server()
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": np.asarray(1.0)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
 
 
 class ShmClientReprTest(absltest.TestCase):

@@ -4,8 +4,8 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 全部序列化与压缩。源 spec：`docs/numpy-shm-spec.md`（含决策 S1–S15、C1–C5、R1–R13）。
 
 > **v1 状态：已完成。** ticket ①-⑦ 全部落地，`bazel test //reverb/cc/shm:*` 8/8 绿，
-> Python e2e（`reverb/tests/shm_test.py`）通过。仅 ④ 的 plain Writer SHM 路径有意
-> 延期（见 `[~]`，无 SHM seam，⑬ 改为 deprecate 不实现）。已知技术债（单线程
+> Python e2e（`reverb/tests/shm_test.py`）通过。仅 ④ 的 plain Writer SHM 路径 won't
+> fix（⑬ 已落地：Python 层 `NotImplementedError`，无 SHM seam）。已知技术债（单线程
 > dispatch、RunShmWorker 重复等）以 `// ponytail:` 注释标注在代码里，升级条件见
 > 各注释。
 >
@@ -18,22 +18,25 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > - ✅ ⑧ `server_info`（bootstrap 快照）、✅ ⑨ 多表、✅ ⑩ `mutate_priorities`+`reset`
 >   ——三 ticket 同批落地，已提交 `74608c1`。C++ `//reverb/cc/shm:*` 8/8、Python
 >   `shm_test.py` 35/35、`transport_parity_test.py` 5/5 全绿。
-> - ✅ ⑩ **死锁已修**（本会话）：2026-07-17 复现并抓栈确认根因——**不是**
+> - ✅ ⑩ **死锁已修**（2026-07-17）：复现并抓栈确认根因——**不是**
 >   ticket 原猜的 `insert_flow_mu` 锁范围，而是**服务端单线程 dispatch 在
 >   `HandleSample` 里阻塞于 `Table::Sample` 的 rate-limiter 无限等待**（队头阻塞），
 >   导致该 client 的所有后续 insert/mutate/sample ACK 永远排不进 ring，client
 >   `ReadBlocking` 100% CPU 忙等、`timeout` 杀不掉。按方向 A+C 修复：`HandleSample`
 >   改异步（`EnqueSampleRequest` + `DrainPendingSamples` 镜像 insert 的
 >   callback→outbox 模式）+ `ReadBlocking` 加 60s 硬上限兜底。回归测试
->   `ShmSampleDeadlockRegressionTest` 落地。C++ 8/8 + Python `shm_test.py`
->   31 例 + `transport_parity_test.py` 5/5 全绿，×3 跑无 flaky。决定性三栈与
->   A/B/C/D 方向选型见 ⑩ 的「**已确认根因**」小节。
-> - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）、⑫ `pickle`（P4，一行）、⑬ deprecate
->   legacy `Writer`/`insert`（清理）——均未开始，可任选推进。
+>   `ShmSampleDeadlockRegressionTest` 落地。已提交 `adcfab9`。
+> - ✅ ⑫ `pickle`、✅ ⑬ deprecate legacy `Writer`/`insert`——本轮同批落地（工作区
+>   未提交）。`__reduce__` 返回 `(ShmClient, (socket_path,))`，反序列化重连；
+>   `writer`/`insert` Python 层覆盖抛 `NotImplementedError`。C++ 侧 `NewWriter`
+>   注释从 `TODO(④)` 改 won't fix。测试 `ShmClientPicklableTest`（3 例）+
+>   `ShmClientLegacyWriterInsertNotImplementedTest`（3 例）落地。
+> - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）——v2 唯一剩余，需 checkpointer
+>   集成，单独一轮。
 >
-> **新 session 入口**：⑩ 死锁已修，可放心推进 ⑪/⑫/⑬。本会话改动未提交
-> （`shm_server.{h,cc}`/`shm_client.cc`/`trajectory_writer.cc`/`shm_test.py`/
-> `tickets.md`/`shm_connection.h`），跑 `git diff` 复核后提交。
+> **新 session 入口**：⑫⑬ 已落地，v2 仅剩 ⑪ `checkpoint`。本会话改动未提交
+> （`client.py`/`shm_client.{h,cc}`/`shm_test.py`/`tickets.md`/`docs/*`），跑
+>   `git diff` 复核 + `bazel test //reverb/tests:shm_test //reverb/cc/shm:*` 绿后提交。
 
 ---
 
@@ -375,7 +378,7 @@ dispatch 线程（spec §8.7 原始升级路径）。
 
 ---
 
-## ⑫ `pickle` 支持  [P4]
+## ⑫ `pickle` 支持  [P4]  [已完成]
 
 **What to build:** `ShmClient` 可 pickle，反序列化后按 `socket_path` 重连。改
 `__reduce__` 从 raise 改为返回构造器。需求低（要分发到多进程 worker 时 gRPC
@@ -384,14 +387,20 @@ dispatch 线程（spec §8.7 原始升级路径）。
 
 **Blocked by:** None — 完全独立。
 
-- [ ] `ShmClient.__reduce__` 改为 `return (self.__class__, (self._socket_path,))`
-- [ ] 确认反序列化后 `Connect` 重连语义正确（无残留 mmap/ring 泄漏；旧 fd 正确关闭）
-- [ ] 测试：`pickle.dumps`/`loads` 后 sample/insert 可用；原 client 仍可用
-- [ ] 更新 `docs/client-transports.md` §1 表与 §5.5（pickle 从「只能 gRPC」改「gRPC + ShmClient」）
+**状态：已完成。** `__reduce__` 返回 `(self.__class__, (self._socket_path,))`，反
+序列化走 `__init__` → `ShmClient::Connect`（重新 bootstrap + mmap 五段），原进程
+mmap/ring 状态留原进程随原 client 销毁释放，无跨进程泄漏。测试
+`ShmClientPicklableTest` 3 例（round-trip 重连 / pickled client 可 insert+sample /
+原 client pickle 后仍可用）。
+
+- [x] `ShmClient.__reduce__` 改为 `return (self.__class__, (self._socket_path,))`
+- [x] 确认反序列化后 `Connect` 重连语义正确（无残留 mmap/ring 泄漏；旧 fd 正确关闭）——原 client 的 mmap/fd 在原进程，随原 client GC 释放，pickle 边界不跨进程传
+- [x] 测试：`pickle.dumps`/`loads` 后 sample/insert 可用；原 client 仍可用
+- [x] 更新 `docs/client-transports.md` §0/§1/§2/§5.5（pickle 从「只能 gRPC」改「gRPC + ShmClient」）；`docs/numpy-shm-design.md` §4/§6；`docs/numpy-shm-spec.md` §5
 
 ---
 
-## ⑬ Deprecate legacy `Writer`/`insert` for ShmClient  [清理，不实现]
+## ⑬ Deprecate legacy `Writer`/`insert` for ShmClient  [清理，不实现]  [已完成]
 
 **What to build:** 不实现 plain `Writer` 的 SHM 路径（`shm_client.h` `TODO(④)`，
 无 SHM seam，为 legacy API 复刻 `RunShmWorker` 不划算）。改为在 Python 层把
@@ -400,10 +409,16 @@ trajectory_writer」提示），避免用户撞 C++ 运行时 `UnimplementedErro
 
 **Blocked by:** None — 纯清理，不 block 也不被 block。
 
-- [ ] `ShmClient` 覆盖 `writer`/`insert`，抛 `NotImplementedError("ShmClient 不支持 legacy writer/insert，请用 trajectory_writer 或 structured_writer")`
-- [ ] 移除 `shm_client.h` 的 `TODO(④)`（改为「won't fix — legacy API, use trajectory_writer」注释）
-- [ ] 更新 `docs/client-transports.md` §5.1（从「运行时抛 UnimplementedError」改为「Python 层显式 NotImplementedError」）
-- [ ] 更新 `docs/numpy-shm-design.md` §6 与 `docs/numpy-shm-spec.md` §6 的 plain Writer 延期说明（标 won't fix）
+**状态：已完成。** Python `ShmClient` 覆盖 `writer`/`insert` 抛 `NotImplementedError`，
+消息指引用 `trajectory_writer`/`structured_writer`。C++ 侧 `NewWriter` stub 保留
+作防御性 `UnimplementedError`（直接 pybind 调用者的夾底），注释从 `TODO(④)` 改
+won't fix。测试 `ShmClientLegacyWriterInsertNotImplementedTest` 3 例（writer 抛错 /
+insert 抛错 / trajectory_writer 不受影响）。
+
+- [x] `ShmClient` 覆盖 `writer`/`insert`，抛 `NotImplementedError("ShmClient does not support the legacy writer/insert; use trajectory_writer or structured_writer instead.")`
+- [x] 移除 `shm_client.h` 的 `TODO(④)`（改为「won't fix — legacy API, use trajectory_writer」注释）；`shm_client.cc` 同步
+- [x] 更新 `docs/client-transports.md` §0/§1/§2/§5.1（从「运行时抛 UnimplementedError」改为「Python 层显式 NotImplementedError」）
+- [x] 更新 `docs/numpy-shm-design.md` §4/§6 与 `docs/numpy-shm-spec.md` §5 的 plain Writer 延期说明（标 won't fix）
 
 ---
 
@@ -418,12 +433,13 @@ trajectory_writer」提示），避免用户撞 C++ 运行时 `UnimplementedErro
         │
         └── ⑪ checkpoint [P3]  blockedBy ⑩
 
-⑫ pickle      [P4]  ──  独立，可随时插入
-⑬ deprecate   [清理] ──  独立，不实现
+⑫ pickle      [P4]  ──  ✅ 已完成（独立）
+⑬ deprecate   [清理] ──  ✅ 已完成（独立，不实现）
 ```
 
 **批次建议**：⑧+⑨+⑩ 一轮（dispatch 扩展，做完 ShmClient 对齐 gRPC/LocalClient
-常用面）；⑪ 独立一轮（需 checkpointer 集成）；⑫/⑬ 顺手做。
+常用面）——✅ 已完成；⑫+⑬ 一轮（可用性尾巴，pickle + deprecate）——✅ 已完成；
+⑪ 独立一轮（需 checkpointer 集成）——⬜ 待做。
 
-**关键判断**：⑧/⑨/⑩ 是「让 ShmClient 成为可用客户端」的必经三步；⑪/⑫ 是锦上
-添花；⑬ 是该砍不是该补。
+**关键判断**：⑧/⑨/⑩ 是「让 ShmClient 成为可用客户端」的必经三步（已完成）；
+⑫/⑬ 是锦上添花（已完成）；⑪ 是最后一个未做的 v2 ticket，需 checkpointer 集成。

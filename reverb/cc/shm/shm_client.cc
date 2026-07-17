@@ -527,10 +527,12 @@ absl::Status ShmClient::NewWriter(int /*chunk_length*/,
                                   bool /*delta_encoded*/,
                                   int /*max_in_flight_items*/,
                                   std::unique_ptr<Writer>* /*writer*/) {
-  // ponytail: deferred — the plain Writer (writer.h) has no SHM transport
+  // ponytail: won't fix — the plain Writer (writer.h) has no SHM transport
   // seam. Its local ctor takes a tables map the SHM client doesn't hold.
   // Adding SHM to Writer would duplicate RunShmWorker for a legacy API.
-  // Use NewTrajectoryWriter / NewStructuredWriter for SHM inserts.
+  // The Python ShmClient overrides `writer`/`insert` to raise
+  // NotImplementedError before reaching here. Use NewTrajectoryWriter /
+  // NewStructuredWriter for SHM inserts.
   return absl::UnimplementedError(
       "ShmClient::NewWriter is not implemented for SHM; use "
       "NewTrajectoryWriter or NewStructuredWriter.");

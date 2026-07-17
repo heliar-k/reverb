@@ -1007,7 +1007,10 @@ py::class_<PyShmClient>(m, "ShmClient")
 **PascalCase + snake_case 双名**策略——对齐 `InProcessClient` 的现有模式
 （`pybind.cc` 中对 `InProcessClient` 已有双名绑定）。
 
-> 注意：`ShmClient` 不可 pickle（类似 `LocalClient`），因为持有 SHM mmap 指针。
+> 注意：`ShmClient` 可 pickle（ticket ⑫），`__reduce__` 返回
+> `(ShmClient, (socket_path,))`，反序列化重连（不同于 `LocalClient` 持进程内
+> 指针不可序列化）。plain `Writer` 的 SHM 路径 won't fix（ticket ⑬）：legacy
+> `Writer` 无 SHM seam，Python 层覆盖 `writer`/`insert` 抛 `NotImplementedError`。
 
 ---
 
