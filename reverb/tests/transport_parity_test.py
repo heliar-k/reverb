@@ -21,12 +21,12 @@ file extends the guard to include SHM, so a regression in any one transport's
 write/read semantics surfaces as a cross-transport mismatch.
 
 SHM supports all tables (routed by table name, ticket ⑨); each test builds a
-single-table server per transport. `mutate_priorities`/`reset` are SHM-
-supported as of ticket ⑩ (riding the insert flow under a client mutex);
-`server_info` is a bootstrap-time snapshot on SHM (does not reflect
-mid-session `Table.replace`), so live-`server_info` parity is asserted only
-between gRPC and LocalClient. The shared write→sample round trip remains the
-primary parity guard.
+single-table server per transport. `mutate_priorities`/`reset` (ticket ⑩)
+and `checkpoint` (ticket ⑪) are SHM-supported (riding the insert flow under
+a client mutex); `server_info` is a bootstrap-time snapshot on SHM (does not
+reflect mid-session `Table.replace`), so live-`server_info` parity is
+asserted only between gRPC and LocalClient. The shared write→sample round
+trip remains the primary parity guard.
 """
 
 import numpy as np

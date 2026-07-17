@@ -18,11 +18,12 @@ Exercises the full Server(shm=True) -> ShmClient -> trajectory_writer/
 structured_writer -> sample round trip over POSIX shared memory, mirroring
 `in_process_test.py` for the third transport. No TensorFlow; numpy only.
 
-v1 SHM scope (per spec §6 + ticket ⑤):
-  - ONE table per ShmServer (// ponytail: multi-table later).
-  - No MutatePriorities/Reset/Checkpoint/ServerInfo round-trip over SHM
-    (the C++ ShmServer only handles SAMPLE/RELEASE/INSERT/ALLOCATE). These are
-    therefore NOT exercised here. `server_info` returns a stub (// ponytail:).
+Coverage spans v1 (tickets ①-⑦: ring/bootstrap/pool/sample/insert/crash)
+and v2 (⑧ server_info bootstrap snapshot, ⑨ multi-table, ⑩ mutate/reset +
+deadlock regression, ⑫ pickle, ⑬ legacy writer/insert NotImplementedError,
+⑧-2b validate_items, ⑪ checkpoint). The C++ ShmServer dispatch handles
+SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops mutate_priorities/
+reset/checkpoint (all riding the insert flow under a client mutex).
 """
 
 import os
@@ -69,10 +70,10 @@ def _make_shm_server(
 ):
     """Builds a single-table SHM server + a connected ShmClient.
 
-    v1: ShmServer holds ONE table. The server owns the table directly via
-    `in_process=True` (no gRPC port) and additionally exposes it over the SHM
-    transport via `shm=True`. SHM is an additional surface layered on the owned
-    Table.
+    The server owns the table directly via `in_process=True` (no gRPC port)
+    and additionally exposes it over the SHM transport via `shm=True`. SHM is
+    an additional surface layered on the owned Table (ShmServer supports all
+    tables via name routing, ticket ⑨; this helper builds one for brevity).
     """
     table = _make_table(
         table_name=table_name,

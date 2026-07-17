@@ -829,11 +829,12 @@ class ShmClient(_BaseClient):
 
     v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles
     SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops
-    `mutate_priorities`/`reset` (ticket ⑩, riding the insert flow under a
-    client mutex). `server_info` returns a bootstrap-time snapshot (ticket ⑧);
-    `checkpoint` and the plain `Writer` are unimplemented over SHM (use
-    `trajectory_writer`/`structured_writer`). `ShmClient` is not picklable: it
-    holds SHM mmap + ring state (R13).
+    `mutate_priorities`/`reset` (ticket ⑩) and `checkpoint` (ticket ⑪), all
+    riding the insert flow under a client mutex. `server_info` returns a
+    bootstrap-time snapshot (ticket ⑧); the plain `Writer` is unimplemented
+    over SHM (use `trajectory_writer`/`structured_writer`). `ShmClient` is
+    picklable: `__reduce__` stores `socket_path` and reconnects on load
+    (ticket ⑫).
     """
 
     def __init__(self, socket_path: str):
