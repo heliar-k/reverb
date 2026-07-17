@@ -12,6 +12,24 @@ POSIX 共享内存传输层，作为 gRPC / in_process 之外的第三条路径�
 > **v2 路线图：** ticket ⑧-⑬，补齐 v1 有意延期（spec S10）的冷路径控制面与多表
 > 支持。优先级 P0→P4 标在各 ticket 标题；依赖链与批次建议见文末「v2 依赖图」。
 > v1 依据 `docs/client-transports.md` §1 对比表与 `docs/numpy-shm-spec.md` §6。
+>
+> **当前进度（commit `74608c1`，2026-07-17）：**
+>
+> - ✅ ⑧ `server_info`（bootstrap 快照）、✅ ⑨ 多表、✅ ⑩ `mutate_priorities`+`reset`
+>   ——三 ticket 同批落地，已提交 `74608c1`。C++ `//reverb/cc/shm:*` 8/8、Python
+>   `shm_test.py` 35/35、`transport_parity_test.py` 5/5 全绿。
+> - ⚠️ ⑩ 留有**未查明的偶发死锁技术债**：`ShmConnection::insert_flow_mu` 锁范围
+>   过大（覆盖 `RunShmWorker` 的 send→read-ACK 全程），并发 mutate+insert 时可能
+>   形成「mutate 等 ACK / ACK 卡在 ring / ring 满等 worker 读 / worker 等锁」循环。
+>   本会话未复现（单跑 20× 全绿），但另一 pi 会话观察到 100% CPU + 35 线程卡死
+>   （`timeout` 杀不掉，主线程在 C++ `ReadBlocking` 忙等）。详见 ⑩ 的「已知技术债」
+>   小节 + `shm_connection.h` 的 `ponytail:` 注释。**待办**：构建 tight loop 复现 →
+>   `gdb thread apply all bt` 抓栈 → 选「缩锁范围+序号配对」或「第三条控制 ring」修。
+> - ⬜ ⑪ `checkpoint`（P3，blockedBy ⑩ 已满足）、⑫ `pickle`（P4，一行）、⑬ deprecate
+>   legacy `Writer`/`insert`（清理）——均未开始，可任选推进。
+>
+> **新 session 入口**：读本文件顶部进度 → 看 ⑩「已知技术债」小节决定先修死锁还是
+> 先做 ⑪/⑫/⑬。工作区干净、已提交、无遗留进程。
 
 ---
 
