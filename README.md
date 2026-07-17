@@ -1,7 +1,7 @@
 # Reverb
 
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/dm-reverb)
-[![PyPI version](https://badge.fury.io/py/dm-reverb.svg)](https://badge.fury.io/py/dm-reverb)
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/dm-reverb-numpy)
+[![PyPI version](https://badge.fury.io/py/dm-reverb-numpy.svg)](https://badge.fury.io/py/dm-reverb-numpy)
 
 Reverb is an efficient and easy-to-use data storage and transport system
 designed for machine learning research. Reverb is primarily used as an
@@ -37,7 +37,7 @@ for the embedded, zero-network-overhead usage. The original `Client`/`Writer`
 gRPC path is also available over a networked `Server(in_process=False)`.
 
 ```shell
-pip install dm-reverb
+pip install dm-reverb-numpy
 ```
 
 ### Build from source
@@ -115,7 +115,7 @@ numpy-only walkthrough of the embedded (`in_process=True`) path. The gRPC
 Minimal standalone scripts for each transport and writer path:
 
 | Example | Path | Demonstrates |
-|---|---|---|
+| --- | --- | --- |
 | gRPC client | [examples/grpc_client.py](examples/grpc_client.py) | `Server(in_process=False)` + networked `Client` insert/sample |
 | SHM client | [examples/shm_client.py](examples/shm_client.py) | `Server(shm=True)` + `ShmClient` same-machine zero-copy transport |
 | StructuredWriter | [examples/structured_writer.py](examples/structured_writer.py) | Pattern-based conditional insertion into multiple tables |
@@ -422,7 +422,7 @@ checkpointer).
 
 ## Starting Reverb using `reverb_server` (beta)
 
-Installing `dm-reverb` using `pip` will install a `reverb_server` script, which
+Installing `dm-reverb-numpy` using `pip` will install a `reverb_server` script, which
 accepts its config as a textproto. For example:
 
 ```bash

@@ -57,14 +57,14 @@ uv pip install -e .    # editable
 In another project:
 
 ```shell
-uv add "dm-reverb @ git+ssh://git@gitlab.fuxi.netease.com:2222/guankai1/reverb.git"
+uv add "dm-reverb-numpy @ git+ssh://git@gitlab.fuxi.netease.com:2222/guankai1/reverb.git"
 ```
 
 or in `pyproject.toml`:
 
 ```toml
 dependencies = [
-  "dm-reverb @ git+ssh://git@gitlab.fuxi.netease.com:2222/guankai1/reverb.git",
+  "dm-reverb-numpy @ git+ssh://git@gitlab.fuxi.netease.com:2222/guankai1/reverb.git",
 ]
 ```
 

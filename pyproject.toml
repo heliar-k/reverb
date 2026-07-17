@@ -6,7 +6,7 @@ build-backend = "_build_backend"
 backend-path = ["."]
 
 [project]
-name = "dm-reverb"
+name = "dm-reverb-numpy"
 version = "0.15.0"
 description = "Reverb is an efficient and easy-to-use data storage and transport system designed for machine learning research."
 readme = "README.md"

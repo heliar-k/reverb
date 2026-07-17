@@ -31,8 +31,8 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.resolve()
-NAME = "dm-reverb"  # PyPI 规范化名
-DIST_NAME = "dm_reverb"  # wheel 文件名/dist-info 用下划线
+NAME = "dm-reverb-numpy"  # PyPI 规范化名
+DIST_NAME = "dm_reverb_numpy"  # wheel 文件名/dist-info 用下划线
 VERSION = "0.15.0"
 ENTRY_POINT = "reverb.server_executable.server_main:app_run_main"
 SUMMARY = (
