@@ -20,7 +20,6 @@ http_archive(
     name = "bazel_skylib",
     sha256 = "bc283cdfcd526a52c3201279cda4bc298652efa898b10b4db0837dc51652756f",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/bazelbuild/bazel-skylib/releases/download/1.7.1/bazel-skylib-1.7.1.tar.gz",
         "https://github.com/bazelbuild/bazel-skylib/releases/download/1.7.1/bazel-skylib-1.7.1.tar.gz",
     ],
 )
@@ -67,7 +66,6 @@ http_archive(
     sha256 = "5b00383d08dd71f28503736db0500b6fb4dda47489ff5fc6bed42557c07c6ba9",
     strip_prefix = "rules_closure-308b05b2419edb5c8ee0471b67a40403df940149",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/bazelbuild/rules_closure/archive/308b05b2419edb5c8ee0471b67a40403df940149.tar.gz",
         "https://github.com/bazelbuild/rules_closure/archive/308b05b2419edb5c8ee0471b67a40403df940149.tar.gz",
     ],
 )
@@ -104,8 +102,8 @@ python_init_toolchains(hermetic_python_version = HERMETIC_PYTHON_VERSION)
 
 load("@rules_python//python:pip.bzl", "package_annotation", "pip_parse")
 
-# ponytail: pip_parse 注册 @pypi(numpy 等)。annotations/extra_hub_aliases 与
-# 原 WORKSPACE 一致(tensorflow 注解为 wheel 构建保留,numpy 注解为 cc_library)。
+# ponytail: pip_parse 注册 @pypi(numpy 等)。numpy 注解暴露 cc_library
+# 头文件供 pybind 链接;TF 注解已随去 TF 重构移除。
 numpy_annotation = package_annotation(
     additive_build_content = """\
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
@@ -127,51 +125,13 @@ deps = [":numpy_headers_2", ":numpy_headers_1"],
 """,
 )
 
-tensorflow_annotation = package_annotation(
-    additive_build_content = """\
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
-
-cc_library(
-    name = "headers_lib",
-    hdrs = glob(
-        [
-            "site-packages/tensorflow/include/**/*",
-        ],
-    ),
-    strip_include_prefix = "site-packages/tensorflow/include/"
-)
-
-cc_library(
-    name = "framework_lib",
-    # Ensure that reverb uses the same kSeed as tensorflow. See
-    # https://github.com/abseil/abseil-cpp/blob/4ab53949759ddf3f26336eae7130ac6445376b53/absl/hash/hash.h#L43-L46
-    deps = ["@com_google_absl//absl/hash"],
-    srcs = select({
-        "@platforms//os:linux": ["site-packages/tensorflow/libtensorflow_framework.so.2"],
-        "@platforms//os:macos": ["site-packages/tensorflow/libtensorflow_framework.2.dylib"]
-    }),
-    visibility = ["//visibility:public"],
-)
-""",
-)
-
 pip_parse(
     name = "pypi",
     annotations = {
         "numpy": numpy_annotation,
-        "tensorflow": tensorflow_annotation,
-        "tf-nightly": tensorflow_annotation,
     },
     extra_hub_aliases = {
         "numpy": ["numpy_headers"],
-        "tf_nightly": [
-            "headers_lib",
-            "framework_lib",
-        ],
-        "tensorflow": [
-            "headers_lib",
-            "framework_lib",
-        ],
     },
     python_interpreter_target = "@{}_host//:python".format(
         get_toolchain_name_per_python_version("python", HERMETIC_PYTHON_VERSION),
@@ -210,7 +170,6 @@ http_archive(
     ],
     patch_args = ["-p1"],
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/abseil/abseil-cpp/archive/987c57f325f7fa8472fa84e1f885f7534d391b0d.tar.gz",
         "https://github.com/abseil/abseil-cpp/archive/987c57f325f7fa8472fa84e1f885f7534d391b0d.tar.gz",
     ],
     repo_mapping = {
@@ -225,7 +184,6 @@ http_archive(
     sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
     strip_prefix = "zlib-1.3.1",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/zlib.net/fossils/zlib-1.3.1.tar.gz",
         "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
     ],
 )
@@ -236,7 +194,6 @@ http_archive(
     sha256 = "7ee7540b23ae04df961af24309a55484e7016106e979f83323536a1322cedf1b",
     strip_prefix = "snappy-1.2.0",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/google/snappy/archive/1.2.0.zip",
         "https://github.com/google/snappy/archive/1.2.0.zip",
     ],
 )
@@ -246,7 +203,6 @@ http_archive(
     sha256 = "ef516fb84824a597c4d5d0d6d330daedb18363b5a99eda87d027e6bdd9cba299",
     strip_prefix = "re2-03da4fc0857c285e3a26782f6bc8931c4c950df4",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/google/re2/archive/03da4fc0857c285e3a26782f6bc8931c4c950df4.tar.gz",
         "https://github.com/google/re2/archive/03da4fc0857c285e3a26782f6bc8931c4c950df4.tar.gz",
     ],
 )
@@ -258,7 +214,6 @@ http_archive(
     patches = ["//third_party/patches:googletest.patch"],
     patch_args = ["-p1"],
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/google/googletest/archive/28e9d1f26771c6517c3b4be10254887673c94018.zip",
         "https://github.com/google/googletest/archive/28e9d1f26771c6517c3b4be10254887673c94018.zip",
     ],
 )
@@ -280,7 +235,6 @@ http_archive(
     patches = ["//third_party/patches:grpc.patch"],
     patch_args = ["-p1"],
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/grpc/grpc/archive/refs/tags/v1.74.0.tar.gz",
         "https://github.com/grpc/grpc/archive/refs/tags/v1.74.0.tar.gz",
     ],
 )

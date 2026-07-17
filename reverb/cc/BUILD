@@ -9,7 +9,6 @@ load(
     "reverb_grpc_deps",
     "reverb_py_proto_library",
     "reverb_pybind_deps",
-    "reverb_tf_deps",
 )
 
 package(default_visibility = ["//reverb:__subpackages__"])

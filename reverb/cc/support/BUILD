@@ -4,7 +4,6 @@ load(
     "reverb_cc_test",
     "reverb_embed_py_test",
     "reverb_grpc_deps",
-    "reverb_tf_deps",
 )
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")

@@ -8,7 +8,7 @@ load("@rules_python//python:py_binary.bzl", "py_binary")
 load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
 
-def tf_copts():
+def reverb_copts():
     return ["-Wno-sign-compare"]
 
 def reverb_cc_library(
@@ -21,26 +21,16 @@ def reverb_cc_library(
     if testonly:
         new_deps = [
             "@com_google_googletest//:gtest",
-        ] + reverb_tf_deps()
+        ]
     else:
         new_deps = []
     cc_library(
         name = name,
         srcs = srcs,
         hdrs = hdrs,
-        copts = tf_copts(),
+        copts = reverb_copts(),
         testonly = testonly,
         deps = depset(deps + new_deps),
-        **kwargs
-    )
-
-def reverb_kernel_library(name, srcs = [], deps = [], **kwargs):
-    deps = deps + reverb_tf_deps()
-    reverb_cc_library(
-        name = name,
-        srcs = srcs,
-        deps = deps,
-        alwayslink = 1,
         **kwargs
     )
 
@@ -255,7 +245,7 @@ def reverb_cc_test(name, srcs, deps = [], **kwargs):
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status:status_matchers",
-    ] + reverb_tf_deps()
+    ]
     size = kwargs.pop("size", "small")
     # ponytail: cc_test 主动嵌入 Python 解释器(scoped_interpreter + import_array),
     # 链接器必须解析 Py* 符号。原硬编码 -lpython3.10 绑死系统版本,与 py 侧
@@ -267,7 +257,7 @@ def reverb_cc_test(name, srcs, deps = [], **kwargs):
     cc_test(
         name = name,
         size = size,
-        copts = tf_copts(),
+        copts = reverb_copts(),
         srcs = srcs,
         deps = deps,
         **kwargs
@@ -380,93 +370,6 @@ def reverb_embed_py_test(name, binary, size = "small", **kwargs):
         name = name,
         binary = binary,
         size = size,
-        **kwargs
-    )
-
-def reverb_gen_op_wrapper_py(name, out, kernel_lib, ops_lib = None, linkopts = [], **kwargs):
-    """Generates the py_library `name` with a data dep on the ops in kernel_lib.
-
-    The resulting py_library creates file `$out`, and has a dependency on a
-    symbolic library called lib{$name}_gen_op.so, which contains the kernels
-    and ops and can be loaded via `tf.load_op_library`.
-
-    Args:
-      name: The name of the py_library.
-      out: The name of the python file.  Use "gen_{name}_ops.py".
-      kernel_lib: A cc_kernel_library kernel target to generate for.
-      ops_lib: A cc_kernel_library ops target to generate for.
-      linkopts: Forwarded to the `cc_binary` internal target.
-      **kwargs: Any args to the `cc_binary` and `py_library` internal rules.
-    """
-    if not out.endswith(".py"):
-        fail("Argument out must end with '.py', but saw: {}".format(out))
-
-    module_name = "lib{}_gen_op".format(name)
-    exported_symbols_file = "%s-exported-symbols.lds" % module_name
-
-    # gen_client_ops -> reverb_client
-    symbol = "reverb_{}".format(name.split("_")[1])
-    native.genrule(
-        name = module_name + "_exported_symbols",
-        outs = [exported_symbols_file],
-        cmd = "echo '*%s*' >$@" % symbol,
-        output_licenses = ["unencumbered"],
-        visibility = ["//visibility:private"],
-    )
-    version_script_file = "%s-version-script.lds" % module_name
-    native.genrule(
-        name = module_name + "_version_script",
-        outs = [version_script_file],
-        cmd = "echo '{global:\n *%s*;\n local: *;};' >$@" % symbol,
-        output_licenses = ["unencumbered"],
-        visibility = ["//visibility:private"],
-    )
-    cc_binary(
-        name = "{}.so".format(module_name),
-        deps = [kernel_lib] + [ops_lib] if ops_lib else [],
-        copts = tf_copts() + [
-            "-fno-strict-aliasing",  # allow a wider range of code [aliasing] to compile.
-            "-fvisibility=hidden",  # avoid symbol clashes between DSOs.
-        ],
-        additional_linker_inputs = [
-            exported_symbols_file,
-            version_script_file,
-        ],
-        dynamic_deps = ["//reverb:libreverb"],
-        linkshared = 1,
-        linkopts = linkopts + _rpath_linkopts(module_name) + select({
-            "@platforms//os:macos": [
-                "-Wl,-exported_symbols_list,$(location %s)" % exported_symbols_file,
-            ],
-            "//conditions:default": [
-                "-Wl,--version-script,$(location %s)" % version_script_file,
-            ],
-        }),
-        **kwargs
-    )
-    native.genrule(
-        name = "{}_genrule".format(out),
-        outs = [out],
-        cmd = """echo 'import tensorflow as _tf
-from reverb.platform.default import load_op_library as _load_op_library
-
-try:
-  _reverb_gen_op = _tf.load_op_library(
-    _tf.compat.v1.resource_loader.get_path_to_datafile("lib{}_gen_op.so"))
-except _tf.errors.NotFoundError as e:
-  _load_op_library.reraise_wrapped_error(e)
-_locals = locals()
-for k in dir(_reverb_gen_op):
-  _locals[k] = getattr(_reverb_gen_op, k)
-del _locals' > $@""".format(name),
-    )
-    deps = kwargs.pop("deps", [])
-    deps.append("//reverb/platform/default:load_op_library")
-    native.py_library(
-        name = name,
-        srcs = [out],
-        data = [":lib{}_gen_op.so".format(name)],
-        deps = deps,
         **kwargs
     )
 
@@ -698,17 +601,6 @@ def reverb_pybind_deps():
         "@pybind11",
         "@pypi//numpy:numpy_headers",
     ]
-
-def reverb_tf_ops_visibility():
-    return [
-        "//reverb:__subpackages__",
-    ]
-
-def reverb_tf_deps():
-    # ponytail: TF 依赖已移除——内嵌 numpy 模式不需要 TF。保留函数签名
-    # 兼容 reverb_cc_library/reverb_cc_test 的调用点。client.cc 等仍含 TF
-    # include 的文件不在编译路径内,故返回空列表不破坏内嵌链路。
-    return []
 
 def reverb_grpc_deps():
     return ["@com_github_grpc_grpc//:grpc++"]

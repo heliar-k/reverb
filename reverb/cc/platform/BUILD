@@ -5,7 +5,6 @@ load(
     "reverb_cc_library",
     "reverb_cc_test",
     "reverb_grpc_deps",
-    "reverb_tf_deps",
 )
 
 package(

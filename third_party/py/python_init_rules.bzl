@@ -8,14 +8,6 @@ ponytail: 替代 @local_xla//third_party/py:python_init_rules.bzl。urls/sha 与
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-def _tf_mirror_urls(url):
-    if not url.startswith("https://"):
-        return [url]
-    return [
-        "https://storage.googleapis.com/mirror.tensorflow.org/%s" % url[8:],
-        url,
-    ]
-
 def python_init_rules(extra_rules_python_patches = []):
     """Defines rules_cc, com_google_protobuf, rules_python (no toolchain setup)."""
     http_archive(
@@ -35,7 +27,7 @@ def python_init_rules(extra_rules_python_patches = []):
         patch_args = ["-p1"],
         sha256 = "6e09bbc950ba60c3a7b30280210cd285af8d7d8ed5e0a6ed101c72aff22e8d88",
         strip_prefix = "protobuf-6.31.1",
-        urls = _tf_mirror_urls("https://github.com/protocolbuffers/protobuf/archive/refs/tags/v6.31.1.zip"),
+        urls = ["https://github.com/protocolbuffers/protobuf/archive/refs/tags/v6.31.1.zip"],
         repo_mapping = {
             "@abseil-cpp": "@com_google_absl",
             "@protobuf_pip_deps": "@pypi",
