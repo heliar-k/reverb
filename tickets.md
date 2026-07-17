@@ -183,6 +183,7 @@ grab。
 这是当前最坏的失败模式——静默返回空，用户不知道它坏了，且连锁导致
 `sample(unpack_as_table_signature=True)` 抛 `ValueError`、
 `trajectory_writer(validate_items=True)` 形同虚设（`flat_signature_map` 永远空）。
+（`validate_items` 形同虚设已于 ⑧-2b 修复——`NewTrajectoryWriter` 从缓存快照填 map。）
 
 分两步交付：先 bootstrap 时填一次（覆盖表签名 rarely change 的场景，零新消息
 类型），再加 `SERVER_INFO` 往返支持按需刷新（对齐 gRPC「每次调用刷新」语义）。
@@ -211,8 +212,8 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 - [ ] `ShmServer` dispatch 增 `HandleServerInfo`：序列化各表**当前** `TableInfo` 写 S→C
 - [ ] `ShmClient._fetch_server_info_proto` 改为发 `SERVER_INFO` 阻塞读 `SERVER_INFO_RESP`（按需刷新，对齐 gRPC「每次调用刷新签名缓存」）
 - [ ] 表签名变更（`Table.replace`）后 `server_info()` 能反映新签名
-- [x] `NewTrajectoryWriter` 把缓存的 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效（step 1 已暴露数据，但 writer options 未接，需后续 wiring）——**已完成（⑧-2b）**：`ShmClient::NewTrajectoryWriter` 遍历 `cached_server_info_`，经 `FlatSignatureFromTableInfo` 填 map（镜像 `InProcessClient`）；无签名表设 nullopt 跳过校验。测试 `ShmClientValidateItemsTest` 3 例（匹配通过 / 列数不匹配拒 / 无签名表跳过）。`ponytail:` 上限：快照不反映会话中途签名变更，不匹配安全失败。
-- [ ] 测试：`Table.replace` 后 `server_info()` 反映新签名；`trajectory_writer(validate_items=True)` 拒绝不匹配 trajectory
+- [x] `NewTrajectoryWriter` 把缓存的 `TableInfo` signature 填进 `TrajectoryWriter::Options.flat_signature_map`，使 `validate_items=True` 生效（step 1 已暴露数据，但 writer options 未接，需后续 wiring）——**已完成（⑧-2b）**：`ShmClient::NewTrajectoryWriter` 遍历 `cached_server_info_`，经 `FlatSignatureFromTableInfo` 填 map（镜像 `InProcessClient`）；无签名表设 nullopt 跳过校验。测试 `ShmClientValidateItemsTest` 3 例（匹配通过 / dtype 不匹配拒 / 无签名表跳过）。副作用：未知表现在 client 侧 `create_item` 拒为 `ValueError`（对齐 InProcessClient/gRPC），不再到 server 才 `FileNotFoundError`。`ponytail:` 上限：快照不反映会话中途签名变更，不匹配安全失败。
+- [ ] 测试：`Table.replace` 后 `server_info()` 反映新签名（仍 deferred，需 step 2 往返）；`trajectory_writer(validate_items=True)` 拒绝不匹配 trajectory——✅ 已由 ⑧-2b 覆盖（`ShmClientValidateItemsTest`）
 
 ---
 
@@ -228,8 +229,10 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 扩展）。
 
 **状态：已完成。** `ShmServer` 持 `flat_hash_map<string, shared_ptr<Table>> tables_`，
-`FindTable` 作为共享路由 seam（⑩ 复用）。C++ 8/8 + Python 28/28 绿。未知表名走
-`ShmError::NOT_FOUND` → `absl::NotFoundError` → Python `FileNotFoundError`。
+`FindTable` 作为共享路由 seam（⑩ 复用）。C++ 8/8 + Python 28/28 绿。未知表名：
+`sample`/`mutate`/`reset` 走 `ShmError::NOT_FOUND` → `absl::NotFoundError` → Python
+`FileNotFoundError`；`trajectory_writer.create_item` 经 ⑧-2b 的 `flat_signature_map`
+在 client 侧拒为 `ValueError`（不到 server）。
 
 - [x] `ShmServer` 把 `shared_ptr<Table> table_` 换 `flat_hash_map<string, shared_ptr<Table>> tables_`，构造时接收 `vector<shared_ptr<Table>>` + 唯一名校验（`shm_server.{h,cc}`）
 - [x] `FindTable(name)` 私有 helper 返回 `StatusOr<shared_ptr<Table>>`，缺失返 `NotFoundError`——路由 seam，⑩ 复用
@@ -240,7 +243,7 @@ Step 2（按需 SERVER_INFO 往返）仍在下面，未做。
 - [x] pybind `ShmServer.__init__`/`Create` 从 `table: Table` 改 `tables: Sequence[Table]`（`pybind.cc` + `pybind.pyi`）
 - [x] `Server(shm=True)` Python 层传 `[t.internal_table for t in tables]`（`server.py`）
 - [x] C++ 测试更新 `{table}` vector 形式（`shm_crash_test.cc`/`shm_insert_test.cc`/`shm_sample_test.cc`）
-- [x] Python 测试 `ShmMultiTableTest` 5 例：sample 路由 / insert 路由 / server_info 列全表 / 未知表 sample 抛 `FileNotFoundError` / 未知表 insert 抛 `FileNotFoundError`（`shm_test.py`）
+- [x] Python 测试 `ShmMultiTableTest` 5 例：sample 路由 / insert 路由 / server_info 列全表 / 未知表 sample 抛 `FileNotFoundError` / 未知表 insert 抛 `ValueError`（⑧-2b 后 client 侧 `create_item` 拒，原为 `FileNotFoundError`）（`shm_test.py`）
 - [x] 更新 `docs/client-transports.md` §1 表 + §5.3（多表 ✅）；`README.md`；`docs/numpy-shm-design.md` §6（标「已实现」）；`transport_parity_test.py` docstring
 - [x] `ponytail:` 注释：map-only 无并行有序 list（server_info 消费为 dict，顺序无关）；升级条件 = 有测试断言 table_info 顺序时再加
 - [x] 路由基础设施预留给 ⑩ 的 `mutate_priorities`/`reset` 复用（`FindTable` seam + 注释）

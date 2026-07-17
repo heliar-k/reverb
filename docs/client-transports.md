@@ -35,7 +35,7 @@
 | `server_info` | ✅ 真实，带 timeout | ✅ 真实，忽略 timeout | ✅ **bootstrap 快照**（连接时缓存，无往返） |
 | `mutate_priorities` / `reset` | ✅ | ✅ | ✅（ticket ⑩，走 insert 流 + 客户端互斥锁） |
 | `checkpoint` / 恢复 | ✅ | ✅（`Server(in_process=True)` 构造时自动 `LoadLatest`） | ❌ 不支持 |
-| `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM） |
+| `trajectory_writer` / `structured_writer` | ✅ | ✅ | ✅（chunker/column 在 client 侧，insert 走 SHM；`validate_items` 总是开，⑧-2b） |
 | `writer`（legacy）/ `insert` | ✅ | ✅ | ❌ **Python 层抛 `NotImplementedError`**（ticket ⑬） |
 
 ## 2. API 覆盖面
