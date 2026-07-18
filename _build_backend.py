@@ -56,28 +56,24 @@ def _target_py_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-def _so_links_matching_python(so_path: Path) -> bool:
-    """检查 .so 的 NEEDED libpython 是否匹配当前解释器。
-
-    readelf 缺失时返回 False(安全回退:触发重建)。
-    """
-    try:
-        out = subprocess.run(
-            ["readelf", "-d", str(so_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-    return f"libpython{_target_py_version()}.so" in out
+# pybind11 模块不直接链接 libpython (Python 符号运行时由宿主解释器注入,
+# readelf NEEDED 里永远没有 libpythonX.Y.so), 所以无法从 .so 的动态段探测
+# 编译时的 Python 版本。改用 sidecar 标记文件记录上次构建的版本。
+# ponytail: 单文件 marker, 升级路径 = 若 bazel 未来把 py 版本编码进产物路径,
+# 改读路径即可删此文件。
+_PYVER_MARKER = REPO_ROOT / ".bazel_pyver"
 
 
 def _artifacts_valid() -> bool:
-    """bazel-bin/reverb/libpybind.so 存在且 libpython 版本匹配 → 可复用。"""
+    """bazel-bin/reverb/libpybind.so 存在且 sidecar 标记的版本匹配 → 可复用。"""
     so = REPO_ROOT / "bazel-bin" / "reverb" / "libpybind.so"
     # bazel-bin 是符号链接;resolve() 解析到真实路径再 exists()。
-    return so.exists() and _so_links_matching_python(so)
+    if not so.exists():
+        return False
+    try:
+        return _PYVER_MARKER.read_text().strip() == _target_py_version()
+    except OSError:
+        return False
 
 
 def _run_bazel(args: list[str], **kw) -> subprocess.CompletedProcess:
@@ -101,6 +97,7 @@ def _ensure_artifacts() -> None:
         _run_bazel(["build", *BAZEL_TARGETS], check=True)
     except subprocess.CalledProcessError as e:
         raise SystemExit(f"bazel build 失败 (exit {e.returncode})") from e
+    _PYVER_MARKER.write_text(_target_py_version())
 
 
 def _collect_artifacts() -> list[tuple[str, str]]:

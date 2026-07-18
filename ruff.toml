@@ -1,5 +1,5 @@
 line-length = 88
-target-version = "py38"
+target-version = "py39"
 exclude = ["bazel-*", "third_party"]
 
 [lint]
@@ -8,7 +8,7 @@ exclude = ["bazel-*", "third_party"]
 # I    = isort (import ordering)
 # B    = flake8-bugbear (common pitfalls)
 # SIM  = flake8-simplify
-# (UP/pyupgrade excluded: its PEP 604 annotations `X | None` require py3.10+, but this project targets py3.8 — see target-version above.)
+# (UP/pyupgrade excluded: its PEP 604 annotations `X | None` require py3.10+, but this project targets py3.9 — see target-version above.)
 select = ["E", "W", "F", "I", "B", "SIM"]
 ignore = [
   "E501",   # line too long — formatter handles wrapping; lint flagging is noise

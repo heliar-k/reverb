@@ -4,6 +4,7 @@
 /bazel-reverb
 /bazel-testlogs
 /MODULE.bazel.lock
+/.bazel_pyver
 
 # AI agent working notes
 /docs/superpowers/
