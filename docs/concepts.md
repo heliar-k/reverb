@@ -31,31 +31,21 @@ sample = next(server.in_process_client.sample('q', 1, emit_timesteps=False))
 
 ## 2. 架构一览
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                       Client                             │
-│  (TrajectoryWriter / StructuredWriter / sample / mutate_priorities) │
-└────────────┬──────────────┬──────────────┬──────────────┘
-             │ gRPC         │ In-Process   │ SHM
-             ▼              ▼              ▼
-┌─────────────────────────────────────────────────────────┐
-│                       Server                             │
-│                                                          │
-│   ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│   │  Table A  │  │  Table B  │  │  Table C  │   ...       │
-│   │           │  │           │  │           │              │
-│   │ sampler:  │  │ sampler:  │  │ sampler:  │              │
-│   │ Uniform() │  │ Prioritized│ │  Fifo()   │              │
-│   │           │  │           │  │           │              │
-│   │ remover:  │  │ remover:  │  │ remover:  │              │
-│   │  Fifo()   │  │  Fifo()   │  │  Fifo()   │              │
-│   │           │  │           │  │           │              │
-│   │ rate_lim: │  │ rate_lim: │  │ rate_lim: │              │
-│   │ MinSize() │  │ MinSize() │  │ Queue()   │              │
-│   └──────────┘  └──────────┘  └──────────┘              │
-│                                                          │
-│   Checkpointer ──► 磁盘持久化                             │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  Client["Client<br/>TrajectoryWriter / StructuredWriter / sample / mutate_priorities"]
+  Client -->|gRPC| Server
+  Client -->|In-Process| Server
+  Client -->|SHM| Server
+
+  subgraph Server["Server"]
+    direction TB
+    TableA["Table A<br/>sampler: Uniform()<br/>remover: Fifo()<br/>rate_lim: MinSize()"]
+    TableB["Table B<br/>sampler: Prioritized()<br/>remover: Fifo()<br/>rate_lim: MinSize()"]
+    TableC["Table C<br/>sampler: Fifo()<br/>remover: Fifo()<br/>rate_lim: Queue()"]
+    TableA -.- TableB -.- TableC
+    Checkpointer[("Checkpointer<br/>→ 磁盘持久化")]
+  end
 ```
 
 **核心思路：** Server 持有若干 Table，每个 Table 是一个独立的「容器 + 采样/移除策略」组合。Client 通过三种传输层之一连接 Server，写入数据或读取样本。传输层对上层核心 API 完全透明——用 `trajectory_writer`、`structured_writer`、`sample`、`mutate_priorities` 时调用方式都一样。**例外：** `ShmClient` 不支持 `Writer`/`insert`（较早的写入 API，功能已被 `TrajectoryWriter` 取代），请使用 `trajectory_writer` 代替。详见 [client-transports.md](client-transports.md)。
@@ -293,38 +283,22 @@ server = reverb.Server(tables=[...], checkpointer=checkpointer)
 
 ### 4.1 Insert 路径
 
-```
-TrajectoryWriter.append()          # 追加时间步到 chunk
-       │
-       ▼
-TrajectoryWriter.create_item()     # 从 chunk 中切出 trajectory，
-       │                            #   构造 Item proto
-       ▼
-TrajectoryWriter.flush()            # 将 pending item 发送到 Server
-       │
-       ▼
-[传输层: gRPC stream / 直接指针 / SHM ring]
-       │
-       ▼
-Server → Table 后台工作线程处理插入  # 存入 Table
-       │                            #   - 检查容量，触发 remover 淘汰
-       ▼                            #   - 更新 rate limiter 计数
-Item 可用                          # 可以被采样
+```mermaid
+flowchart TB
+  A["TrajectoryWriter.append()<br/>追加时间步到 chunk"] --> B["TrajectoryWriter.create_item()<br/>从 chunk 中切出 trajectory，构造 Item proto"]
+  B --> C["TrajectoryWriter.flush()<br/>将 pending item 发送到 Server"]
+  C --> D["传输层：gRPC stream / 直接指针 / SHM ring"]
+  D --> E["Server → Table 后台工作线程处理插入<br/>存入 Table<br/>· 检查容量，触发 remover 淘汰<br/>· 更新 rate limiter 计数"]
+  E --> F["Item 可用<br/>可以被采样"]
 ```
 
 ### 4.2 Sample 路径
 
-```
-client.sample(table, num_samples=N)
-       │
-       ▼
-[传输层: gRPC stream / 直接指针 / SHM ring]
-       │
-       ▼
-Server → Table 后台工作线程处理采样  # 按 sampler 策略选取 item
-       │                            #   - 检查 rate limiter（MinSize 等）
-       ▼                            #   - 更新 times_sampled
-ReplaySample(info, data)           # 返回数据和元信息
+```mermaid
+flowchart TB
+  A["client.sample(table, num_samples=N)"] --> B["传输层：gRPC stream / 直接指针 / SHM ring"]
+  B --> C["Server → Table 后台工作线程处理采样<br/>按 sampler 策略选取 item<br/>· 检查 rate limiter（MinSize 等）<br/>· 更新 times_sampled"]
+  C --> D["ReplaySample(info, data)<br/>返回数据和元信息"]
 ```
 
 ---
