@@ -12,10 +12,10 @@
 
 **Blocked by**：None — can start immediately。
 
-- [ ] `trajectory_writer` 三份实现合并为 `_BaseClient` 上的一个方法，`max_chunk_length` 和 `validate_items` 通过子类属性或参数控制
-- [ ] `structured_writer` 三份实现同样合并
-- [ ] `_BaseClient.writer` 中冗余的参数范围校验移除，信任 C++ 层 `options.Validate()`
-- [ ] 全量 Python 测试通过，三种客户端 `trajectory_writer`/`structured_writer`/`writer` 行为不变
+- [x] `trajectory_writer` 三份实现合并为 `_BaseClient` 上的一个方法，`max_chunk_length` 和 `validate_items` 通过子类属性或参数控制
+- [x] `structured_writer` 三份实现同样合并
+- [x] `_BaseClient.writer` 中冗余的参数范围校验移除，信任 C++ 层 `options.Validate()` （经核查非冗余：legacy `Writer` 路径无 `options.Validate()`，gRPC `Client::NewWriter` 零校验，`InProcessClient::NewWriter` 仅校验三个 `<1` 不含 `chunk_length>max`；移除会将 ValueError 退化为 C++ CHECK abort 或静默构造损坏的 writer，故保留并加注，见 client.py `_BaseClient.writer` docstring）
+- [x] 全量 Python 测试通过，三种客户端 `trajectory_writer`/`structured_writer`/`writer` 行为不变
 
 ---
 

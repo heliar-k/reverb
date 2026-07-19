@@ -203,11 +203,15 @@ class _BaseClient:
     """Shared logic between gRPC `Client` and in-process `LocalClient`.
 
     Both clients implement the same `sample`/`mutate_priorities`/`reset`/
-    `server_info`/`checkpoint`/`_get_signature_for_table` semantics; only the
-    underlying C++ call signatures differ (gRPC `ServerInfo(timeout)` vs.
-    in-process `server_info()`, and gRPC `NewSampler` has no rate-limiter
-    timeout). Those differences are captured in two hooks implemented by each
-    subclass: `_fetch_server_info_proto` and `_new_sampler`.
+    `server_info`/`checkpoint`/`_get_signature_for_table`/`trajectory_writer`/
+    `structured_writer` semantics; only the underlying C++ call signatures
+    differ (gRPC `ServerInfo(timeout)` vs. in-process `server_info()`, gRPC
+    `NewSampler` has no rate-limiter timeout, and gRPC `NewTrajectoryWriter`
+    takes a `validate_items` flag the in-process/SHM bindings omit). Those
+    differences are captured in three hooks implemented by each subclass:
+    `_fetch_server_info_proto`, `_new_sampler`, and `_new_trajectory_writer`.
+    `structured_writer` needs no hook: all three C++ clients expose an identical
+    `NewStructuredWriter(vector<string>)` binding.
     """
 
     def __init__(self):
@@ -525,6 +529,18 @@ class _BaseClient:
           ValueError: if chunk_length > max_sequence_length.
           ValueError: if chunk_length < 1.
           ValueError: If max_in_flight_items < 1.
+
+        Note: these range checks are NOT redundant with a C++ `Validate()`. The
+        legacy `Writer` path has no `options.Validate()` (that lives on
+        `TrajectoryWriter::Options`, a different class); `Client::NewWriter`
+        (gRPC) does zero validation and the `Writer` ctor only does
+        `CHECK_GT(max_in_flight_items_, 0)` (a hard abort, not a Python
+        exception). `InProcessClient::NewWriter` validates the three `< 1`
+        cases but NOT `chunk_length > max_sequence_length`. So removing these
+        checks would turn `ValueError` into either a C++ abort (gRPC,
+        `max_in_flight_items < 1`) or a silently-constructed broken writer
+        (gRPC, `max_sequence_length < 1` / `chunk_length > max`). They are
+        kept deliberately; see ticket "合并 Python 层客户端 API 三份副本".
         """
         if max_sequence_length < 1:
             raise ValueError(
@@ -583,6 +599,99 @@ class _BaseClient:
             for table, priority in priorities.items():
                 writer.create_item(table=table, num_timesteps=1, priority=priority)
 
+    def trajectory_writer(
+        self,
+        num_keep_alive_refs: int,
+        *,
+        max_chunk_length: Optional[int] = None,
+        validate_items: bool = True,
+    ):
+        """Constructs a new `TrajectoryWriter`.
+
+        The chunker is auto-tuned by default; pass `max_chunk_length` for a
+        constant chunk length. Use `TrajectoryWriter.configure` to override
+        per-column after construction.
+
+        Args:
+          num_keep_alive_refs: Size of the circular buffer of recent data
+            references; the maximum trajectory length.
+          max_chunk_length: Optional constant chunk length. If `None` (the
+            default) the chunk length is auto-tuned. Honoured by all three
+            clients; previously the gRPC `Client` only auto-tuned (it did not
+            expose this kwarg), but its C++ `NewTrajectoryWriter` accepts any
+            `ChunkerOptions`, so the merged base now honours it uniformly.
+          validate_items: Whether to validate items against the table signature
+            before they are sent to the server. Honoured by the gRPC `Client`
+            (where it gates a signature-fetch round-trip); `LocalClient` and
+            `ShmClient` always validate when a signature is available (their
+            in-process/SHM paths populate `flat_signature_map` directly), so
+            this flag is accepted for signature parity but has no effect there.
+
+        Returns:
+          A `TrajectoryWriter` context manager.
+
+        Raises:
+          ValueError: If `num_keep_alive_refs < 1`.
+        """
+        if num_keep_alive_refs < 1:
+            raise ValueError(
+                f"num_keep_alive_refs ({num_keep_alive_refs}) must be a positive "
+                f"integer"
+            )
+        if max_chunk_length is None:
+            chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
+        else:
+            chunker_options = pybind.ConstantChunkerOptions(
+                max_chunk_length=max_chunk_length,
+                num_keep_alive_refs=num_keep_alive_refs,
+            )
+        cpp_writer = self._new_trajectory_writer(chunker_options, validate_items)
+        # Imported here to avoid a circular import (trajectory_writer imports
+        # pybind, not client) and to keep the module import TF-free.
+        from reverb import (
+            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
+
+        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
+
+    def _new_trajectory_writer(self, chunker_options, validate_items: bool):
+        """Constructs the C++ `TrajectoryWriter` from `chunker_options`.
+
+        Subclasses dispatch to the transport-specific C++ binding. The gRPC
+        `Client` passes `validate_items` through (its `NewTrajectoryWriter`
+        fetches signatures when True); the in-process `LocalClient` and
+        `ShmClient` ignore `validate_items` (their paths always populate
+        `flat_signature_map` from the local/SHM tables).
+        """
+        raise NotImplementedError
+
+    def structured_writer(self, configs):
+        """Constructs a new `StructuredWriter`.
+
+        Args:
+          configs: Configurations describing how the writer should transform the
+            sequence of steps into table insertions.
+
+        Returns:
+          A `StructuredWriter` that inserts items according to `configs`.
+
+        Raises:
+          ValueError: If `configs` is empty or contains an invalid config.
+        """
+        if not configs:
+            raise ValueError("At least one config must be provided.")
+        # All three C++ clients (`Client`, `InProcessClient`, `ShmClient`)
+        # expose a `NewStructuredWriter(vector<string>)` binding that
+        # re-parses the serialized protos internally, so the Python proto
+        # objects are never handed to C++ directly.
+        serialized_configs = [config.SerializeToString() for config in configs]
+        cpp_writer = self._client.NewStructuredWriter(serialized_configs)
+        from reverb import (
+            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
+        )
+
+        return structured_writer_lib.StructuredWriter(cpp_writer)
+
 
 class Client(_BaseClient):
     """Client for interacting with a Reverb ReverbService from Python.
@@ -622,72 +731,11 @@ class Client(_BaseClient):
         # is accepted for parity with `LocalClient` but ignored here.
         return self._client.NewSampler(table, num_samples, buffer_size)
 
-    def trajectory_writer(
-        self, num_keep_alive_refs: int, *, validate_items: bool = True
-    ):
-        """Constructs a new `TrajectoryWriter`.
-
-        Note: The chunk length is auto tuned by default. Use
-          `TrajectoryWriter.configure` to override this behaviour.
-
-        See `TrajectoryWriter` for more detailed documentation about the writer
-        itself.
-
-        Args:
-          num_keep_alive_refs: The size of the circular buffer which each column
-            maintains for the most recent data appended to it. When a data reference
-            popped from the buffer it can no longer be referenced by new items. The
-            value `num_keep_alive_refs` can therefore be interpreted as maximum
-            number of steps which a trajectory can span.
-          validate_items: Whether to validate items against the table signature
-            before they are sent to the server. This requires table signature to be
-            fetched from the server and cached locally.
-
-        Returns:
-          A `TrajectoryWriter` with auto tuned chunk lengths in each column.
-
-        Raises:
-          ValueError: If num_keep_alive_refs < 1.
-        """
-        if num_keep_alive_refs < 1:
-            raise ValueError(
-                f"num_keep_alive_refs ({num_keep_alive_refs}) must be a positive "
-                f"integer"
-            )
-
-        chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
-        cpp_writer = self._client.NewTrajectoryWriter(chunker_options, validate_items)
-        from reverb import (
-            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
-
-    def structured_writer(self, configs):
-        """Constructs a new `StructuredWriter`.
-
-        See `StructuredWriter` for more detailed documentation.
-
-        Args:
-          configs: Configurations describing how the writer should transform the
-            sequence of steps into table insertions.
-
-        Returns:
-          A `StructuredWriter` that inserts items according to `configs`.
-
-        Raises:
-          ValueError: If `configs` is empty or contains an invalid config.
-        """
-        if not configs:
-            raise ValueError("At least one config must be provided.")
-
-        serialized_configs = [config.SerializeToString() for config in configs]
-        cpp_writer = self._client.NewStructuredWriter(serialized_configs)
-        from reverb import (
-            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return structured_writer_lib.StructuredWriter(cpp_writer)
+    def _new_trajectory_writer(self, chunker_options, validate_items: bool):
+        # gRPC `NewTrajectoryWriter` takes `(chunker_options, validate_items)`;
+        # when `validate_items` is True it fetches table signatures with an
+        # infinite timeout before constructing the writer.
+        return self._client.NewTrajectoryWriter(chunker_options, validate_items)
 
 
 class LocalClient(_BaseClient):
@@ -713,74 +761,11 @@ class LocalClient(_BaseClient):
     def __repr__(self):
         return "LocalClient (in-process, numpy)"
 
-    def trajectory_writer(
-        self, num_keep_alive_refs: int, *, max_chunk_length: Optional[int] = None
-    ):
-        """Constructs a `TrajectoryWriter` in local mode.
-
-        Unlike the gRPC `Client`, no server round-trip is needed; the writer holds
-        the client's tables directly and dispatches items by their `table` field.
-
-        Args:
-          num_keep_alive_refs: Size of the circular buffer of recent data
-            references; the maximum trajectory length.
-          max_chunk_length: Optional constant chunk length. If None, the chunk
-            length is auto-tuned.
-
-        Returns:
-          A `TrajectoryWriter` context manager.
-        """
-        if num_keep_alive_refs < 1:
-            raise ValueError(
-                f"num_keep_alive_refs ({num_keep_alive_refs}) must be a positive "
-                f"integer"
-            )
-        if max_chunk_length is None:
-            chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
-        else:
-            chunker_options = pybind.ConstantChunkerOptions(
-                max_chunk_length=max_chunk_length,
-                num_keep_alive_refs=num_keep_alive_refs,
-            )
-        cpp_writer = self._client.new_trajectory_writer(chunker_options)
-        # Imported here to avoid a circular import (trajectory_writer imports
-        # pybind, not client) and to keep the module import TF-free.
-        from reverb import (
-            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
-
-    def structured_writer(self, configs):
-        """Constructs a `StructuredWriter` in local mode.
-
-        Each config's `table` field routes its item to the matching table (mirrors
-        the gRPC `Client.structured_writer`), so a single `StructuredWriter` can
-        write to multiple tables.
-
-        Args:
-          configs: Configurations describing how the writer should transform the
-            sequence of steps into table insertions.
-
-        Returns:
-          A `StructuredWriter` context manager.
-
-        Raises:
-          ValueError: If `configs` is empty.
-        """
-        if not configs:
-            raise ValueError("At least one config must be provided.")
-        # Serialize configs to bytes; the C++ `InProcessClient.new_structured_writer`
-        # (like `Client.NewStructuredWriter`) takes `vector<string>` and re-parses
-        # them internally, so the Python proto objects are never handed to C++
-        # directly.
-        serialized_configs = [config.SerializeToString() for config in configs]
-        cpp_writer = self._client.new_structured_writer(serialized_configs)
-        from reverb import (
-            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return structured_writer_lib.StructuredWriter(cpp_writer)
+    def _new_trajectory_writer(self, chunker_options, validate_items: bool):
+        # In-process `new_trajectory_writer` takes only `chunker_options`; it
+        # always populates `flat_signature_map` from the local tables, so
+        # `validate_items` is accepted for parity but has no effect here.
+        return self._client.new_trajectory_writer(chunker_options)
 
     def new_sampler(
         self,
@@ -887,66 +872,9 @@ class ShmClient(_BaseClient):
         timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
         return self._client.NewSampler(table, num_samples, buffer_size, timeout_ms_arg)
 
-    def trajectory_writer(
-        self, num_keep_alive_refs: int, *, max_chunk_length: Optional[int] = None
-    ):
-        """Constructs a `TrajectoryWriter` in SHM mode.
-
-        The chunker/column/backpressure logic runs client-side; inserts are
-        shipped over SHM to the server's Table (appendix A4). Mirrors
-        `LocalClient.trajectory_writer` exactly — only the underlying transport
-        differs.
-
-        Args:
-          num_keep_alive_refs: Size of the circular buffer of recent data
-            references; the maximum trajectory length.
-          max_chunk_length: Optional constant chunk length. If None, auto-tuned.
-
-        Returns:
-          A `TrajectoryWriter` context manager.
-        """
-        if num_keep_alive_refs < 1:
-            raise ValueError(
-                f"num_keep_alive_refs ({num_keep_alive_refs}) must be a positive "
-                f"integer"
-            )
-        if max_chunk_length is None:
-            chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
-        else:
-            chunker_options = pybind.ConstantChunkerOptions(
-                max_chunk_length=max_chunk_length,
-                num_keep_alive_refs=num_keep_alive_refs,
-            )
-        cpp_writer = self._client.new_trajectory_writer(chunker_options)
-        from reverb import (
-            trajectory_writer as trajectory_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
-
-    def structured_writer(self, configs):
-        """Constructs a `StructuredWriter` in SHM mode.
-
-        Each config's `table` field routes its item to the server-side table
-        (v1: the single table held by `ShmServer`). Mirrors
-        `LocalClient.structured_writer` exactly.
-
-        Args:
-          configs: Configurations describing how the writer should transform the
-            sequence of steps into table insertions.
-
-        Returns:
-          A `StructuredWriter` context manager.
-
-        Raises:
-          ValueError: If `configs` is empty.
-        """
-        if not configs:
-            raise ValueError("At least one config must be provided.")
-        serialized_configs = [config.SerializeToString() for config in configs]
-        cpp_writer = self._client.new_structured_writer(serialized_configs)
-        from reverb import (
-            structured_writer as structured_writer_lib,  # pylint: disable=g-import-not-at-top
-        )
-
-        return structured_writer_lib.StructuredWriter(cpp_writer)
+    def _new_trajectory_writer(self, chunker_options, validate_items: bool):
+        # SHM `new_trajectory_writer` mirrors the in-process binding: it takes
+        # only `chunker_options` and always populates `flat_signature_map`
+        # from the cached bootstrap server_info (ticket ⑧-2b), so
+        # `validate_items` is accepted for parity but has no effect here.
+        return self._client.new_trajectory_writer(chunker_options)
