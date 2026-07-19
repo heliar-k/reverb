@@ -58,7 +58,7 @@ sample = next(server.in_process_client.sample('q', 1, emit_timesteps=False))
 └─────────────────────────────────────────────────────────┘
 ```
 
-**核心思路：** Server 持有若干 Table，每个 Table 是一个独立的「容器 + 采样/移除策略」组合。Client 通过三种传输层之一连接 Server，写入数据或读取样本。传输层对上层核心 API 完全透明——用 `trajectory_writer`、`structured_writer`、`sample`、`mutate_priorities` 时调用方式都一样。**例外：** `ShmClient` 不支持 legacy `insert`/`writer`（请使用 `trajectory_writer` 代替）。详见 [client-transports.md](client-transports.md)。
+**核心思路：** Server 持有若干 Table，每个 Table 是一个独立的「容器 + 采样/移除策略」组合。Client 通过三种传输层之一连接 Server，写入数据或读取样本。传输层对上层核心 API 完全透明——用 `trajectory_writer`、`structured_writer`、`sample`、`mutate_priorities` 时调用方式都一样。**例外：** `ShmClient` 不支持 `Writer`/`insert`（较早的写入 API，功能已被 `TrajectoryWriter` 取代），请使用 `trajectory_writer` 代替。详见 [client-transports.md](client-transports.md)。
 
 > 图中 `sampler`、`remover`、`rate_limiter` 等概念详见下文第 3 节。
 
@@ -203,6 +203,8 @@ for step in range(100):
 
 **何时用哪个？** 简单场景用 `StructuredWriter`（少写代码），复杂逻辑或需要手动切轨迹时用 `TrajectoryWriter`。
 
+> 历史遗留：`client.writer()` 返回一个更早的 `Writer` 对象，功能与 `TrajectoryWriter` 重叠但不支持轨迹构造。新代码请统一使用 `TrajectoryWriter`。`Writer` 已从 `ShmClient` 中移除。
+
 ### 3.6 Selector（选择策略）
 
 决定「取哪条」和「淘汰哪条」。所有 Selector 都可用于 `sampler` 或 `remover`。
@@ -229,7 +231,7 @@ for step in range(100):
 
 `SampleToInsertRatio` 内建了 MinSize 行为（通过 `min_size_to_sample` 参数）：先保证表中有足够 item，再按 ratio 约束插入和采样的速率。每个 Table 只接受一个 RateLimiter，不需要手动组合两个对象。
 
-所有 rate limiter 在条件不满足时会**阻塞** `sample()`/`insert()`。想给阻塞加超时，可以在 `sample()` 和 `flush()` 中传 `timeout_ms` 参数（超时抛出 `DeadlineExceededError`，继承自 `ReverbError`）。想非阻塞地检查是否可插入/采样，使用 Table 的方法 `table.can_sample(num_samples)` / `table.can_insert(num_items)`。
+所有 rate limiter 在条件不满足时会**阻塞** `sample()`/`insert()`。想给阻塞加超时，可以在 `sample()` 和 `flush()` 中传 `timeout_ms` 参数（超时抛出 `DeadlineExceededError`，继承自 `ReverbError`）。想非阻塞地检查是否可插入/采样，使用 Table 的方法 `table.can_sample(num_samples)` / `table.can_insert(num_inserts)`。
 
 如需清空一个 Table 的所有内容并重置 rate limiter：
 
