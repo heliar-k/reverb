@@ -479,6 +479,33 @@ absl::StatusOr<int> PrepareStructuredWriterConfigs(
   return max_num_keep_alive_refs;
 }
 
+absl::Status MakeStructuredWriter(
+    std::vector<StructuredWriterConfig> configs,
+    std::unique_ptr<StructuredWriter>* writer,
+    std::function<absl::Status(const TrajectoryWriter::Options&,
+                               std::unique_ptr<TrajectoryWriter>*)>
+        make_trajectory_writer) {
+  if (configs.empty()) {
+    return absl::InvalidArgumentError("At least one config must be provided.");
+  }
+
+  REVERB_ASSIGN_OR_RETURN(
+      int max_num_keep_alive_refs,
+      PrepareStructuredWriterConfigs(configs));
+
+  TrajectoryWriter::Options options = {
+      .chunker_options =
+          std::make_shared<AutoTunedChunkerOptions>(max_num_keep_alive_refs),
+  };
+  std::unique_ptr<TrajectoryWriter> trajectory_writer;
+  REVERB_RETURN_IF_ERROR(
+      make_trajectory_writer(options, &trajectory_writer));
+
+  *writer = std::make_unique<StructuredWriter>(std::move(trajectory_writer),
+                                               std::move(configs));
+  return absl::OkStatus();
+}
+
 StructuredWriter::StructuredWriter(std::unique_ptr<ColumnWriter> writer,
                                    std::vector<StructuredWriterConfig> configs)
     : writer_(std::move(writer)),

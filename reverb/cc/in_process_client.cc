@@ -83,27 +83,14 @@ absl::Status InProcessClient::NewTrajectoryWriter(
 absl::Status InProcessClient::NewStructuredWriter(
     std::vector<StructuredWriterConfig> configs,
     std::unique_ptr<StructuredWriter>* writer) {
-  if (configs.empty()) {
-    return absl::InvalidArgumentError("At least one config must be provided.");
-  }
-
-  // ponytail: configs 的补条件/校验/max_num_keep_alive_refs 计算已收敛到
-  // PrepareStructuredWriterConfigs(与 Client::NewStructuredWriter 共用)。
-  REVERB_ASSIGN_OR_RETURN(
-      int max_num_keep_alive_refs,
-      PrepareStructuredWriterConfigs(configs));
-
-  TrajectoryWriter::Options options = {
-      .chunker_options =
-          std::make_shared<AutoTunedChunkerOptions>(max_num_keep_alive_refs),
-  };
-  std::unique_ptr<TrajectoryWriter> trajectory_writer;
-  REVERB_RETURN_IF_ERROR(
-      NewTrajectoryWriter(options, &trajectory_writer));
-
-  *writer = std::make_unique<StructuredWriter>(std::move(trajectory_writer),
-                                               std::move(configs));
-  return absl::OkStatus();
+  // ponytail: 主体收敛到 MakeStructuredWriter(与 Client/ShmClient 共用),
+  // 仅 NewTrajectoryWriter 钩子为本客户端专有(走本地 tables_ 路径)。
+  return MakeStructuredWriter(
+      std::move(configs), writer,
+      [this](const TrajectoryWriter::Options& options,
+             std::unique_ptr<TrajectoryWriter>* trajectory_writer) {
+        return NewTrajectoryWriter(options, trajectory_writer);
+      });
 }
 
 absl::Status InProcessClient::NewSampler(const std::string& table_name,

@@ -16,6 +16,7 @@
 #define REVERB_CC_STRUCTURED_WRITER_H_
 
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -114,6 +115,19 @@ absl::Status ValidateStructuredWriterConfig(
 // 供调用方构造 AutoTunedChunkerOptions。两处调用模式一致(table 由调用方处理)。
 absl::StatusOr<int> PrepareStructuredWriterConfigs(
     std::vector<StructuredWriterConfig>& configs);
+
+// ponytail: 收敛 Client/InProcessClient/ShmClient 三份逐字相同的
+// NewStructuredWriter 主体。差异仅在「如何构造 TrajectoryWriter」——各客户端
+// 通过 `make_trajectory_writer` 钩子提供自己的 NewTrajectoryWriter(gRPC 走
+// ServerInfo 缓存、in-process 走本地 tables_、SHM 走 live SERVER_INFO)。
+// signature 填充逻辑刻意不在此处模板化:三端数据源/容器/助手函数都不同
+// (见各 NewTrajectoryWriter),模板化会把三份不同代码塞进一个钩子,反增复杂度。
+absl::Status MakeStructuredWriter(
+    std::vector<StructuredWriterConfig> configs,
+    std::unique_ptr<StructuredWriter>* writer,
+    std::function<absl::Status(const TrajectoryWriter::Options&,
+                               std::unique_ptr<TrajectoryWriter>*)>
+        make_trajectory_writer);
 
 }  // namespace deepmind::reverb
 

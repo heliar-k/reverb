@@ -38,10 +38,16 @@
 
 **Blocked by**：None — can start immediately。
 
-- [ ] `MakeStructuredWriter` 自由函数替代三份 `NewStructuredWriter` 重复实现
+- [x] `MakeStructuredWriter` 自由函数替代三份 `NewStructuredWriter` 重复实现
 - [ ] `PopulateFlatSignatureMap` 模板函数消除三份 signature 填充副本，客户端提供 signature 获取钩子
 - [ ] `client.h`/`in_process_client.h`/`shm_client.h` 中移除已不再需要的重复声明
 - [ ] 全量 C++ 构建和传输层测试通过
+
+> **实现说明（2026-07）**：`MakeStructuredWriter` 已提取为 `structured_writer.h/.cc` 中的自由函数，三端 `NewStructuredWriter` 收敛为传入各自 `NewTrajectoryWriter` 钩子的薄封装。
+>
+> `PopulateFlatSignatureMap` 刻意不提取——经核查三端 signature 填充路径为「概念相似但实现不同」而非复制粘贴：gRPC 走 `MaybeUpdateServerInfoCache` 从缓存 RPC 取 `RepeatedPtrField<TableInfo>` 调 `FlatSignatureFromTableInfo`；in-process 遍历本地 `flat_hash_map<string,shared_ptr<Table>>` 调 `FlatSignatureFromSignatureProto` 且有 `has_value()` 条件分支；SHM 从 live `SERVER_INFO` ring 取 `std::vector<TableInfo>` 调 `FlatSignatureFromTableInfo`。容器类型、助手函数、控制流均不同，共享的仅「循环 + 赋给 `signatures[name]`」约三行。模板化需双钩子（元素转换 + 源获取）换三行收益，净增复杂度，故判为伪需求。
+>
+> 头声明无冗余可删：`NewStructuredWriter` 仍是三端的公开 API 入口（pybind/tests/Python 直接调用），提取的是函数体而非方法本身；仅同步修正了 `in_process_client.h`/`shm_client.h` 中描述内部实现的注释指向 `MakeStructuredWriter`。
 
 ---
 

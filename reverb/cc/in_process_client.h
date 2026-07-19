@@ -56,9 +56,10 @@ class InProcessClient {
   absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
                                   std::unique_ptr<TrajectoryWriter>* writer);
 
-  // 校验 `configs` 并创建 `StructuredWriter`。内部按 `Client::NewStructuredWriter`
-  // 的逻辑算 max_num_keep_alive_refs、补 buffer_length 条件、构造
-  // `AutoTunedChunkerOptions`,然后调 `NewTrajectoryWriter`。
+  // 校验 `configs` 并创建 `StructuredWriter`。主体走共享的
+  // `MakeStructuredWriter`(与 Client/ShmClient 共用):算 max_num_keep_alive_refs、
+  // 补 buffer_length 条件、构造 `AutoTunedChunkerOptions`,然后调本客户端的
+  // `NewTrajectoryWriter`。
   //
   // 每个 config 的 `table` 字段决定其 item 落入哪个 table(经底层
   // TrajectoryWriter 的 `tables_` map 分发),支持多表写入。

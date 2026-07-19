@@ -127,9 +127,10 @@ class ShmClient {
   absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
                                    std::unique_ptr<TrajectoryWriter>* writer);
 
-  // Mirrors InProcessClient::NewStructuredWriter: runs
-  // PrepareStructuredWriterConfigs to compute max_num_keep_alive_refs, builds
-  // AutoTunedChunkerOptions, and wraps a SHM TrajectoryWriter. Each config's
+  // Mirrors InProcessClient::NewStructuredWriter: delegates the shared body
+  // to MakeStructuredWriter (computes max_num_keep_alive_refs via
+  // PrepareStructuredWriterConfigs, builds AutoTunedChunkerOptions) and wraps
+  // a SHM TrajectoryWriter via the NewTrajectoryWriter hook. Each config's
   // `table` field routes its item to the server-side table.
   absl::Status NewStructuredWriter(
       std::vector<StructuredWriterConfig> configs,
