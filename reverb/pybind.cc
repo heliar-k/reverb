@@ -230,6 +230,49 @@ namespace {
 
 namespace py = pybind11;
 
+// Serializes a vector of TableInfo protos into py::bytes (one per entry).
+// Used by the ServerInfo bindings of Client / InProcessClient / ShmClient.
+// Must run with the GIL held (constructs py::bytes).
+std::vector<py::bytes> SerializeTableInfoToPyBytes(
+    const std::vector<TableInfo>& table_info) {
+  std::vector<py::bytes> serialized;
+  serialized.reserve(table_info.size());
+  for (const auto& info : table_info) {
+    serialized.emplace_back(info.SerializeAsString());
+  }
+  return serialized;
+}
+
+// Converts (key, priority) pairs into KeyWithPriority protos for the
+// MutatePriorities bindings of Client / InProcessClient / ShmClient.
+std::vector<KeyWithPriority> UpdatesToKeyWithPriorityProtos(
+    const std::vector<std::pair<uint64_t, double>>& updates) {
+  std::vector<KeyWithPriority> protos;
+  protos.reserve(updates.size());
+  for (const auto& update : updates) {
+    protos.emplace_back();
+    protos.back().set_key(update.first);
+    protos.back().set_priority(update.second);
+  }
+  return protos;
+}
+
+// Builds Sampler::Options from the Python-facing args shared by the
+// new_sampler bindings of Client / InProcessClient / ShmClient. A negative
+// `rate_limiter_timeout_ms` yields InfiniteDuration(), which is the field's
+// default — so the gRPC path (which historically omitted the field) passes -1
+// and gets byte-identical behavior.
+Sampler::Options BuildSamplerOptions(int64_t max_samples,
+                                     size_t buffer_size,
+                                     int64_t rate_limiter_timeout_ms) {
+  Sampler::Options options;
+  options.max_samples = max_samples;
+  options.max_in_flight_samples_per_worker = buffer_size;
+  options.rate_limiter_timeout =
+      Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
+  return options;
+}
+
 PYBIND11_MODULE(libpybind, m) {
   // numpy C-API import; must run once after the interpreter is up.
   if (_import_array() < 0) {
@@ -421,9 +464,8 @@ PYBIND11_MODULE(libpybind, m) {
            [](Client* client, const std::string& table, int64_t max_samples,
               size_t buffer_size) {
              std::unique_ptr<Sampler> sampler;
-             Sampler::Options options;
-             options.max_samples = max_samples;
-             options.max_in_flight_samples_per_worker = buffer_size;
+             Sampler::Options options =
+                 BuildSamplerOptions(max_samples, buffer_size, /*timeout_ms=*/-1);
              absl::Status status;
              {
                py::gil_scoped_release g;
@@ -483,12 +525,8 @@ PYBIND11_MODULE(libpybind, m) {
           [](Client* client, const std::string& table,
              const std::vector<std::pair<uint64_t, double>>& updates,
              const std::vector<uint64_t>& deletes) {
-            std::vector<KeyWithPriority> update_protos;
-            for (const auto &update : updates) {
-              update_protos.emplace_back();
-              update_protos.back().set_key(update.first);
-              update_protos.back().set_priority(update.second);
-            }
+            std::vector<KeyWithPriority> update_protos =
+                UpdatesToKeyWithPriorityProtos(updates);
             absl::Status status;
             {
               py::gil_scoped_release g;
@@ -517,13 +555,7 @@ PYBIND11_MODULE(libpybind, m) {
                status = client->ServerInfo(timeout, &info);
              }
              MaybeRaiseFromStatus(status);
-             std::vector<py::bytes> serialized_table_info;
-             serialized_table_info.reserve(info.table_info.size());
-             for (const auto &table_info : info.table_info) {
-               serialized_table_info.push_back(
-                   py::bytes(table_info.SerializeAsString()));
-             }
-             return serialized_table_info;
+             return SerializeTableInfoToPyBytes(info.table_info);
            })
       .def("Checkpoint", [](Client* client) {
         std::string path;
@@ -843,11 +875,8 @@ PYBIND11_MODULE(libpybind, m) {
       [](InProcessClient* client, const std::string& table,
          int64_t max_samples, size_t buffer_size,
          int64_t rate_limiter_timeout_ms) -> Sampler* {
-        Sampler::Options options;
-        options.max_samples = max_samples;
-        options.max_in_flight_samples_per_worker = buffer_size;
-        options.rate_limiter_timeout =
-            Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
+        Sampler::Options options = BuildSamplerOptions(
+            max_samples, buffer_size, rate_limiter_timeout_ms);
         std::unique_ptr<Sampler> sampler;
         absl::Status status;
         {
@@ -861,12 +890,8 @@ PYBIND11_MODULE(libpybind, m) {
       [](InProcessClient* client, const std::string& table,
          const std::vector<std::pair<uint64_t, double>>& updates,
          const std::vector<uint64_t>& deletes) {
-        std::vector<KeyWithPriority> update_protos;
-        for (const auto &update : updates) {
-          update_protos.emplace_back();
-          update_protos.back().set_key(update.first);
-          update_protos.back().set_priority(update.second);
-        }
+        std::vector<KeyWithPriority> update_protos =
+            UpdatesToKeyWithPriorityProtos(updates);
         absl::Status status;
         {
           py::gil_scoped_release g;
@@ -900,14 +925,7 @@ PYBIND11_MODULE(libpybind, m) {
       status = client->ServerInfo(&table_info);
     }
     MaybeRaiseFromStatus(status);
-
-    // Return a list of serialized TableInfo proto bytes strings.
-    std::vector<py::bytes> serialized_table_info;
-    serialized_table_info.reserve(table_info.size());
-    for (const auto &info : table_info) {
-      serialized_table_info.push_back(py::bytes(info.SerializeAsString()));
-    }
-    return serialized_table_info;
+    return SerializeTableInfoToPyBytes(table_info);
   };
 
   py::class_<InProcessClient, std::shared_ptr<InProcessClient>>(
@@ -1084,11 +1102,8 @@ PYBIND11_MODULE(libpybind, m) {
   auto shm_new_sampler_fn =
       [](ShmClient* client, const std::string& table, int64_t max_samples,
          size_t buffer_size, int64_t rate_limiter_timeout_ms) -> ShmSampler* {
-        Sampler::Options options;
-        options.max_samples = max_samples;
-        options.max_in_flight_samples_per_worker = buffer_size;
-        options.rate_limiter_timeout =
-            Int64MillisToNonnegativeDuration(rate_limiter_timeout_ms);
+        Sampler::Options options = BuildSamplerOptions(
+            max_samples, buffer_size, rate_limiter_timeout_ms);
         std::unique_ptr<ShmSampler> sampler;
         absl::Status status;
         {
@@ -1148,12 +1163,7 @@ PYBIND11_MODULE(libpybind, m) {
       status = client->ServerInfo(&table_info);
     }
     MaybeRaiseFromStatus(status);
-    std::vector<py::bytes> serialized_table_info;
-    serialized_table_info.reserve(table_info.size());
-    for (const auto& info : table_info) {
-      serialized_table_info.push_back(py::bytes(info.SerializeAsString()));
-    }
-    return serialized_table_info;
+    return SerializeTableInfoToPyBytes(table_info);
   };
   // ticket ⑩: MutatePriorities/Reset over SHM (ride the insert flow under
   // ShmConnection::insert_flow_mu). Mirrors the gRPC Client / InProcessClient
@@ -1162,12 +1172,8 @@ PYBIND11_MODULE(libpybind, m) {
       [](ShmClient* client, const std::string& table,
          const std::vector<std::pair<uint64_t, double>>& updates,
          const std::vector<uint64_t>& deletes) {
-        std::vector<KeyWithPriority> update_protos;
-        for (const auto& update : updates) {
-          update_protos.emplace_back();
-          update_protos.back().set_key(update.first);
-          update_protos.back().set_priority(update.second);
-        }
+        std::vector<KeyWithPriority> update_protos =
+            UpdatesToKeyWithPriorityProtos(updates);
         absl::Status status;
         {
           py::gil_scoped_release g;

@@ -51,7 +51,7 @@
 
 **Blocked by**：None — can start immediately。
 
-- [ ] `SerializeTableInfoToPyBytes` 辅助函数消除三处重复序列化
-- [ ] `UpdatesToKeyWithPriorityProtos` 辅助函数消除三处重复 proto 转换
-- [ ] `BuildSamplerOptions` 辅助函数消除三处重复构造
-- [ ] 全量 pybind 构建和 Python API 测试通过，所有客户端方法行为不变
+- [x] `SerializeTableInfoToPyBytes` 辅助函数消除三处重复序列化
+- [x] `UpdatesToKeyWithPriorityProtos` 辅助函数消除三处重复 proto 转换
+- [x] `BuildSamplerOptions` 辅助函数消除三处重复构造
+- [x] 全量 pybind 构建和 Python API 测试通过，所有客户端方法行为不变
