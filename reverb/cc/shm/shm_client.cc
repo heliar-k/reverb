@@ -83,6 +83,70 @@ absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload,
   }
 }
 
+// ticket「提取 SHM 写入-读取-确认公共循环」: the four insert-flow control-plane
+// ops (ServerInfo/MutatePriorities/Reset/Checkpoint) share one body —
+// serialize request → lock insert_flow_mu → write insert_c2s → ReadBlocking
+// insert_s2c → map ShmError → parse response. Factored here so each caller
+// just builds its request proto and (if non-empty) reads its response field.
+//
+// `map_routing_errors`: MutatePriorities/Reset map ShmError::NOT_FOUND ->
+// NotFoundError and INVALID_ARGUMENT -> InvalidArgumentError (so unknown-table
+// / bad-arg surfaces as FileNotFoundError/ValueError in Python).
+// Checkpoint/ServerInfo's server handlers have no NOT_FOUND/INVALID_ARGUMENT
+// path and historically surface every server error as InternalError — pass
+// false to preserve that. ponytail: one boolean hook, not three.
+//
+// Mutex/ring/timeout rationale (previously per-method, now shared):
+// insert_flow_mu serializes the whole send→read-ACK round-trip so this caller
+// thread and RunShmWorker (the insert worker background thread) are never both
+// mid-flight on insert_c2s (two producers on one SPSC `head` corrupt the ring).
+// kReadBlockingHardCap is the finite robustness ceiling so a stuck server
+// dispatch can't make the client spin forever (tickets ⑩/⑪ 方向 C).
+template <typename Req, typename Resp>
+absl::Status SendInsertFlowRequest(ShmConnection* conn, const Req& request,
+                                   MsgType req_type, MsgType expected_resp_type,
+                                   absl::string_view op_name,
+                                   bool map_routing_errors, Resp* response) {
+  std::string body;
+  request.SerializeToString(&body);
+
+  absl::MutexLock lock(&conn->insert_flow_mu);
+  REVERB_RETURN_IF_ERROR(
+      conn->insert_c2s.Write(req_type, absl::MakeSpan(body)));
+
+  MsgType resp_type;
+  std::string resp_body;
+  REVERB_RETURN_IF_ERROR(ReadBlocking(&conn->insert_s2c, &resp_type, &resp_body,
+                                      conn->control_fd, kReadBlockingHardCap));
+
+  if (resp_type == ERROR) {
+    ShmError err;
+    if (!err.ParseFromString(resp_body)) {
+      return absl::InternalError(
+          absl::StrCat("ShmClient::", op_name, ": malformed ShmError"));
+    }
+    if (map_routing_errors) {
+      if (err.code() == ShmError::NOT_FOUND) {
+        return absl::NotFoundError(err.message());
+      }
+      if (err.code() == ShmError::INVALID_ARGUMENT) {
+        return absl::InvalidArgumentError(err.message());
+      }
+    }
+    return absl::InternalError(absl::StrCat("ShmClient::", op_name,
+                                            ": server error: ", err.message()));
+  }
+  if (resp_type != expected_resp_type) {
+    return absl::InternalError(absl::StrCat(
+        "ShmClient::", op_name, ": unexpected response type ", resp_type));
+  }
+  if (!response->ParseFromString(resp_body)) {
+    return absl::InternalError(
+        absl::StrCat("ShmClient::", op_name, ": malformed response"));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 // ---- ShmSampler ----
@@ -360,44 +424,15 @@ absl::StatusOr<std::unique_ptr<ShmClient>> ShmClient::Connect(
 
 absl::Status ShmClient::ServerInfo(std::vector<TableInfo>* table_info) {
   // ticket ⑧ step 2: on-demand SERVER_INFO round-trip (replaces the step-1
-  // bootstrap snapshot). Rides the INSERT flow under insert_flow_mu like
-  // ⑩/⑪'s control-plane ops — see MutatePriorities for the mutex rationale.
-  // ServerInfoRequest is empty; ServerInfoResponse carries repeated TableInfo.
-  // Always succeeds server-side (HandleServerInfo has no error path).
+  // bootstrap snapshot) so server_info() reflects mid-session state. Rides
+  // the INSERT flow under insert_flow_mu like ⑩/⑪'s control-plane ops.
+  // HandleServerInfo has no error path, so map_routing_errors=false preserves
+  // the historical always-Internal error mapping.
   ServerInfoRequest req;
-  std::string body;
-  req.SerializeToString(&body);
-
-  absl::MutexLock lock(&conn_.insert_flow_mu);
-  REVERB_RETURN_IF_ERROR(
-      conn_.insert_c2s.Write(SERVER_INFO, absl::MakeSpan(body)));
-
-  MsgType resp_type;
-  std::string resp_body;
-  // Same kReadBlockingHardCap cap as ⑩/⑪'s control-plane ACKs.
-  REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
-                   kReadBlockingHardCap));
-
-  if (resp_type == ERROR) {
-    // HandleServerInfo has no error path, but defend against future ones.
-    ShmError err;
-    if (!err.ParseFromString(resp_body)) {
-      return absl::InternalError(
-          "ShmClient::ServerInfo: malformed ShmError");
-    }
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::ServerInfo: server error: ", err.message()));
-  }
-  if (resp_type != SERVER_INFO_RESP) {
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::ServerInfo: unexpected response type ", resp_type));
-  }
   ServerInfoResponse resp;
-  if (!resp.ParseFromString(resp_body)) {
-    return absl::InternalError(
-        "ShmClient::ServerInfo: malformed ServerInfoResponse");
-  }
+  REVERB_RETURN_IF_ERROR(SendInsertFlowRequest(
+      &conn_, req, SERVER_INFO, SERVER_INFO_RESP, /*op_name=*/"ServerInfo",
+      /*map_routing_errors=*/false, &resp));
   table_info->clear();
   table_info->reserve(resp.table_info_size());
   for (const auto& info : resp.table_info()) {
@@ -409,137 +444,43 @@ absl::Status ShmClient::ServerInfo(std::vector<TableInfo>* table_info) {
 absl::Status ShmClient::MutatePriorities(
     const std::string& table, const std::vector<KeyWithPriority>& updates,
     const std::vector<uint64_t>& deletes) {
-  // ticket ⑩: ride the INSERT flow. Hold conn_.insert_flow_mu across the whole
-  // send→read-ACK sequence so this caller thread and RunShmWorker (the insert
-  // worker background thread) are never both mid-flight on insert_c2s — that
-  // would put two producers on one SPSC `head` and silently corrupt the ring.
-  // The server-side dispatch is single-threaded and reads insert_c2s in order,
-  // replying on insert_s2c in order, so whoever holds the mutex sends one
-  // request and gets its matching ACK before releasing. Reuses the existing
-  // reverb_service.proto MutatePrioritiesRequest (empty Response).
+  // ticket ⑩: rides the INSERT flow (see SendInsertFlowRequest for the
+  // insert_flow_mu / ring / timeout rationale). map_routing_errors=true so an
+  // unknown table surfaces as FileNotFoundError and a bad arg as ValueError
+  // (mirrors FetchOne's error mapping). Reuses reverb_service.proto
+  // MutatePrioritiesRequest/Response (Response is empty).
   MutatePrioritiesRequest req;
   req.set_table(table);
   for (const auto& u : updates) *req.add_updates() = u;
   for (uint64_t k : deletes) req.add_delete_keys(k);
-  std::string body;
-  req.SerializeToString(&body);
-
-  absl::MutexLock lock(&conn_.insert_flow_mu);
-  REVERB_RETURN_IF_ERROR(
-      conn_.insert_c2s.Write(MUTATE_PRIORITIES, absl::MakeSpan(body)));
-
-  MsgType resp_type;
-  std::string resp_body;
-  // ticket ⑩ 方向 C：控制面 ACK 等待用有限硬上限，避免 dispatch 被卡时 client
-  // 无限忙等（mutate/reset 本身不含超时语义，靠此兜底）。
-  REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
-                   kReadBlockingHardCap));
-
-  if (resp_type == ERROR) {
-    // mirror FetchOne's error mapping: NOT_FOUND -> NotFoundError (Python
-    // FileNotFoundError), INVALID_ARGUMENT -> InvalidArgumentError, else
-    // InternalError.
-    ShmError err;
-    if (!err.ParseFromString(resp_body)) {
-      return absl::InternalError(
-          "ShmClient::MutatePriorities: malformed ShmError");
-    }
-    if (err.code() == ShmError::NOT_FOUND) {
-      return absl::NotFoundError(err.message());
-    }
-    if (err.code() == ShmError::INVALID_ARGUMENT) {
-      return absl::InvalidArgumentError(err.message());
-    }
-    return absl::InternalError(
-        absl::StrCat("ShmClient::MutatePriorities: server error: ", err.message()));
-  }
-  if (resp_type != MUTATE_ACK) {
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::MutatePriorities: unexpected response type ", resp_type));
-  }
-  return absl::OkStatus();  // MUTATE_ACK is empty
+  MutatePrioritiesResponse resp;  // empty
+  return SendInsertFlowRequest(&conn_, req, MUTATE_PRIORITIES, MUTATE_ACK,
+                               /*op_name=*/"MutatePriorities",
+                               /*map_routing_errors=*/true, &resp);
 }
 
 absl::Status ShmClient::Reset(const std::string& table) {
-  // ticket ⑩: same insert-flow round-trip as MutatePriorities (see above for
-  // the mutex rationale). ResetRequest{table}; RESET_ACK is empty.
+  // ticket ⑩: same insert-flow round-trip as MutatePriorities (see
+  // SendInsertFlowRequest). ResetRequest{table}; ResetResponse is empty.
   ResetRequest req;
   req.set_table(table);
-  std::string body;
-  req.SerializeToString(&body);
-
-  absl::MutexLock lock(&conn_.insert_flow_mu);
-  REVERB_RETURN_IF_ERROR(
-      conn_.insert_c2s.Write(RESET, absl::MakeSpan(body)));
-
-  MsgType resp_type;
-  std::string resp_body;
-  // ticket ⑩ 方向 C：控制面 ACK 等待用有限硬上限（同 MutatePriorities）。
-  REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
-                   kReadBlockingHardCap));
-
-  if (resp_type == ERROR) {
-    ShmError err;
-    if (!err.ParseFromString(resp_body)) {
-      return absl::InternalError("ShmClient::Reset: malformed ShmError");
-    }
-    if (err.code() == ShmError::NOT_FOUND) {
-      return absl::NotFoundError(err.message());
-    }
-    if (err.code() == ShmError::INVALID_ARGUMENT) {
-      return absl::InvalidArgumentError(err.message());
-    }
-    return absl::InternalError(
-        absl::StrCat("ShmClient::Reset: server error: ", err.message()));
-  }
-  if (resp_type != RESET_ACK) {
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::Reset: unexpected response type ", resp_type));
-  }
-  return absl::OkStatus();  // RESET_ACK is empty
+  ResetResponse resp;  // empty
+  return SendInsertFlowRequest(&conn_, req, RESET, RESET_ACK,
+                               /*op_name=*/"Reset",
+                               /*map_routing_errors=*/true, &resp);
 }
 
 absl::Status ShmClient::Checkpoint(std::string* path) {
   // ticket ⑪: same insert-flow round-trip as MutatePriorities/Reset (see
-  // MutatePriorities for the insert_flow_mu rationale). CheckpointRequest is
-  // empty; CheckpointResponse carries checkpoint_path. No table routing —
-  // checkpoint is cross-table.
+  // SendInsertFlowRequest). CheckpointRequest is empty; CheckpointResponse
+  // carries checkpoint_path. No table routing — checkpoint is cross-table, so
+  // map_routing_errors=false (server maps no-checkpointer / Save failure to
+  // ShmError::INTERNAL -> absl::InternalError, unchanged).
   CheckpointRequest req;
-  std::string body;
-  req.SerializeToString(&body);
-
-  absl::MutexLock lock(&conn_.insert_flow_mu);
-  REVERB_RETURN_IF_ERROR(
-      conn_.insert_c2s.Write(CHECKPOINT, absl::MakeSpan(body)));
-
-  MsgType resp_type;
-  std::string resp_body;
-  // ticket ⑪: same kReadBlockingHardCap cap as ⑩'s control-plane ACKs.
-  REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_.insert_s2c, &resp_type, &resp_body, conn_.control_fd,
-                   kReadBlockingHardCap));
-
-  if (resp_type == ERROR) {
-    // Server maps no-checkpointer / Save failure to ShmError::INTERNAL.
-    ShmError err;
-    if (!err.ParseFromString(resp_body)) {
-      return absl::InternalError(
-          "ShmClient::Checkpoint: malformed ShmError");
-    }
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::Checkpoint: server error: ", err.message()));
-  }
-  if (resp_type != CHECKPOINT_RESP) {
-    return absl::InternalError(absl::StrCat(
-        "ShmClient::Checkpoint: unexpected response type ", resp_type));
-  }
   CheckpointResponse resp;
-  if (!resp.ParseFromString(resp_body)) {
-    return absl::InternalError(
-        "ShmClient::Checkpoint: malformed CheckpointResponse");
-  }
+  REVERB_RETURN_IF_ERROR(SendInsertFlowRequest(
+      &conn_, req, CHECKPOINT, CHECKPOINT_RESP, /*op_name=*/"Checkpoint",
+      /*map_routing_errors=*/false, &resp));
   *path = resp.checkpoint_path();
   return absl::OkStatus();
 }

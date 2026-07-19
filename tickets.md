@@ -25,10 +25,10 @@
 
 **Blocked by**：None — can start immediately。
 
-- [ ] 模板方法 `SendInsertFlowRequest` 覆盖四个方法的公共流程，请求/响应类型参数化
-- [ ] `MutatePriorities`/`Reset`/`Checkpoint`/`ServerInfo` 各自改为调用该模板
-- [ ] 错误映射（`ShmError::NOT_FOUND` → `NotFoundError` 等）内聚在模板中，四处行为一致
-- [ ] 全量 C++ 构建和 SHM 相关测试通过
+- [x] 模板方法 `SendInsertFlowRequest` 覆盖四个方法的公共流程，请求/响应类型参数化
+- [x] `MutatePriorities`/`Reset`/`Checkpoint`/`ServerInfo` 各自改为调用该模板
+- [x] 错误映射（`ShmError::NOT_FOUND` → `NotFoundError` 等）内聚在模板中，四处行为一致
+- [x] 全量 C++ 构建和 SHM 相关测试通过
 
 ---
 
