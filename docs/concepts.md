@@ -62,7 +62,7 @@ Server 是 Reverb 的顶层容器。它：
 
 - 持有一个或多个 Table
 - 管理 Table 的后台工作线程（插入、采样、删除、chunk 回收）
-- 可选地暴露 gRPC 端口（`in_process=False`）或 SHM 接口（`shm=True`）
+- 可选择暴露 gRPC 端口（`in_process=False`）或 SHM 接口（`shm=True`）
 - 可选地通过 Checkpointer 在启动时恢复上次的 checkpoint
 
 ```python
@@ -127,6 +127,13 @@ Reverb 提供三种 Client，对应三种不同的通信路径。**API 完全一
 | `LocalClient` | `server.in_process_client` | 同进程内嵌 | 最快（零拷贝，直接持有 Table 指针） |
 | `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` | 同机器跨进程 | 约 gRPC 的 9-11 倍（mmap 零拷贝） |
 
+```python
+# 三种构造方式，API 完全一致
+client = reverb.Client('localhost:8000')                 # gRPC
+client = server.in_process_client                         # LocalClient
+client = reverb.ShmClient(server.shm_socket_path)        # ShmClient
+```
+
 **选型原则：** 能在同进程搞定就用 `LocalClient`；需要跨进程就优先 `ShmClient`（同机器）或 `Client`（跨机器）。详见 [client-transports.md](client-transports.md)。
 
 ### 3.4 Item 与 Data Element
@@ -166,7 +173,7 @@ with client.trajectory_writer(num_keep_alive_refs=10) as writer:
 ```
 
 - 通过 `append` 追加时间步，通过 `history` 切出轨迹片段
-- `num_keep_alive_refs` 控制 `history` 能回溯多少步——也就是你能在 `create_item` 的 `trajectory` 中引用的最大轨迹长度
+- `num_keep_alive_refs` 控制 `history` 能回溯多少步，也就是 `trajectory` 参数可引用的最大轨迹长度
 - `writer.history['key']` 返回 `TrajectoryColumn`；用 `[:]` 索引转换为 numpy 数组
 - 每次 `create_item` 都需要手动指定 table、priority、trajectory
 - 适合需要精确控制轨迹构造方式的场景
@@ -185,13 +192,17 @@ cfg = sw.create_config(pattern={'obs_window': ref['obs'][-2:]}, table='my_table'
 writer = client.structured_writer([cfg])
 for step in range(100):
     writer.append({'obs': obs, 'action': action, 'reward': reward})
+writer.flush()  # 或由 StructuredWriter 在退出时自动 flush
 ```
 
 - 定义条件和模式，自动路由到对应 Table
 - 适合「每 N 步存一条」、「多个 Table 共享同一数据流」的场景
 - 详见 `examples/structured_writer.py` 和 `examples/structured_writer_advanced.py`
 
-**何时用哪个？** 简单场景用 `StructuredWriter`（少写代码），复杂逻辑或需要手动切轨迹时用 `TrajectoryWriter`。
+| 场景 | 推荐 |
+|---|---|
+| 固定窗口、条件触发、一数据流多表 | `StructuredWriter` |
+| 手动切轨迹、复杂依赖、自定义优先级 | `TrajectoryWriter` |
 
 > 历史遗留：`client.writer()` 返回一个更早的 `Writer` 对象，功能与 `TrajectoryWriter` 重叠但不支持轨迹构造。新代码请统一使用 `TrajectoryWriter`。`Writer` 已从 `ShmClient` 中移除。
 
@@ -205,8 +216,8 @@ for step in range(100):
 | `Prioritized(priority_exponent)` | 按优先级加权选择，`priority_exponent=0` 退化为 `Uniform` | PER 的 sampler |
 | `Fifo()` | 选择最旧的 | Queue 的 sampler，或任何表的 remover |
 | `Lifo()` | 选择最新的 | Stack 的 sampler/remover |
-| `MinHeap()` | 选择优先级最低的 | 用于淘汰低价值数据 |
-| `MaxHeap()` | 选择优先级最高的 | 用于优先处理高价值数据 |
+| `MinHeap()` | 选择优先级最低的 | remover：淘汰低价值数据（与 `Prioritized` 不同——`MinHeap` 总是选最小值，`Prioritized` 按指数加权随机） |
+| `MaxHeap()` | 选择优先级最高的 | sampler：优先处理高价值数据 |
 
 ### 3.7 Rate Limiter（速率控制）
 
@@ -219,7 +230,7 @@ for step in range(100):
 | `Queue(N)` | 每条 item 恰好采样一次后删除；满则阻塞插入，空则阻塞采样 |
 | `Stack(N)` | 同 Queue，但后进先出 |
 
-`SampleToInsertRatio` 内建了 MinSize 行为（通过 `min_size_to_sample` 参数）：先保证表中有足够 item，再按 ratio 约束插入和采样的速率。每个 Table 只接受一个 RateLimiter，不需要手动组合两个对象。
+`SampleToInsertRatio` 内建 MinSize 行为（通过 `min_size_to_sample` 参数）：先保证表中有足够 item，再按 ratio 约束插入和采样的速率。`error_buffer` 参数控制 ratio 的容差范围——实际采样数相对于「插入数 × samples_per_insert」的允许偏离程度，超出则阻塞对应操作。每个 Table 只接受一个 RateLimiter，不需要手动组合两个对象。
 
 所有 rate limiter 在条件不满足时会**阻塞** `sample()`/`insert()`。想给阻塞加超时，可以在 `sample()` 和 `flush()` 中传 `timeout_ms` 参数（超时抛出 `DeadlineExceededError`，继承自 `ReverbError`）。想非阻塞地检查是否可插入/采样，使用 Table 的方法 `table.can_sample(num_samples)` / `table.can_insert(num_inserts)`。
 
