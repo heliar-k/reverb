@@ -136,6 +136,25 @@ TEST(TensorBuffer, SerializeRoundTrip) {
   EXPECT_EQ(back.bytes(), buf.bytes());
 }
 
+TEST(TensorBuffer, DeserializeRejectsTruncatedContent) {
+  // A corrupt/peer-crafted TensorProto whose tensor_content is shorter than
+  // shape*dtype implies must be rejected — otherwise ToNdArray memcpys
+  // NumElements*itemsize bytes out of the undersized string (heap over-read).
+  py::object arr = MakeArrayInt({10, 20, 30}, "int32");
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  TensorProto proto;
+  ASSERT_TRUE(buf.SerializeToProto(&proto).ok());
+  proto.set_tensor_content(std::string(4, '\0'));  // shape says 12 bytes
+  auto bad = TensorBuffer::DeserializeFromProto(proto);
+  EXPECT_FALSE(bad.ok());
+  EXPECT_TRUE(absl::IsInvalidArgument(bad.status())) << bad.status();
+
+  // Oversized content is equally suspect (length-prefixed framing elsewhere
+  // relies on exact sizes).
+  proto.set_tensor_content(std::string(16, '\0'));
+  EXPECT_FALSE(TensorBuffer::DeserializeFromProto(proto).ok());
+}
+
 TEST(TensorBuffer, InsertAndRemoveBatchDim) {
   py::object arr = MakeArray({1.0f, 2.0f, 3.0f}, "float32");
   auto buf = TensorBuffer::FromNdArray(arr).value();

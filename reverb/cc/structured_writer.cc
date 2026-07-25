@@ -120,27 +120,24 @@ bool CheckCondition(
 
         // Only integer and bool scalars are supported as condition sources.
         // ponytail: 直接读 bytes,不走 TF DataTypeToEnum 宏。
+        // ponytail: memcpy 而非 reinterpret_cast —— string::data() 不保证
+        // 对齐,直接 cast 在严格对齐平台是 UB(x86 只是恰好没事)。
         auto read_scalar_int = [&]() -> absl::StatusOr<int> {
           const char* data = tensor.bytes().data();
+          auto load = [&](auto* out) {
+            std::memcpy(out, data, sizeof(*out));
+            return static_cast<int>(*out);
+          };
           switch (tensor.dtype()) {
-            case DataType::Int8:
-              return static_cast<int>(*reinterpret_cast<const int8_t*>(data));
-            case DataType::Int16:
-              return static_cast<int>(*reinterpret_cast<const int16_t*>(data));
-            case DataType::Int32:
-              return static_cast<int>(*reinterpret_cast<const int32_t*>(data));
-            case DataType::Int64:
-              return static_cast<int>(*reinterpret_cast<const int64_t*>(data));
-            case DataType::Uint8:
-              return static_cast<int>(*reinterpret_cast<const uint8_t*>(data));
-            case DataType::Uint16:
-              return static_cast<int>(*reinterpret_cast<const uint16_t*>(data));
-            case DataType::Uint32:
-              return static_cast<int>(*reinterpret_cast<const uint32_t*>(data));
-            case DataType::Uint64:
-              return static_cast<int>(*reinterpret_cast<const uint64_t*>(data));
-            case DataType::Bool:
-              return *reinterpret_cast<const bool*>(data) ? 1 : 0;
+            case DataType::Int8: { int8_t v; return load(&v); }
+            case DataType::Int16: { int16_t v; return load(&v); }
+            case DataType::Int32: { int32_t v; return load(&v); }
+            case DataType::Int64: { int64_t v; return load(&v); }
+            case DataType::Uint8: { uint8_t v; return load(&v); }
+            case DataType::Uint16: { uint16_t v; return load(&v); }
+            case DataType::Uint32: { uint32_t v; return load(&v); }
+            case DataType::Uint64: { uint64_t v; return load(&v); }
+            case DataType::Bool: { bool v; std::memcpy(&v, data, sizeof(v)); return v ? 1 : 0; }
             default:
               return absl::FailedPreconditionError(absl::StrFormat(
                   "Config specified data condition on column %d has invalid "
@@ -203,19 +200,33 @@ absl::StatusOr<double> ComputeTDError(TrajectoryColumn& column, double weight) {
       return absl::InvalidArgumentError("TD Error expects a scalar tensor");
     double abs_error = 0.0;
     const char* data = tensor.bytes().data();
+    // memcpy: data() 不保证对齐,reinterpret_cast 在严格对齐平台是 UB。
+    auto load = [&](auto* out) { std::memcpy(out, data, sizeof(*out)); };
     switch (tensor.dtype()) {
-      case DataType::Float64:
-        abs_error = std::abs(*reinterpret_cast<const double*>(data));
+      case DataType::Float64: {
+        double v;
+        load(&v);
+        abs_error = std::abs(v);
         break;
-      case DataType::Float32:
-        abs_error = std::abs(*reinterpret_cast<const float*>(data));
+      }
+      case DataType::Float32: {
+        float v;
+        load(&v);
+        abs_error = std::abs(v);
         break;
-      case DataType::Int32:
-        abs_error = std::abs(*reinterpret_cast<const int32_t*>(data));
+      }
+      case DataType::Int32: {
+        int32_t v;
+        load(&v);
+        abs_error = std::abs(v);
         break;
-      case DataType::Int64:
-        abs_error = std::abs(*reinterpret_cast<const int64_t*>(data));
+      }
+      case DataType::Int64: {
+        int64_t v;
+        load(&v);
+        abs_error = static_cast<double>(std::abs(v));
         break;
+      }
       default:
         REVERB_CHECK(false)
             << "TDError expects a tensor of type double, float or int and it "

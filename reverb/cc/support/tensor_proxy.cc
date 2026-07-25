@@ -435,6 +435,25 @@ absl::StatusOr<TensorBuffer> TensorBuffer::DeserializeFromProto(
     }
   } else {
     bytes = proto.tensor_content();
+    // Validate length BEFORE anyone reads it: ToNdArray memcpys
+    // NumElements*itemsize bytes out of bytes_ — a truncated/corrupt proto
+    // must fail here, not over-read the heap (old TF Tensor::FromProto
+    // CHECK-failed; we return a status).
+    int64_t numel = 1;
+    for (int64_t d : spec.shape) {
+      if (d < 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "DeserializeFromProto: negative dim ", d));
+      }
+      numel *= d;
+    }
+    size_t expected =
+        static_cast<size_t>(numel) * DataTypeItemsize(spec.dtype);
+    if (bytes.size() != expected) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "DeserializeFromProto: tensor_content is ", bytes.size(),
+          " bytes, shape*dtype implies ", expected));
+    }
   }
   return TensorBuffer(std::move(spec), std::move(bytes));
 }
