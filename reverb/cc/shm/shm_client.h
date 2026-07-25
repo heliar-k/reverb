@@ -58,9 +58,12 @@ class ShmSampler {
   // `conn` is borrowed (owned by ShmClient); must outlive the sampler.
   // `table_name` is the server-side table to sample from. `options` mirrors
   // Sampler::Options (only max_samples + rate_limiter_timeout matter for v1).
+  // `active_flag` (optional): single-sampler permit owned by ShmClient —
+  // claimed by NewSampler before Create, released by Close()/destruction.
   static absl::StatusOr<std::unique_ptr<ShmSampler>> Create(
       ShmConnection* conn, const std::string& table_name,
-      const Sampler::Options& options);
+      const Sampler::Options& options,
+      std::atomic<bool>* active_flag = nullptr);
 
   ~ShmSampler();
 
@@ -76,7 +79,8 @@ class ShmSampler {
 
  private:
   ShmSampler(ShmConnection* conn, std::string table_name,
-             int64_t max_samples, absl::Duration rate_limiter_timeout);
+             int64_t max_samples, absl::Duration rate_limiter_timeout,
+             std::atomic<bool>* active_flag);
 
   // Worker thread main loop: fetch samples until max_samples or cancelled.
   void RunWorker();
@@ -93,6 +97,9 @@ class ShmSampler {
   internal::Queue<std::unique_ptr<Sample>> samples_;
 
   std::atomic<bool> closed_{false};
+  // Single-sampler permit to release on Close (nullptr when created without
+  // one, e.g. direct Create in tests).
+  std::atomic<bool>* active_flag_;
   absl::Status worker_status_ ABSL_GUARDED_BY(mu_);
   int64_t requested_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t returned_ ABSL_GUARDED_BY(mu_) = 0;
@@ -181,6 +188,15 @@ class ShmClient {
   explicit ShmClient(ShmConnection conn);
 
   ShmConnection conn_;
+
+  // 扫描 #1: single-sampler permit for THIS connection. A second live
+  // sampler would put two producer workers on sample_c2s (SPSC, no CAS =>
+  // corrupted `head`) and, with no request_seq on responses, could consume
+  // the other sampler's SAMPLE_RESP — silently wrong-table data. NewSampler
+  // claims it (exchange); ShmSampler::Close releases it.
+  // ponytail: boolean permit, not per-sampler ring pairs. Upgrade path:
+  // request_seq routing (tickets.md「SHM 并发正确性」) restores multi-sampler.
+  std::atomic<bool> sampler_active_{false};
 };
 
 }  // namespace shm

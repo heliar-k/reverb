@@ -218,6 +218,39 @@ TEST(ShmSampleTest, SampleCrossesShmMatchesInsertedData) {
   (*server)->Stop();
 }
 
+// 扫描 #1: two live samplers on ONE connection each spawn a worker that
+// produces on sample_c2s and consumes sample_s2c — two producers on an SPSC
+// ring with no CAS corrupts `head`, and with no request_seq on responses a
+// sampler can consume the other's SAMPLE_RESP (silently wrong-table data).
+// The client must reject a second concurrent sampler with FailedPrecondition
+// until the first is Closed.
+TEST(ShmSampleTest, SecondConcurrentSamplerRejected) {
+  auto table = MakeTable();
+  std::string sock = "/tmp/reverb_shm_sample_" + UniqueTag("spsc") + ".sock";
+  auto server = ShmServer::Create({table}, sock);
+  REVERB_ASSERT_OK(server.status());
+  REVERB_ASSERT_OK((*server)->Start());
+  auto client = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(client.status());
+
+  std::unique_ptr<ShmSampler> first;
+  REVERB_ASSERT_OK((*client)->NewSampler("queue", /*options=*/{1}, &first));
+
+  // Second sampler on the same connection: must fail loudly, not corrupt.
+  std::unique_ptr<ShmSampler> second;
+  absl::Status st = (*client)->NewSampler("queue", /*options=*/{1}, &second);
+  EXPECT_TRUE(absl::IsFailedPrecondition(st)) << st;
+  EXPECT_EQ(second, nullptr);
+
+  // Closing the first releases the slot: a new sampler can be created.
+  first->Close();
+  std::unique_ptr<ShmSampler> third;
+  REVERB_ASSERT_OK((*client)->NewSampler("queue", /*options=*/{1}, &third));
+  third->Close();
+
+  (*server)->Stop();
+}
+
 // The squeeze flag must round-trip: a squeezed column returns shape [2], not
 // [1, 2] (mirrors LocalSamplerTest.GetNextTrajectorySqueezesColumnsIfSet).
 TEST(ShmSampleTest, SqueezedColumnRoundTrips) {

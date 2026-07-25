@@ -152,17 +152,19 @@ absl::Status SendInsertFlowRequest(ShmConnection* conn, const Req& request,
 // ---- ShmSampler ----
 
 ShmSampler::ShmSampler(ShmConnection* conn, std::string table_name,
-                       int64_t max_samples, absl::Duration rate_limiter_timeout)
+                       int64_t max_samples, absl::Duration rate_limiter_timeout,
+                       std::atomic<bool>* active_flag)
     : conn_(conn),
       table_name_(std::move(table_name)),
       max_samples_(max_samples),
       rate_limiter_timeout_(rate_limiter_timeout),
-      samples_(/*capacity=*/8) {}
+      samples_(/*capacity=*/8),
+      active_flag_(active_flag) {}
 
 // static
 absl::StatusOr<std::unique_ptr<ShmSampler>> ShmSampler::Create(
     ShmConnection* conn, const std::string& table_name,
-    const Sampler::Options& options) {
+    const Sampler::Options& options, std::atomic<bool>* active_flag) {
   if (conn == nullptr) {
     return absl::InvalidArgumentError("conn must not be null");
   }
@@ -172,8 +174,9 @@ absl::StatusOr<std::unique_ptr<ShmSampler>> ShmSampler::Create(
   if (max_samples < 1) {
     return absl::InvalidArgumentError("max_samples must be >= 1");
   }
-  auto s = absl::WrapUnique(
-      new ShmSampler(conn, table_name, max_samples, options.rate_limiter_timeout));
+  auto s = absl::WrapUnique(new ShmSampler(conn, table_name, max_samples,
+                                           options.rate_limiter_timeout,
+                                           active_flag));
   s->worker_thread_ = internal::StartThread("ShmSamplerWorker",
                                             [self = s.get()] { self->RunWorker(); });
   return s;
@@ -185,6 +188,8 @@ void ShmSampler::Close() {
   if (closed_.exchange(true)) return;
   samples_.Close();
   if (worker_thread_) worker_thread_.reset();  // joins
+  // Release the single-sampler permit so a later NewSampler can proceed.
+  if (active_flag_ != nullptr) active_flag_->store(false);
 }
 
 absl::Status ShmSampler::GetNextTrajectory(
@@ -488,8 +493,22 @@ absl::Status ShmClient::Checkpoint(std::string* path) {
 absl::Status ShmClient::NewSampler(const std::string& table_name,
                                    const Sampler::Options& options,
                                    std::unique_ptr<ShmSampler>* sampler) {
-  auto s = ShmSampler::Create(&conn_, table_name, options);
-  REVERB_RETURN_IF_ERROR(s.status());
+  // 扫描 #1: one live sampler per connection. A second one would put two
+  // producer workers on the SPSC sample rings (no CAS => corrupted head) and
+  // could consume the first sampler's responses (no request_seq) — silently
+  // wrong-table data. Claim the permit; the sampler's Close releases it.
+  if (sampler_active_.exchange(true)) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "ShmClient::NewSampler(", table_name,
+        "): this SHM connection already has a live sampler — at most one "
+        "sampler per connection (SPSC ring invariant). Close the existing "
+        "sampler first, or open a second connection for concurrent sampling."));
+  }
+  auto s = ShmSampler::Create(&conn_, table_name, options, &sampler_active_);
+  if (!s.ok()) {
+    sampler_active_.store(false);
+    return s.status();
+  }
   *sampler = std::move(*s);
   return absl::OkStatus();
 }

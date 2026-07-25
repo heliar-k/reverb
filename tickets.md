@@ -91,10 +91,19 @@
 
 **Blocked by**：None — can start immediately。
 
-- [ ] `NewSampler` 拒绝同一连接的第二个活 sampler（`FailedPrecondition`），sampler 关闭后释放名额
-- [ ] 并发 `sample("a")`/`sample("b")` 回归测试：第二个 sampler 得到明确错误而非静默错数据
-- [ ] Python 层 `ShmClient.sample()` 并发调用行为文档化（client.py / docs）
-- [ ] （远期）`request_seq` 路由方案评估并记录结论（做/不做）
+- [x] `NewSampler` 拒绝同一连接的第二个活 sampler（`FailedPrecondition`），sampler 关闭后释放名额
+- [x] 并发 `sample("a")`/`sample("b")` 回归测试：第二个 sampler 得到明确错误而非静默错数据（shm_sample_test `SecondConcurrentSamplerRejected`）
+- [x] Python 层 `ShmClient.sample()` 并发调用行为文档化（client.py `sample()` docstring）
+- [x] （远期）`request_seq` 路由方案评估并记录结论（做/不做）
+
+> **远期 request_seq 评估结论（2026-07-25）：暂不做。** 恢复多 sampler 需
+> `request_seq` 贯穿请求/响应 + 按 seq 路由 + `sample_c2s` 改 MPMC 或每 sampler
+> 独立 ring 对 —— 协议面改动大，而单连接单 sampler + 多连接已覆盖并发采样需求。
+> 若未来单连接多路采样成为真实瓶颈，按 ticket 中的远期方案重开。
+
+> **实现说明**：permit 为 `ShmClient::sampler_active_` 原子布尔，NewSampler
+> `exchange` 认领、`ShmSampler::Close` 释放（析构经 Close 幂等）。直接
+> `ShmSampler::Create`（测试）不受限——约束在客户端 seam 而非 sampler 类。
 
 ---
 
@@ -115,6 +124,13 @@ b. 消费者侧容忍：`Read` 遇缺续槽返回 NotFound(NOT_READY) 而非 Int
 
 **Blocked by**：None — can start immediately。与上一张 ticket 无依赖，可并行。
 
-- [ ] 多槽消息在并发读写下不再产生 "continuation slot missing" 致命错误
-- [ ] ring_test 新增多槽消息并发压力用例（大消息 + 高频读写，断言无 InternalError）
-- [ ] 客户端长消息（大 INSERT / 多列 SAMPLE_RESP）在负载下不再被杀流，shm_insert_test/shm_sample_test 回归通过
+- [x] 多槽消息在并发读写下不再产生 "continuation slot missing" 致命错误
+- [x] ring_test 新增多槽消息并发压力用例（大消息 + 高频读写，断言无 InternalError，`MultiSlotConcurrentReadNeverSeesPartialMessage`——修复前稳定复现 red）
+- [x] 客户端长消息（大 INSERT / 多列 SAMPLE_RESP）在负载下不再被杀流，shm_insert_test/shm_sample_test 回归通过
+
+> **方案评估结论（2026-07-25）：采纳 a 的精化版——槽 0 最后发布。** 续槽照旧
+> 逐个 release，仅把槽 0 的 seq store 挪到循环末尾；消费者对槽 0 的 acquire 与
+> 该 release 构成 synchronizes-with，整条消息（含续槽 seq）对其原子可见，
+> 消费者代码零改动。方案 b（容忍 NOT_READY）会把“半条消息被目击”常态
+> 化、稀释真损坏信号，否。崩溃语义反而变强：槽 0 未发布 = 整条未就绪，
+> "continuation slot missing" 从此只指示真损坏。

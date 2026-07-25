@@ -405,6 +405,17 @@ class _BaseClient:
             if the table's rate limiter blocks longer than `timeout_ms`. Ignored by
             the gRPC `Client` (whose C++ `NewSampler` has no timeout parameter).
 
+        Note:
+          SHM transport (`ShmClient`): at most ONE live sampler per connection.
+          Each live (not-yet-exhausted) `sample()` generator holds a sampler,
+          so starting a second `sample()` before the previous generator is
+          exhausted raises an error immediately — this guards the shared-memory
+          ring's single-producer invariant (a second sampler could otherwise
+          receive the first sampler's responses, silently mixing tables).
+          Exhaust or close the previous generator first, or use a second
+          connection for concurrent sampling. gRPC and in-process clients are
+          not restricted.
+
         Yields:
           If `emit_timesteps` is `True`:
 
