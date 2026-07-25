@@ -246,11 +246,17 @@ absl::StatusOr<uint64_t> ShmBytePool::Allocate(size_t bytes) {
         absl::StrCat("allocation too large: ", bytes, " bytes"));
   }
 
-  // Block if this tier's free list is empty; Deallocate signals on push.
-  // SERVER-ONLY: the dispatch thread is the sole caller.
+  // Fail fast if this tier's free list is empty — NEVER block: the server's
+  // single dispatch thread is the sole Allocate AND Deallocate caller, so a
+  // blocking wait here can never be satisfied (unrecoverable server-wide
+  // deadlock). The caller propagates RESOURCE_EXHAUSTED to the client, which
+  // surfaces it instead of hanging. SERVER-ONLY.
   mu_.Lock();
-  while (slabs_[idx].free_head_offset == kNullOffset) {
-    cv_.Wait(&mu_);
+  if (slabs_[idx].free_head_offset == kNullOffset) {
+    mu_.Unlock();
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "slab tier ", slabs_[idx].block_size, " bytes exhausted (",
+        slabs_[idx].block_count, " blocks outstanding)"));
   }
   uint64_t off = PopFree(idx);
   mu_.Unlock();
@@ -271,9 +277,7 @@ void ShmBytePool::Deallocate(uint64_t offset) {
   }
 
   mu_.Lock();
-  bool was_full = (slabs_[idx].free_head_offset == kNullOffset);
   PushFree(idx, offset);
-  if (was_full) cv_.Signal();
   mu_.Unlock();
 }
 

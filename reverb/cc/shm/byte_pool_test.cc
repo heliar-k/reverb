@@ -144,10 +144,13 @@ TEST(ShmBytePoolTest, RefcountIncDecToZeroSignalsDealloc) {
 
 // ── Pool-full blocking ──
 
-TEST(ShmBytePoolTest, AllocateBlocksWhenSlabFullThenUnblocks) {
-  // One slab of 4 blocks so we can exhaust it quickly.
+TEST(ShmBytePoolTest, AllocateReturnsResourceExhaustedWhenSlabFull) {
+  // Exhaustion must FAIL FAST, never block: the server's single dispatch
+  // thread is the sole Allocate caller AND the sole Deallocate caller, so a
+  // blocking Allocate there can never be unblocked — an unrecoverable
+  // server-wide deadlock (and Stop() then hangs joining the thread).
   const size_t one_slab[] = {256};
-  auto s = ShmBytePool::Create(UniqueName("fullblock"), one_slab,
+  auto s = ShmBytePool::Create(UniqueName("fullfast"), one_slab,
                                kSmallBlocksPerSlab);
   REVERB_ASSERT_OK(s.status());
   ShmBytePool pool = std::move(s).value();
@@ -160,35 +163,24 @@ TEST(ShmBytePoolTest, AllocateBlocksWhenSlabFullThenUnblocks) {
     held.push_back(*a);
   }
 
-  // A 5th allocate must block (no free block). Run on a thread.
-  std::promise<uint64_t> got;
-  std::future<uint64_t> fut = got.get_future();
-  std::atomic<bool> started{false};
-  std::thread waiter([&] {
-    started.store(true);
-    auto a = pool.Allocate(256);
-    ASSERT_TRUE(a.ok()) << a.status();
-    got.set_value(*a);
-  });
-
-  // Wait until the waiter is definitely running, then confirm it has NOT
-  // returned immediately (pool is full).
-  while (!started.load()) std::this_thread::yield();
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  EXPECT_EQ(fut.wait_for(std::chrono::seconds(0)),
-            std::future_status::timeout)
-      << "Allocate returned while pool still full";
-
-  // Free one block from the main thread; the blocked Allocate should unblock.
-  pool.Deallocate(held[0]);
+  // The 5th allocate must return promptly with RESOURCE_EXHAUSTED. Run it on
+  // a detached thread so a blocking implementation fails the assertion in 2s
+  // instead of hanging the test binary.
+  std::promise<absl::Status> got;
+  std::future<absl::Status> fut = got.get_future();
+  std::thread([&] { got.set_value(pool.Allocate(256).status()); }).detach();
 
   ASSERT_EQ(fut.wait_for(std::chrono::seconds(2)), std::future_status::ready)
-      << "Allocate did not unblock after Deallocate";
-  uint64_t granted = fut.get();
-  // LIFO: the freed block is recycled.
-  EXPECT_EQ(granted, held[0]);
+      << "Allocate blocked on an exhausted slab — dispatch-thread deadlock";
+  absl::Status st = fut.get();
+  EXPECT_TRUE(absl::IsResourceExhausted(st))
+      << "want RESOURCE_EXHAUSTED, got " << st;
 
-  waiter.join();
+  // Recovery: freeing a block makes the tier allocatable again (LIFO).
+  pool.Deallocate(held[0]);
+  auto b = pool.Allocate(256);
+  REVERB_ASSERT_OK(b.status());
+  EXPECT_EQ(*b, held[0]);
 }
 
 // ── Multiple blocks same slab reused correctly (no aliasing) ──
@@ -221,20 +213,14 @@ TEST(ShmBytePoolTest, MultipleBlocksSameSlabNoAliasing) {
               static_cast<char>('A' + i));
   }
 
-  // Exhausting the slab now blocks (next Allocate should not return).
-  std::promise<void> blocked;
-  std::shared_future<void> blocked_fut = blocked.get_future().share();
-  std::thread waiter([&] {
-    auto a = pool.Allocate(32);
-    ASSERT_TRUE(a.ok()) << a.status();
-    blocked.set_value();  // only reached after unblock
-  });
-  EXPECT_NE(blocked_fut.wait_for(std::chrono::milliseconds(50)),
-            std::future_status::ready);
+  // Exhausting the slab fails fast (see AllocateReturnsResourceExhausted-
+  // WhenSlabFull); freeing one block recycles it.
+  auto full = pool.Allocate(32);
+  EXPECT_TRUE(absl::IsResourceExhausted(full.status())) << full.status();
   pool.Deallocate(offs[0]);
-  EXPECT_EQ(blocked_fut.wait_for(std::chrono::seconds(2)),
-            std::future_status::ready);
-  waiter.join();
+  auto recycled = pool.Allocate(32);
+  REVERB_ASSERT_OK(recycled.status());
+  EXPECT_EQ(*recycled, offs[0]);
 }
 
 // ── ReleaseAll ──

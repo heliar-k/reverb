@@ -862,7 +862,22 @@ absl::Status ShmServer::HandleAllocate(ClientState& state,
   // outstanding (refcount=1) so a client crash (⑥) reclaims it, and reply with
   // ALLOCATE_RESP. The client memcpy's insert bytes here, then sends INSERT and
   // waits for InsertAck.offsets_to_release before reusing the region (C2).
-  REVERB_ASSIGN_OR_RETURN(uint64_t offset, pool_.Allocate(req.num_bytes()));
+  // Pool exhaustion / oversize must reach the client as an ERROR — returning
+  // a bare status only gets logged by the dispatcher and the writer hangs
+  // until its timeout cap. (Exhaustion can't block-wait anymore: the dispatch
+  // thread is the sole Deallocate caller, so waiting would deadlock.)
+  auto offset_or = pool_.Allocate(req.num_bytes());
+  if (!offset_or.ok()) {
+    ShmError err;
+    err.set_code(absl::IsResourceExhausted(offset_or.status())
+                     ? ShmError::RESOURCE_EXHAUSTED
+                     : ShmError::INVALID_ARGUMENT);
+    err.set_message(std::string(offset_or.status().message()));
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  }
+  uint64_t offset = *offset_or;
   pool_.Ref(offset);  // outstanding against client crash
   state.outstanding_offsets_.insert(offset);
   ShmAllocateResponse resp;

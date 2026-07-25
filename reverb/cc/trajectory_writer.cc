@@ -1033,6 +1033,27 @@ absl::Status TrajectoryWriter::RunShmWorker() {
         data_cv_.Signal();
         break;
       }
+      if (atype == ERROR) {
+        // The server rejected the allocation (e.g. pool exhausted). Surface
+        // the ShmError's real status instead of a generic type mismatch.
+        alloc_failed = true;
+        ShmError err;
+        absl::MutexLock l(&mu_);
+        if (err.ParseFromString(aresp_body) &&
+            err.code() == ShmError::RESOURCE_EXHAUSTED) {
+          stream_status_ = absl::ResourceExhaustedError(err.message());
+        } else if (err.ParseFromString(aresp_body) &&
+                   err.code() == ShmError::INVALID_ARGUMENT) {
+          stream_status_ = absl::InvalidArgumentError(err.message());
+        } else {
+          stream_status_ = absl::InternalError(absl::StrCat(
+              "RunShmWorker: ALLOCATE rejected: ", aresp_body));
+        }
+        stream_ok_ = false;
+        unrecoverable_status_ = stream_status_;
+        data_cv_.Signal();
+        break;
+      }
       if (atype != ALLOCATE_RESP) {
         alloc_failed = true;
         absl::MutexLock l(&mu_);

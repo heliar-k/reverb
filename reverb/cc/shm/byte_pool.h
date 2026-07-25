@@ -89,9 +89,10 @@ inline constexpr uint64_t kNullOffset = UINT64_MAX;  // free-list sentinel
 // segment (O_CREAT|O_EXCL) and is the sole allocator; clients Open it RW
 // (decision C4) and read/write bytes at server-granted offsets via At().
 //
-// Allocate blocks when the requested tier is exhausted (condvar); a
-// Deallocate frees a block and wakes the waiter. Allocate/Deallocate/Ref/
-// Unref/ReleaseAll are SERVER-ONLY (single-threaded caller).
+// Allocate fails fast with RESOURCE_EXHAUSTED when the requested tier is
+// exhausted — blocking here would deadlock the server's single dispatch
+// thread (the sole caller of both Allocate and Deallocate).
+// Allocate/Deallocate/Ref/Unref/ReleaseAll are SERVER-ONLY.
 class ShmBytePool {
  public:
   ShmBytePool();
@@ -113,9 +114,10 @@ class ShmBytePool {
   // magic/version. The client only uses At(offset); it must NOT allocate.
   static absl::StatusOr<ShmBytePool> Open(const std::string& shm_name);
 
-  // Allocate `bytes` from the smallest tier whose block_size >= bytes. Blocks
-  // (condvar) if that tier's free list is empty, until a Deallocate frees a
-  // block. SERVER-ONLY. Returns the offset relative to the segment base.
+  // Allocate `bytes` from the smallest tier whose block_size >= bytes.
+  // Returns RESOURCE_EXHAUSTED if that tier's free list is empty (never
+  // blocks — see class comment). SERVER-ONLY. Returns the offset relative to
+  // the segment base.
   absl::StatusOr<uint64_t> Allocate(size_t bytes);
 
   // Return `offset` to its tier's free list. SERVER-ONLY. Wakes a blocked
@@ -174,10 +176,8 @@ class ShmBytePool {
   // thread throughput.
   absl::flat_hash_map<uint64_t, int> refcounts_;
 
-  // Pool-full blocking. Allocate holds this while waiting on a tier's free
-  // list; Deallocate signals when it pushes a block back. SERVER-ONLY.
+  // Guards the free lists against a stray cross-thread Deallocate. SERVER-ONLY.
   absl::Mutex mu_;
-  absl::CondVar cv_;
 };
 
 }  // namespace shm
