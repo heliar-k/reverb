@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -438,6 +442,110 @@ TEST(ShmInsertTest, DoubleReleaseDoesNotHandOutSameBlockTwice) {
   allocate(&b);
   EXPECT_NE(a, b) << "double-freed block handed out twice (offset " << a
                   << ")";
+}
+
+// An INSERT whose item references a chunk_key that is NOT among the
+// request's chunks must be rejected with an ERROR on the insert s2c flow.
+// Before the fix, the unknown-chunk path returned a bare status that the
+// dispatcher only LOGGED — the client hung until its timeout cap, and the
+// request's pending callbacks leaked (remaining never reaches 0, no ACK).
+TEST(ShmInsertTest, ItemReferencingUnknownChunkReturnsError) {
+  auto table = MakeTable("t");
+  auto fx = ShmFixture::Make(table, "unk");
+  ASSERT_NE(fx, nullptr);
+  Ring* c2s = &fx->client->connection()->insert_c2s;
+  Ring* s2c = &fx->client->connection()->insert_s2c;
+
+  // ALLOCATE a real block and write a valid ChunkData (chunk_key=1) into it
+  // (offsets are validated against outstanding grants since the ⑧-b fix).
+  ShmAllocateRequest areq;
+  areq.set_num_bytes(256);
+  std::string abody;
+  areq.SerializeToString(&abody);
+  REVERB_ASSERT_OK(c2s->Write(ALLOCATE, abody));
+  MsgType atype;
+  std::string apayload;
+  REVERB_ASSERT_OK(ReadWithDeadline(s2c, &atype, &apayload, absl::Seconds(5)));
+  ASSERT_EQ(atype, ALLOCATE_RESP);
+  ShmAllocateResponse aresp;
+  ASSERT_TRUE(aresp.ParseFromString(apayload));
+  uint64_t off = aresp.shm_offset();
+
+  ChunkData cd;
+  cd.set_chunk_key(1);
+  std::string cd_bytes;
+  cd.SerializeToString(&cd_bytes);
+  std::memcpy(fx->client->connection()->pool.At(off), cd_bytes.data(),
+              cd_bytes.size());
+
+  ShmInsertRequest req;
+  auto* chunk = req.add_chunks();
+  chunk->set_chunk_key(1);
+  chunk->set_shm_offset(off);
+  chunk->set_total_length(cd_bytes.size());
+  auto* item = req.add_items();
+  item->set_key(1);
+  item->set_table("t");
+  item->set_priority(1.0);
+  // Item references chunk_key=2, which is NOT in req.chunks() — unknown.
+  auto* slice = item->mutable_flat_trajectory()
+                    ->add_columns()
+                    ->add_chunk_slices();
+  slice->set_chunk_key(2);
+  slice->set_offset(0);
+  slice->set_length(1);
+  std::string body;
+  req.SerializeToString(&body);
+  REVERB_ASSERT_OK(c2s->Write(INSERT, body));
+
+  MsgType type;
+  std::string payload;
+  REVERB_ASSERT_OK(ReadWithDeadline(s2c, &type, &payload, absl::Seconds(5)));
+  ASSERT_EQ(type, ERROR);
+  ShmError err;
+  ASSERT_TRUE(err.ParseFromString(payload));
+  EXPECT_THAT(err.message(), ::testing::HasSubstr("unknown chunk"));
+
+  // Server survives: a normal insert round-trip still works.
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush());
+  EXPECT_EQ(table->size(), 1);
+}
+
+// A client that connects and never sends HELLO must not wedge the dispatch
+// loop. Before the fix, TryAccept ran a blocking RecvHello on the dispatch
+// thread — one stalled connection froze accept AND service for every client.
+TEST(ShmInsertTest, StalledHelloDoesNotWedgeDispatch) {
+  auto table = MakeTable("t");
+  auto fx = ShmFixture::Make(table, "stall");
+  ASSERT_NE(fx, nullptr);
+
+  // Raw-connect and stay silent (no HELLO).
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, fx->sock.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+  // Wait past the handshake bound, then the pre-existing client must still
+  // get full service (dispatch thread not stuck in RecvHello).
+  usleep(400 * 1000);
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush(/*ignore_last_num_items=*/0,
+                                 /*timeout=*/absl::Milliseconds(3000)));
+  EXPECT_EQ(table->size(), 1);
+  close(fd);
 }
 
 }  // namespace

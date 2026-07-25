@@ -250,7 +250,7 @@ TEST(ShmCrashTest, ClientFdCloseReclaimsOffsetsAndUnlinksRings) {
   ASSERT_GE(conn->control_fd, 0);
   // Recompute this client's ring names to assert unlink later. The client sent
   // getpid() as its PID; the server's PID is also getpid() (same process).
-  ShmSegmentNames names = MakeShmNames(getpid(), getpid());
+  ShmSegmentNames names = MakeShmNames(sock, getpid());
   // Sanity: all four rings exist while the client is connected (decision D).
   ASSERT_TRUE(ShmSegmentExists(names.insert_c2s));
   ASSERT_TRUE(ShmSegmentExists(names.insert_s2c));
@@ -334,7 +334,7 @@ TEST(ShmCrashTest, RepeatedCrashDoesNotExhaustPool) {
     // reclamation-completed signal: ring names are getpid()/getpid() each
     // round (same process), so the server must unlink before the next round's
     // Ring::Create(names.insert_c2s) can succeed with O_EXCL.
-    ShmSegmentNames names = MakeShmNames(getpid(), getpid());
+    ShmSegmentNames names = MakeShmNames(sock, getpid());
     ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
                         absl::Seconds(5)))
         << "round " << i << ": server did not reclaim after crash";
@@ -398,7 +398,7 @@ TEST(ShmCrashTest, OtherClientUnaffectedByChildCrash) {
       << "child did not sample successfully";
 
   // Give the server a moment to detect the child's fd EOF + reclaim.
-  ShmSegmentNames child_names = MakeShmNames(getpid(), pid);
+  ShmSegmentNames child_names = MakeShmNames(sock, pid);
   ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(child_names.insert_c2s); },
                       absl::Seconds(5)))
       << "server did not unlink crashed child's insert c2s ring";

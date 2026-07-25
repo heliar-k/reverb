@@ -119,9 +119,10 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
   REVERB_ASSIGN_OR_RETURN(ShmBootstrapServer bootstrap,
                           ShmBootstrapServer::Create(socket_path));
 
-  // The pool name is keyed by the server PID alone (A3).
-  std::string pool_name =
-      absl::StrCat("/reverb_shm_pool_", getpid());
+  // The pool name is derived from the socket path (unique per server
+  // instance) — NOT the PID alone, which made a second in-process ShmServer
+  // unlink the first's live pool (scan #12).
+  std::string pool_name = MakePoolShmName(socket_path);
   REVERB_ASSIGN_OR_RETURN(
       ShmBytePool pool, ShmBytePool::Create(pool_name));
   return absl::WrapUnique(
@@ -184,7 +185,7 @@ void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
     // (owner_=true), but explicit unlink here is safe (second unlink is a
     // harmless ENOENT) and makes the cleanup intent obvious at the disconnect
     // site.
-    ShmSegmentNames names = MakeShmNames(getpid(), state.client_pid);
+    ShmSegmentNames names = MakeShmNames(socket_path_, state.client_pid);
     shm_unlink(names.insert_c2s.c_str());
     shm_unlink(names.insert_s2c.c_str());
     shm_unlink(names.sample_c2s.c_str());
@@ -264,8 +265,17 @@ bool ShmServer::TryAccept() {
   if (!a.ok()) return false;
   auto [client_fd, client_pid] = std::move(a).value();
 
-  auto hello = RecvHello(client_fd);
+  // Bounded handshake: RecvHello runs on the single dispatch thread — an
+  // unbounded read lets a connect-and-stall client wedge accept AND service
+  // for every client. 250ms is generous for a local udsocket peer (the
+  // client writes HELLO immediately after connect); on timeout/malformed we
+  // close the fd and keep serving.
+  // ponytail: full async accept (pending-hello state machine) would remove
+  // even this bounded stall; the 250ms bound caps a stall flood at 4/s.
+  auto hello = RecvHello(client_fd, absl::Milliseconds(250));
   if (!hello.ok()) {
+    REVERB_LOG(REVERB_WARNING)
+        << "ShmServer: closing stalled/malformed HELLO: " << hello.status();
     close(client_fd);
     return false;
   }
@@ -275,7 +285,7 @@ bool ShmServer::TryAccept() {
     return false;
   }
 
-  ShmSegmentNames names = MakeShmNames(getpid(), client_pid);
+  ShmSegmentNames names = MakeShmNames(socket_path_, client_pid);
   // Decision D: create FOUR rings per client — one SPSC pair for the insert
   // flow (TrajectoryWriter) and one for the sample flow (ShmSampler). Each
   // pair keeps the SPSC invariant intact (one client-thread producer per c2s)
@@ -560,6 +570,34 @@ void ShmServer::FlushOutbox(ClientState& state) {
   }
 }
 
+namespace {
+// TryWrite's InvalidArgument means the response can NEVER fit the ring.
+// Stashing it for retry would spin forever (a >capacity SAMPLE_RESP /
+// SERVER_INFO_RESP used to hang the client until its 60s cap). Send a small
+// ERROR instead so the client fails fast.
+absl::Status EnqueueOversizeError(
+    Ring* ring, std::vector<std::pair<uint16_t, std::string>>* outbox,
+    absl::Mutex* mu, MsgType type, size_t body_size) {
+  REVERB_LOG(REVERB_WARNING)
+      << "ShmServer: response type " << type << " (" << body_size
+      << " bytes) exceeds ring capacity; sending ERROR instead";
+  ShmError err;
+  err.set_code(ShmError::INTERNAL);
+  err.set_message(absl::StrCat("ShmServer: response type ", type,
+                               " too large for SHM ring (", body_size,
+                               " bytes)"));
+  std::string ebody;
+  err.SerializeToString(&ebody);
+  absl::Status s = ring->TryWrite(ERROR, absl::MakeSpan(ebody));
+  if (absl::IsResourceExhausted(s)) {
+    absl::MutexLock lock(mu);
+    outbox->emplace_back(static_cast<uint16_t>(ERROR), std::move(ebody));
+    return absl::OkStatus();
+  }
+  return s;
+}
+}  // namespace
+
 absl::Status ShmServer::EnqueueInsertS2C(ClientState& state, MsgType type,
                                          absl::string_view body) {
   // Non-blocking write on the INSERT flow's s2c ring (spec §8.7). TryWrite
@@ -567,6 +605,14 @@ absl::Status ShmServer::EnqueueInsertS2C(ClientState& state, MsgType type,
   // in insert_outbox and FlushOutbox retries each dispatch pass.
   absl::Status s = state.conn.insert_s2c.TryWrite(type, absl::MakeSpan(body));
   if (s.ok()) return absl::OkStatus();
+  if (absl::IsInvalidArgument(s)) {
+    // PERMANENT: the message can never fit the ring. Stashing it would retry
+    // forever (the old RING_FULL/oversize confusion). Send a small ERROR
+    // instead so the client fails fast instead of hanging to its 60s cap.
+    return EnqueueOversizeError(&state.conn.insert_s2c,
+                                &state.insert_outbox, &state.insert_outbox_mu,
+                                type, body.size());
+  }
   if (!absl::IsResourceExhausted(s)) {
     return s;  // genuine error
   }
@@ -583,6 +629,12 @@ absl::Status ShmServer::EnqueueSampleS2C(ClientState& state, MsgType type,
   // Non-blocking write on the SAMPLE flow's s2c ring.
   absl::Status s = state.conn.sample_s2c.TryWrite(type, absl::MakeSpan(body));
   if (s.ok()) return absl::OkStatus();
+  if (absl::IsInvalidArgument(s)) {
+    // PERMANENT: see EnqueueInsertS2C.
+    return EnqueueOversizeError(&state.conn.sample_s2c,
+                                &state.sample_outbox, &state.sample_outbox_mu,
+                                type, body.size());
+  }
   if (!absl::IsResourceExhausted(s)) {
     return s;
   }
@@ -820,6 +872,15 @@ void ShmServer::DrainPendingSamples(ClientState& state) {
     }
 
     if (!unpack_ok) {
+      // 回收本轮已 memcpy 进池的列块:它们以 refcount=1 挂在
+      // outstanding_offsets_ 上,不回收会泄漏到客户端断连(喂养池耗尽)。
+      for (const ShmColumn& col : sample->columns()) {
+        if (state.outstanding_offsets_.erase(col.shm_offset()) > 0) {
+          if (pool_.Unref(col.shm_offset())) {  // ->0
+            pool_.Deallocate(col.shm_offset());
+          }
+        }
+      }
       // unpack/alloc 失败：回收本轮已分配的 offset，写 ERROR。
       ShmError err;
       err.set_code(ShmError::INTERNAL);
@@ -1120,6 +1181,28 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     }
   }
 
+  // Mid-insert failure must BOTH reply ERROR and drop the request's pending
+  // callbacks. A bare status return only gets logged by the dispatcher — the
+  // client hangs until its timeout cap; and with `remaining` initialized to
+  // num_items but fewer callbacks registered, no INSERT_ACK ever fires and
+  // pending_insert_callbacks leaks. The table holds the callbacks as
+  // weak_ptr, so clear() safely expires them (later completions are dropped
+  // by design). The client kills the stream on ERROR; the request's pool
+  // offsets are reclaimed at disconnect like any abandoned outstanding.
+  auto fail_insert = [&state, this](ShmError::Code code,
+                                    const std::string& msg) {
+    {
+      absl::MutexLock lock(&state.insert_outbox_mu);
+      state.pending_insert_callbacks.clear();
+    }
+    ShmError err;
+    err.set_code(code);
+    err.set_message(msg);
+    std::string body;
+    err.SerializeToString(&body);
+    return EnqueueInsertS2C(state, ERROR, body);
+  };
+
   for (const PrioritizedItem& item_proto : req.items()) {
     const std::string& table_name = item_proto.table();
     // FindTable already validated above; safe to dereference.
@@ -1132,9 +1215,10 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     for (uint64_t ck : keys) {
       auto it = chunks.find(ck);
       if (it == chunks.end()) {
-        return absl::InternalError(absl::StrCat(
-            "ShmServer::HandleInsert: item ", item_proto.key(),
-            " references unknown chunk ", ck));
+        return fail_insert(
+            ShmError::INTERNAL,
+            absl::StrCat("ShmServer::HandleInsert: item ", item_proto.key(),
+                         " references unknown chunk ", ck));
       }
       item_chunks.push_back(it->second);
     }
@@ -1179,7 +1263,11 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     absl::Status s = table->InsertOrAssignAsync(std::move(table_item),
                                                 &can_insert_more, cb);
     if (!s.ok()) {
-      return s;
+      return fail_insert(
+          ShmError::INTERNAL,
+          absl::StrCat("ShmServer::HandleInsert: InsertOrAssignAsync failed "
+                       "for item ",
+                       item_proto.key(), ": ", s.message()));
     }
     // ponytail: v1 ignores can_insert_more on the server side — the dispatch
     // thread reads one INSERT at a time and the table's pending_inserts_ queue

@@ -21,6 +21,7 @@
 #include "absl/strings/str_cat.h"
 #include "reverb/cc/platform/status_macros.h"
 #include <arpa/inet.h>  // htonl/ntohl
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -166,16 +167,62 @@ absl::Status SendWelcome(int client_fd, const WelcomeResponse& welcome) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<HelloRequest> RecvHello(int client_fd) {
+// Poll until readable or past `deadline` (EINTR-safe).
+absl::Status PollReadable(int fd, absl::Time deadline) {
+  while (true) {
+    int64_t ms = absl::ToInt64Milliseconds(deadline - absl::Now());
+    if (ms < 0) ms = 0;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int r = poll(&pfd, 1, static_cast<int>(ms));
+    if (r > 0) return absl::OkStatus();
+    if (r == 0) return absl::DeadlineExceededError("recv timeout");
+    if (errno == EINTR) continue;
+    return ErrnoStatus("poll", "recv");
+  }
+}
+
+// ReadExact with a hard deadline: polls before EVERY read, so a peer that
+// trickles partial bytes then stalls cannot block past the deadline.
+absl::Status ReadExactBounded(int fd, void* buf, size_t n,
+                              absl::Time deadline) {
+  char* p = static_cast<char*>(buf);
+  size_t got = 0;
+  while (got < n) {
+    REVERB_RETURN_IF_ERROR(PollReadable(fd, deadline));
+    ssize_t r = read(fd, p + got, n - got);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(
+          absl::StrCat("read failed (errno ", errno, ": ",
+                       std::strerror(errno), ")"));
+    }
+    if (r == 0) {
+      return absl::InvalidArgumentError("connection closed by peer");
+    }
+    got += r;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<HelloRequest> RecvHello(int client_fd, absl::Duration timeout) {
+  const bool bounded = timeout != absl::InfiniteDuration();
+  const absl::Time deadline = absl::Now() + timeout;
+  auto read = [&](void* buf, size_t n) {
+    return bounded ? ReadExactBounded(client_fd, buf, n, deadline)
+                   : ReadExact(client_fd, buf, n);
+  };
   uint32_t len_net = 0;
-  REVERB_RETURN_IF_ERROR(ReadExact(client_fd, &len_net, sizeof(len_net)));
+  REVERB_RETURN_IF_ERROR(read(&len_net, sizeof(len_net)));
   uint32_t len = ntohl(len_net);
   // ponytail: cap at 4MB to reject a hostile/huge length prefix; Hello is tiny.
   if (len > 4 * 1024 * 1024) {
     return absl::InvalidArgumentError("HelloRequest length too large");
   }
   std::string body(len, '\0');
-  REVERB_RETURN_IF_ERROR(ReadExact(client_fd, body.data(), len));
+  REVERB_RETURN_IF_ERROR(read(body.data(), len));
   HelloRequest hello;
   if (!hello.ParseFromString(body)) {
     return absl::InvalidArgumentError("failed to parse HelloRequest");
@@ -192,17 +239,35 @@ absl::Status CheckProtocolVersion(uint32_t client_version) {
   return absl::OkStatus();
 }
 
-ShmSegmentNames MakeShmNames(int server_pid, int client_pid) {
+namespace {
+// POSIX shm names: single leading '/', no further slashes. Map the server's
+// socket path to a valid, filesystem-unique component.
+std::string SanitizeToken(absl::string_view token) {
+  std::string out;
+  out.reserve(token.size());
+  for (char c : token) {
+    out.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+  }
+  return out;
+}
+}  // namespace
+
+std::string MakePoolShmName(absl::string_view server_token) {
+  return absl::StrCat("/reverb_shm_pool_", SanitizeToken(server_token));
+}
+
+ShmSegmentNames MakeShmNames(absl::string_view server_token, int client_pid) {
+  const std::string tok = SanitizeToken(server_token);
   ShmSegmentNames names;
-  names.pool = absl::StrCat("/reverb_shm_pool_", server_pid);
+  names.pool = MakePoolShmName(server_token);
   names.insert_c2s =
-      absl::StrCat("/reverb_shm_insert_c2s_", server_pid, "_", client_pid);
+      absl::StrCat("/reverb_shm_insert_c2s_", tok, "_", client_pid);
   names.insert_s2c =
-      absl::StrCat("/reverb_shm_insert_s2c_", server_pid, "_", client_pid);
+      absl::StrCat("/reverb_shm_insert_s2c_", tok, "_", client_pid);
   names.sample_c2s =
-      absl::StrCat("/reverb_shm_sample_c2s_", server_pid, "_", client_pid);
+      absl::StrCat("/reverb_shm_sample_c2s_", tok, "_", client_pid);
   names.sample_s2c =
-      absl::StrCat("/reverb_shm_sample_s2c_", server_pid, "_", client_pid);
+      absl::StrCat("/reverb_shm_sample_s2c_", tok, "_", client_pid);
   return names;
 }
 

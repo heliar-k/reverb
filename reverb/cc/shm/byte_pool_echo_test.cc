@@ -86,7 +86,7 @@ TEST(ShmBytePoolEchoTest, ClientAllocatesViaRingThenReleases) {
     REVERB_ASSERT_OK(hello.status());
     REVERB_ASSERT_OK(CheckProtocolVersion(hello->protocol_version()));
 
-    ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
+    ShmSegmentNames names = MakeShmNames(sock, client_pid);
 
     // Create the pool + both rings. The pool name is the A3 pool name.
     auto pool_s = ShmBytePool::Create(names.pool, kSlabs, kBlocksPerSlab);

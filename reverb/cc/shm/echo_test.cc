@@ -78,7 +78,7 @@ TEST(ShmEchoTest, DataCrossesRingBoundary) {
     REVERB_ASSERT_OK(hello.status());
     REVERB_ASSERT_OK(CheckProtocolVersion(hello->protocol_version()));
 
-    ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
+    ShmSegmentNames names = MakeShmNames(sock, client_pid);
     auto c2s_server = Ring::Create(names.sample_c2s, 16, 256);
     REVERB_ASSERT_OK(c2s_server.status());
     auto s2c_server = Ring::Create(names.sample_s2c, 16, 256);
@@ -108,14 +108,10 @@ TEST(ShmEchoTest, DataCrossesRingBoundary) {
   WelcomeResponse welcome = std::move(r).value();
   // The client asserts it received A3-format names with its own PID.
   int client_pid = getpid();
-  EXPECT_EQ(welcome.pool_shm_name(),
-            "/reverb_shm_pool_" + std::to_string(server_pid));
-  EXPECT_EQ(welcome.sample_c2s_shm_name(), "/reverb_shm_sample_c2s_" +
-                                            std::to_string(server_pid) + "_" +
-                                            std::to_string(client_pid));
-  EXPECT_EQ(welcome.sample_s2c_shm_name(), "/reverb_shm_sample_s2c_" +
-                                            std::to_string(server_pid) + "_" +
-                                            std::to_string(client_pid));
+  ShmSegmentNames expected_names = MakeShmNames(sock, client_pid);
+  EXPECT_EQ(welcome.pool_shm_name(), expected_names.pool);
+  EXPECT_EQ(welcome.sample_c2s_shm_name(), expected_names.sample_c2s);
+  EXPECT_EQ(welcome.sample_s2c_shm_name(), expected_names.sample_s2c);
 
   auto c2s_client = Ring::Open(welcome.sample_c2s_shm_name());
   REVERB_ASSERT_OK(c2s_client.status());
@@ -154,7 +150,7 @@ TEST(ShmEchoTest, CrossSlotMessageAcrossBoundary) {
     REVERB_ASSERT_OK(a.status());
     auto [client_fd, client_pid] = std::move(a).value();
     // A3: server generates the segment names from the real PIDs.
-    ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
+    ShmSegmentNames names = MakeShmNames(sock, client_pid);
     auto c2s_server = Ring::Create(names.sample_c2s, 16, 256);
     REVERB_ASSERT_OK(c2s_server.status());
     auto s2c_server = Ring::Create(names.sample_s2c, 16, 256);

@@ -206,6 +206,32 @@ TEST(RingTest, MultiSlotConcurrentReadNeverSeesPartialMessage) {
   EXPECT_EQ(read_count.load(), kMessages);
 }
 
+TEST(RingTest, OversizeMessageIsInvalidArgumentNotRingFull) {
+  // "Message larger than ring capacity" is PERMANENT — retrying can never
+  // succeed — while "ring full" is transient. They must have distinct
+  // statuses: the server's Enqueue*S2C stashes ResourceExhausted in an outbox
+  // for retry, and an oversize message would spin there forever (the
+  // >capacity SAMPLE_RESP/SERVER_INFO_RESP hang).
+  auto s = Ring::Create(UniqueName("oversize"), 4, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+
+  std::string big(5000, 'x');  // > 4 slots x 240-byte body
+  absl::Status st = ring.TryWrite(INSERT, absl::MakeSpan(big));
+  EXPECT_TRUE(absl::IsInvalidArgument(st))
+      << "oversize must be InvalidArgument (permanent), got " << st;
+
+  // Transient full stays ResourceExhausted: fill all 4 slots, TryWrite a 5th.
+  for (int i = 0; i < 4; i++) {
+    std::string p = "m" + std::to_string(i);
+    REVERB_ASSERT_OK(ring.Write(SAMPLE, absl::MakeSpan(p)));
+  }
+  std::string one = "x";
+  absl::Status full = ring.TryWrite(INSERT, absl::MakeSpan(one));
+  EXPECT_TRUE(absl::IsResourceExhausted(full))
+      << "ring-full must stay ResourceExhausted (transient), got " << full;
+}
+
 TEST(RingTest, SeqCounterWraps) {
   // seq is uint64 starting at 1; we can't overflow it in a test, but we verify
   // the ring keeps working after many rounds (head/tail advance far beyond

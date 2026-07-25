@@ -61,16 +61,17 @@ class ShmBootstrapServer {
 };
 
 // A3/D-format SHM segment names for one (server, client) pair. The server owns
-// generation (spec A3): pool is keyed by server PID alone; decision D splits
-// the control rings into a per-flow SPSC pair — insert and sample each get
-// their OWN two rings so the two background worker threads (TrajectoryWriter's
-// RunShmWorker + ShmSampler's worker) never contend as producers/consumers on
-// one SPSC ring. Names carry the flow tag + both PIDs.
-//   /reverb_shm_pool_<server_pid>
-//   /reverb_shm_insert_c2s_<server_pid>_<client_pid>
-//   /reverb_shm_insert_s2c_<server_pid>_<client_pid>
-//   /reverb_shm_sample_c2s_<server_pid>_<client_pid>
-//   /reverb_shm_sample_s2c_<server_pid>_<client_pid>
+// generation (spec A3). `server_token` is the server's udsocket path (already
+// unique per server instance); it is sanitized (non-alnum -> '_') so the names
+// are valid POSIX shm names. Keying by socket path — NOT by server PID — is
+// what lets two ShmServers coexist in one process: PID-keyed names made the
+// second server's Create unlink the FIRST server's live segments (scan #12).
+// Decision D splits the control rings into a per-flow SPSC pair.
+//   /reverb_shm_pool_<token>
+//   /reverb_shm_insert_c2s_<token>_<client_pid>
+//   /reverb_shm_insert_s2c_<token>_<client_pid>
+//   /reverb_shm_sample_c2s_<token>_<client_pid>
+//   /reverb_shm_sample_s2c_<token>_<client_pid>
 struct ShmSegmentNames {
   std::string pool;
   std::string insert_c2s;
@@ -78,14 +79,22 @@ struct ShmSegmentNames {
   std::string sample_c2s;
   std::string sample_s2c;
 };
-ShmSegmentNames MakeShmNames(int server_pid, int client_pid);
+ShmSegmentNames MakeShmNames(absl::string_view server_token, int client_pid);
+
+// The server-wide pool segment name for `server_token` (socket path).
+std::string MakePoolShmName(absl::string_view server_token);
 
 // Send a WelcomeResponse (length-delimited: 4-byte big-endian length prefix +
 // proto bytes) over `client_fd`.
 absl::Status SendWelcome(int client_fd, const WelcomeResponse& welcome);
 
 // Receive a HelloRequest (length-delimited) over `client_fd`.
-absl::StatusOr<HelloRequest> RecvHello(int client_fd);
+// `timeout` bounds the WHOLE handshake wait (per-byte deadline, airtight
+// against a trickling sender). TryAccept on the server passes a small bound —
+// it runs on the single dispatch thread, where an unbounded read lets a
+// connect-and-stall client wedge accept AND service for everyone.
+absl::StatusOr<HelloRequest> RecvHello(
+    int client_fd, absl::Duration timeout = absl::InfiniteDuration());
 
 // Validate the client's protocol version against kProtocolVersion. Returns
 // InvalidArgumentError on mismatch (caller should send an error + close).

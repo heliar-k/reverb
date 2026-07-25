@@ -122,7 +122,7 @@ TEST(BootstrapTest, SegmentNamesMatchA3Format) {
   int server_pid = getpid();
   int client_pid = getpid();  // client thread runs in the same process
 
-  ShmSegmentNames names = MakeShmNames(server_pid, client_pid);
+  ShmSegmentNames names = MakeShmNames(sock, client_pid);
   WelcomeResponse expected;
   expected.set_pool_shm_name(names.pool);
   expected.set_insert_c2s_shm_name(names.insert_c2s);
@@ -134,26 +134,14 @@ TEST(BootstrapTest, SegmentNamesMatchA3Format) {
     auto r = ClientBootstrap(sock, client_pid);
     REVERB_ASSERT_OK(r.status());
     WelcomeResponse got = std::move(r).value();
-    // A3: /reverb_shm_pool_<server_pid>
-    EXPECT_EQ(got.pool_shm_name(),
-              "/reverb_shm_pool_" + std::to_string(server_pid));
-    // A3/D: /reverb_shm_insert_c2s_<server_pid>_<client_pid>
-    EXPECT_EQ(got.insert_c2s_shm_name(), "/reverb_shm_insert_c2s_" +
-                                            std::to_string(server_pid) +
-                                            "_" +
-                                            std::to_string(client_pid));
-    EXPECT_EQ(got.insert_s2c_shm_name(), "/reverb_shm_insert_s2c_" +
-                                            std::to_string(server_pid) +
-                                            "_" +
-                                            std::to_string(client_pid));
-    EXPECT_EQ(got.sample_c2s_shm_name(), "/reverb_shm_sample_c2s_" +
-                                            std::to_string(server_pid) +
-                                            "_" +
-                                            std::to_string(client_pid));
-    EXPECT_EQ(got.sample_s2c_shm_name(), "/reverb_shm_sample_s2c_" +
-                                            std::to_string(server_pid) +
-                                            "_" +
-                                            std::to_string(client_pid));
+    // Segment names are derived from the server's socket path (scan #12:
+    // PID-keyed names let two in-process servers clobber each other).
+    ShmSegmentNames expected_names = MakeShmNames(sock, client_pid);
+    EXPECT_EQ(got.pool_shm_name(), expected_names.pool);
+    EXPECT_EQ(got.insert_c2s_shm_name(), expected_names.insert_c2s);
+    EXPECT_EQ(got.insert_s2c_shm_name(), expected_names.insert_s2c);
+    EXPECT_EQ(got.sample_c2s_shm_name(), expected_names.sample_c2s);
+    EXPECT_EQ(got.sample_s2c_shm_name(), expected_names.sample_s2c);
   });
 
   auto a = server.Accept();

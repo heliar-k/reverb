@@ -191,8 +191,9 @@ absl::Status Ring::Write(MsgType msg_type, absl::Span<const char> payload) {
   size_t num_slots = (len + body_cap - 1) / body_cap;
   if (num_slots == 0) num_slots = 1;
   if (num_slots > header_->capacity) {
-    return absl::ResourceExhaustedError(
-        "message larger than ring capacity");
+    // PERMANENT failure (retry can never succeed) — distinct from the
+    // transient RING_FULL ResourceExhausted so callers never stash-and-retry.
+    return absl::InvalidArgumentError("message larger than ring capacity");
   }
 
   // Wait for `num_slots` contiguous free slots. SPSC: producer reads tail
@@ -214,8 +215,8 @@ absl::Status Ring::TryWrite(MsgType msg_type,
   size_t num_slots = (len + body_cap - 1) / body_cap;
   if (num_slots == 0) num_slots = 1;
   if (num_slots > header_->capacity) {
-    return absl::ResourceExhaustedError(
-        "message larger than ring capacity");
+    // PERMANENT failure — see Write().
+    return absl::InvalidArgumentError("message larger than ring capacity");
   }
 
   // Non-blocking (spec §8.7): if not enough free slots, return immediately

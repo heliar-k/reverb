@@ -1076,6 +1076,22 @@ absl::Status TrajectoryWriter::RunShmWorker() {
         break;
       }
       uint64_t offset = aresp.shm_offset();
+      // Bounds-check the granted region before memcpy: BytePool::At is raw
+      // pointer arithmetic, so a buggy/corrupt ALLOCATE_RESP would otherwise
+      // make us write outside our OWN RW mapping and corrupt this process.
+      if (offset > shm_conn_->pool.size() ||
+          bytes.size() > shm_conn_->pool.size() - offset) {
+        alloc_failed = true;
+        absl::MutexLock l(&mu_);
+        stream_status_ = absl::InternalError(absl::StrCat(
+            "RunShmWorker: ALLOCATE_RESP granted offset ", offset, " (len ",
+            bytes.size(), ") outside mapped pool of ",
+            shm_conn_->pool.size(), " bytes"));
+        stream_ok_ = false;
+        unrecoverable_status_ = stream_status_;
+        data_cv_.Signal();
+        break;
+      }
       // C4: client memcpy's the serialized bytes into the granted region
       // (RW mmap). The region must stay valid until INSERT_ACK (C2).
       std::memcpy(shm_conn_->pool.At(offset), bytes.data(), bytes.size());
