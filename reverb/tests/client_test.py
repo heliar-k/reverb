@@ -613,6 +613,27 @@ class WriterBoundaryTest(absltest.TestCase):
             w.create_item(TABLE_NAME, 2, 1.0)
 
 
+class WriterExitTest(absltest.TestCase):
+    """Writer.__exit__ must run close() even when flush() raises.
+
+    Regression: `self.flush(); self.close()` skipped close() on flush error,
+    leaving the C++ writer's background thread unjoined until GC (client.py:50).
+    """
+
+    def test_exit_closes_when_flush_raises(self):
+        w = client.Writer.__new__(client.Writer)
+        closed = []
+
+        def boom():
+            raise RuntimeError("flush failed")
+
+        w.flush = boom
+        w.close = lambda: closed.append(True)
+        with self.assertRaises(RuntimeError):
+            w.__exit__()
+        self.assertEqual(closed, [True])
+
+
 class LocalClientBoundaryTest(absltest.TestCase):
     """LocalClient (in-process numpy mode) specific edges."""
 

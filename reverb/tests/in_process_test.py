@@ -21,6 +21,7 @@ historical bare-assert + __main__ form.
 
 import os
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -1075,6 +1076,25 @@ class TrajectoryWriterAppendDtypeMismatchTest(absltest.TestCase):
             w.append({"v": np.array([2], dtype=np.int32)})
         # The C++ "for column N" message must be rewritten to the path 'v'.
         self.assertIn("'v'", str(ctx.exception))
+
+
+class InProcessWaitTest(absltest.TestCase):
+    """Server(in_process=True).wait() must block until stop().
+
+    Regression: wait() only called the gRPC server's Wait(), so in-process
+    (and SHM-only) servers returned instantly despite the docstring promising
+    to block until shutdown (server.py:506).
+    """
+
+    def test_wait_blocks_until_stop(self):
+        server = _make_server()
+        t = threading.Thread(target=server.wait)
+        t.start()
+        time.sleep(0.3)
+        self.assertTrue(t.is_alive(), "wait() returned before stop()")
+        server.stop()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "wait() did not return after stop()")
 
 
 class MultiTableServerInfoTest(absltest.TestCase):

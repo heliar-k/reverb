@@ -46,8 +46,12 @@ class Writer:
         return self
 
     def __exit__(self, *_):
-        self.flush()
-        self.close()
+        # close() must run even when flush() raises — otherwise the C++
+        # writer's background thread isn't joined until GC.
+        try:
+            self.flush()
+        finally:
+            self.close()
 
     def __del__(self):
         if not self._closed:

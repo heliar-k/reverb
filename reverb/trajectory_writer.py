@@ -590,7 +590,10 @@ class _ColumnHistory:
             if val >= 0:
                 val -= len(self)
 
-            if val > 0:
+            # val == 0 means the caller asked for index len(self) — one past
+            # the end. `> 0` let it through and returned the OLDEST buffered
+            # ref, silently building trajectories on a stale step.
+            if val >= 0:
                 raise IndexError("list index out of range")
 
             if val < -len(self._data_references):

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import abc
 import collections
+import itertools
+import threading
 from typing import Optional, Sequence
 
 import portpicker
@@ -28,6 +30,10 @@ import tree
 
 from reverb import item_selectors, pybind, rate_limiters, reverb_types, signature_codec
 from reverb.platform.default import checkpointers
+
+
+# Per-process counter for default SHM socket paths (see Server.__init__).
+_SHM_PATH_COUNTER = itertools.count()
 
 
 class TableExtensionBase(metaclass=abc.ABCMeta):
@@ -369,6 +375,9 @@ class Server:
         self._in_process = in_process
         self._port = None
         self._server = None
+        # Set by stop(); lets wait() block for non-gRPC servers (in_process /
+        # SHM-only), where there is no gRPC service whose Wait() we can call.
+        self._stop_event = threading.Event()
         # SHM transport state (decision C1): created when `shm=True`, destroyed in
         # stop()/__del__. None otherwise.
         self._shm_server = None
@@ -415,10 +424,13 @@ class Server:
             import tempfile  # pylint: disable=g-import-not-at-top
 
             if shm_socket_path is None:
-                # /tmp/reverb_shm_<pid>.sock; cleaned up on Stop (the C++ bootstrap
-                # unlinks the udsocket on close, R7).
+                # /tmp/reverb_shm_<pid>_<n>.sock: the per-process counter keeps
+                # two Server(shm=True) instances in one process from clobbering
+                # each other (the PID-only path + bind-time unlink killed the
+                # first server's live socket). Cleaned up on Stop (R7).
                 shm_socket_path = os.path.join(
-                    tempfile.gettempdir(), f"reverb_shm_{os.getpid()}.sock"
+                    tempfile.gettempdir(),
+                    f"reverb_shm_{os.getpid()}_{next(_SHM_PATH_COUNTER)}.sock",
                 )
             self._shm_server = pybind.ShmServer(
                 tables=[t.internal_table for t in tables],
@@ -487,8 +499,11 @@ class Server:
         if self._shm_server is not None:
             self._shm_server.Stop()
             self._shm_server = None
-        if self._server is not None:
-            return self._server.Stop()
+        result = self._server.Stop() if self._server is not None else None
+        # Unblock wait() for ALL server kinds (gRPC Wait covers gRPC; the event
+        # covers in_process/SHM-only).
+        self._stop_event.set()
+        return result
 
     def wait(self):
         """Blocks until the service is shut down.
@@ -505,6 +520,10 @@ class Server:
         """
         if self._server is not None and self._server.Wait():
             raise KeyboardInterrupt
+        if self._server is None:
+            # in_process / SHM-only: no gRPC Wait() exists; block until stop()
+            # (SIGINT interrupts Event.wait in the main thread).
+            self._stop_event.wait()
 
     def localhost_client(self) -> client.Client:
         """Creates a client connect to the localhost channel.

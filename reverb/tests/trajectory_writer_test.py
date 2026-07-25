@@ -54,6 +54,24 @@ def _mock_append(x):
     return [FakeWeakCellRef(y) if y is not None else None for y in x]
 
 
+class ColumnHistorySliceTest(absltest.TestCase):
+    """_ColumnHistory index-boundary behavior."""
+
+    def test_int_one_past_end_raises_index_error(self):
+        # Regression: history[len] returned the OLDEST buffered ref instead of
+        # raising — create_item could silently build a trajectory on a stale
+        # step (trajectory_writer.py:591, `val > 0` let val == 0 through).
+        h = trajectory_writer._ColumnHistory(("x",), buffer_size=10)
+        for i in range(5):
+            h.append(FakeWeakCellRef(i))
+        _ = h[4]  # last valid index: fine
+        _ = h[-5]  # oldest: fine
+        with self.assertRaises(IndexError):
+            _ = h[5]  # one past the end
+        with self.assertRaises(IndexError):
+            _ = h[100]
+
+
 class TrajectoryWriterTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()

@@ -242,6 +242,42 @@ class ShmRateLimiterTest(absltest.TestCase):
         self.assertLess(elapsed, 5.0, f"timeout took too long: {elapsed:.1f}s")
 
 
+class ShmTwoServersOneProcessTest(absltest.TestCase):
+    """Two Server(shm=True) in one process must not clobber each other.
+
+    Regression: the default socket path was /tmp/reverb_shm_<pid>.sock and the
+    C++ pool segment name was keyed by PID only, so starting a second server
+    unlinked the FIRST server's live socket/pool (scan #12, server.py:421,
+    shm_server.cc / bootstrap.cc).
+    """
+
+    def test_two_servers_distinct_and_both_usable(self):
+        s1 = reverb.Server(tables=[_make_table("t")], in_process=True, shm=True)
+        s2 = reverb.Server(tables=[_make_table("t")], in_process=True, shm=True)
+        try:
+            self.assertNotEqual(s1.shm_socket_path, s2.shm_socket_path)
+            # Both must accept NEW connections after both are up (the second
+            # server's bootstrap must not have unlinked the first's socket).
+            c1 = reverb.ShmClient(s1.shm_socket_path)
+            c2 = reverb.ShmClient(s2.shm_socket_path)
+            _insert_one(c1, "t", np.array([1.0], dtype=np.float32))
+            _insert_one(c2, "t", np.array([2.0], dtype=np.float32))
+            v1 = float(
+                np.asarray(
+                    next(c1.sample("t", 1, emit_timesteps=False)).data[0]
+                ).reshape(-1)[0]
+            )
+            v2 = float(
+                np.asarray(
+                    next(c2.sample("t", 1, emit_timesteps=False)).data[0]
+                ).reshape(-1)[0]
+            )
+            self.assertEqual((v1, v2), (1.0, 2.0))
+        finally:
+            s1.stop()
+            s2.stop()
+
+
 class ShmServerLifecycleTest(absltest.TestCase):
     """C1: ShmServer lifecycle hangs off the Server object."""
 
