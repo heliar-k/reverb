@@ -220,6 +220,31 @@ class InProcessDtypesTest(absltest.TestCase):
                 self.assertEqual(int(got), int(exp))
 
 
+class InProcessBytesDtypeTest(absltest.TestCase):
+    """Regression: numpy bytes (S dtype) must round-trip byte-for-byte.
+
+    tensor_proxy.cc FromNdArray serialized string arrays via py::str(item),
+    turning b'abc' into the 6-char repr \"b'abc'\" — silent data corruption.
+    """
+
+    def test_bytes_array_round_trip(self):
+        server = _make_server(table_name="b", max_size=10, min_size=1)
+        client = server.in_process_client
+
+        arr = np.array([b"abc", b"de"])  # dtype '|S3'
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"v": arr})
+            w.create_item(
+                table="b", priority=1.0, trajectory={"v": w.history["v"][:]}
+            )
+            w.flush()
+
+        sample = next(client.sample("b", num_samples=1, emit_timesteps=False))
+        got = np.asarray(sample.data[0])
+        self.assertEqual(got.dtype, arr.dtype, (got.dtype, arr.dtype))
+        np.testing.assert_array_equal(got, [arr])
+
+
 class InProcessRateLimiterTest(absltest.TestCase):
     def test_rate_limiter_min_size(self):
         # MinSize(5) blocks sampling while the table holds < 5 items. With

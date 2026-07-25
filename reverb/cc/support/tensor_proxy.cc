@@ -198,14 +198,28 @@ absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray) {
     }
     NpyIter_IterNextFunc* next = NpyIter_GetIterNext(it, nullptr);
     char** dataptr = NpyIter_GetDataPtrArray(it);
-    while (next(it)) {
+    // NpyIter 初始已停在元素 0:必须 do-while(先处理后推进),
+    // while(next) 会跳过首元素,单元素数组则编出空 bytes。
+    if (PyArray_SIZE(contig) == 0) {
+      NpyIter_Deallocate(it);
+      return TensorBuffer(std::move(spec), std::move(bytes));
+    }
+    do {
       PyObject* item = PyArray_GETITEM(contig, *dataptr);
       if (!item) { PyErr_Clear(); NpyIter_Deallocate(it);
         return absl::InternalError("FromNdArray: PyArray_GETITEM failed"); }
-      std::string s = py::str(item).cast<std::string>();
+      // S-dtype 元素是 PyBytes(np.bytes_ 继承 bytes),必须逐字节拷贝;
+      // py::str(item) 会存成 repr "b'abc'" —— 静默损坏。U-dtype 走
+      // py::str 得到 UTF-8。
+      std::string s;
+      if (PyBytes_Check(item)) {
+        s.assign(PyBytes_AS_STRING(item), PyBytes_GET_SIZE(item));
+      } else {
+        s = py::str(item).cast<std::string>();
+      }
       Py_DECREF(item);
       EncodeString(&bytes, s);
-    }
+    } while (next(it));
     NpyIter_Deallocate(it);
   } else {
     size_t nbytes = static_cast<size_t>(PyArray_NBYTES(contig));
@@ -226,9 +240,18 @@ py::object TensorBuffer::ToNdArray() const {
     py::list lst;
     size_t pos = 0;
     while (pos < bytes_.size()) {
-      lst.append(py::str(DecodeString(bytes_, &pos)));
+      // 解码为 bytes:线格式不区分 S/U,取 TF 语义 string==bytes,
+      // 与写侧 PyBytes 逐字节拷贝自洽(S 数组 dtype 往返一致)。
+      // ponytail: U-dtype 数组读回变成 S(dtype 变化,值为 UTF-8 字节);
+      // 升级路径 = 线格式加 dtype 标记。
+      lst.append(py::bytes(DecodeString(bytes_, &pos)));
     }
-    return np.attr("array")(lst);
+    // reshape 回 spec_.shape:否则 [T,2] 字符串列塌成 [T*2],
+    // 与数值路径(ToNdArray 用 spec_.shape 建数组)不一致。
+    // (无 pybind11/stl.h,手动构 tuple)
+    py::tuple dims(spec_.shape.size());
+    for (size_t i = 0; i < spec_.shape.size(); ++i) dims[i] = spec_.shape[i];
+    return np.attr("array")(lst).attr("reshape")(dims);
   }
 
   std::vector<npy_intp> dims(spec_.shape.begin(), spec_.shape.end());
