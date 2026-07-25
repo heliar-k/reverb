@@ -22,6 +22,25 @@ reverb_py_test(
     ],
 )
 
+# bazel 环境无 torch → 除 is_available 探针外全部 skip(恰好验证 FR3 无 torch
+# 可导入);真 torch 用例在系统 python + runfiles 下跑,见 spec 测试策略。
+reverb_py_test(
+    name = "torch_support_test",
+    srcs = ["torch_support_test.py"],
+    deps = [
+        "//reverb:torch_support",
+    ],
+)
+
+reverb_py_test(
+    name = "torch_integration_test",
+    srcs = ["torch_integration_test.py"],
+    deps = [
+        "//reverb",
+        "//reverb:structured_writer",
+    ],
+)
+
 # Runs examples/*.ipynb code cells in a pure-numpy embedded mode as a regression guard.
 reverb_py_test(
     name = "examples_notebook_test",

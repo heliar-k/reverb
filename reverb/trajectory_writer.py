@@ -21,7 +21,7 @@ from typing import Any, Iterator, List, MutableMapping, Optional, Sequence, Tupl
 import numpy as np
 import tree
 
-from reverb import errors, pybind
+from reverb import errors, pybind, torch_support
 
 
 class TrajectoryWriter:
@@ -279,6 +279,9 @@ class TrajectoryWriter:
           ValueError: If the same column is provided more than once in the same
             step.
         """
+        # Accept torch.Tensor leaves (converted zero-copy on CPU; one D2H copy
+        # on CUDA). No-op when torch is not installed.
+        data = torch_support.to_numpy_tree(data)
         # Unless it is the first step, check that the structure is the same.
         if self._structure is None:
             self._update_structure(tree.map_structure(lambda _: None, data))

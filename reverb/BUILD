@@ -51,6 +51,7 @@ reverb_pytype_library(
         ":replay_sample",
         ":reverb_types",
         ":structured_writer",
+        ":torch_support",
         ":trajectory_writer",
     ],
 )
@@ -58,6 +59,15 @@ reverb_pytype_library(
 reverb_pytype_library(
     name = "errors",
     srcs = ["errors.py"],
+    strict_deps = True,
+    deps = [],
+)
+
+# Optional torch.Tensor support. Pure Python, lazy-imports torch at runtime;
+# deliberately no torch dep here — bazel test env has no torch (FR3).
+reverb_pytype_library(
+    name = "torch_support",
+    srcs = ["torch_support.py"],
     strict_deps = True,
     deps = [],
 )
@@ -229,6 +239,7 @@ reverb_pytype_strict_library(
         ":pybind",
         ":reverb_types",
         ":signature_codec",
+        ":torch_support",
         "//reverb/cc:patterns_py_pb2",
         "//third_party/reverb_tensor:reverb_tensor_py_pb2",
     ],
@@ -247,6 +258,7 @@ reverb_pytype_library(
     deps = [
         ":errors",
         ":pybind",
+        ":torch_support",
     ],
 )
 

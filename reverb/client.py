@@ -26,7 +26,7 @@ from typing import Any, Dict, Generator, List, Literal, Optional, Union, overloa
 import numpy as np
 import tree
 
-from reverb import pybind, replay_sample, reverb_types
+from reverb import pybind, replay_sample, reverb_types, torch_support
 
 
 class Writer:
@@ -97,7 +97,8 @@ class Writer:
           data: The (possibly nested) structure to make available for new
             items to reference.
         """
-        self._writer.Append(tree.flatten(data))
+        # Accept torch.Tensor leaves (see TrajectoryWriter.append).
+        self._writer.Append(tree.flatten(torch_support.to_numpy_tree(data)))
 
     def append_sequence(self, sequence: Any):
         """Appends sequence of data to the internal buffer.

@@ -23,7 +23,7 @@ from typing import Any, Callable, NewType, Optional, Sequence
 
 import tree
 
-from reverb import pybind, reverb_types, signature_codec
+from reverb import pybind, reverb_types, signature_codec, torch_support
 from reverb.cc import patterns_pb2
 from third_party.reverb_tensor import reverb_tensor_pb2
 
@@ -116,6 +116,8 @@ class StructuredWriter:
           ValueError: If the number of items in the flattened data changes between
             calls.
         """
+        # Accept torch.Tensor leaves (see TrajectoryWriter.append).
+        data = torch_support.to_numpy_tree(data)
         flat_data = tree.flatten(data)
 
         if self._flat_data_length is None:
@@ -366,6 +368,8 @@ def infer_signature(
             f"included {', '.join(sorted(set(c.table for c in configs)))}."
         )
 
+    # Accept torch.Tensor leaves in the spec (converted to numpy views).
+    step_spec = torch_support.to_numpy_tree(step_spec)
     flat_step_spec = tree.flatten(step_spec)
 
     # Uses the pure-Python `signature_codec.TensorSpec` (no TF). `step_spec`
