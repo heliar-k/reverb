@@ -337,6 +337,109 @@ TEST(ShmInsertTest, StructuredWriterEmitsItemsOverShm) {
   sampler->Close();
 }
 
+// --- ⑧-b: server-side validation of peer-supplied pool offsets ----------
+
+// Poll a non-blocking Ring::Read with a deadline so a missing response fails
+// the test in seconds instead of hanging forever (pre-fix the server only
+// LOGS a rejected INSERT and never replies).
+absl::Status ReadWithDeadline(Ring* ring, MsgType* msg_type,
+                              std::string* payload, absl::Duration timeout) {
+  absl::Time deadline = absl::Now() + timeout;
+  while (absl::Now() < deadline) {
+    absl::Status s = ring->Read(msg_type, payload);
+    if (s.ok()) return absl::OkStatus();
+    if (!absl::IsNotFound(s)) return s;
+    sched_yield();
+  }
+  return absl::DeadlineExceededError("no response within deadline");
+}
+
+// A forged INSERT whose chunk ref points at pool offset 0 (the PoolHeader —
+// never an allocated block) must be rejected with an INVALID_ARGUMENT ERROR
+// on the insert s2c flow, and the server must keep serving. Before the fix,
+// HandleInsert ParseFromArray'd the peer-controlled offset/length directly
+// (OOB read for a wild offset) and only LOGGED the failure — the client's
+// writer hung until its 60s cap.
+TEST(ShmInsertTest, BogusChunkOffsetReturnsErrorAndServerSurvives) {
+  auto table = MakeTable("t");
+  auto fx = ShmFixture::Make(table, "bad");
+  ASSERT_NE(fx, nullptr);
+
+  ShmInsertRequest req;
+  auto* chunk = req.add_chunks();
+  chunk->set_chunk_key(1);
+  chunk->set_shm_offset(0);   // PoolHeader, never granted by ALLOCATE
+  chunk->set_total_length(64);
+  std::string body;
+  req.SerializeToString(&body);
+  REVERB_ASSERT_OK(fx->client->connection()->insert_c2s.Write(INSERT, body));
+
+  MsgType type;
+  std::string payload;
+  REVERB_ASSERT_OK(ReadWithDeadline(&fx->client->connection()->insert_s2c,
+                                    &type, &payload, absl::Seconds(5)));
+  ASSERT_EQ(type, ERROR);
+  ShmError err;
+  ASSERT_TRUE(err.ParseFromString(payload));
+  EXPECT_EQ(err.code(), ShmError::INVALID_ARGUMENT);
+
+  // Server survives: a normal insert round-trip still works.
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush());
+  EXPECT_EQ(table->size(), 1);
+}
+
+// A RELEASE for an offset the server never granted to this client must be
+// ignored. Before the fix, HandleRelease Deallocate'd ANY offset: a double
+// RELEASE pushed the same block onto its slab's free list twice, so two later
+// ALLOCATEs were handed the SAME block concurrently (insert bytes overwrite
+// each other; offset 0 would even corrupt the PoolHeader).
+TEST(ShmInsertTest, DoubleReleaseDoesNotHandOutSameBlockTwice) {
+  auto table = MakeTable("t");
+  auto fx = ShmFixture::Make(table, "rel");
+  ASSERT_NE(fx, nullptr);
+  Ring* c2s = &fx->client->connection()->insert_c2s;
+  Ring* s2c = &fx->client->connection()->insert_s2c;
+
+  auto allocate = [&](uint64_t* out) {
+    ShmAllocateRequest req;
+    req.set_num_bytes(64);
+    std::string body;
+    req.SerializeToString(&body);
+    REVERB_ASSERT_OK(c2s->Write(ALLOCATE, body));
+    MsgType type;
+    std::string payload;
+    REVERB_ASSERT_OK(ReadWithDeadline(s2c, &type, &payload, absl::Seconds(5)));
+    ASSERT_EQ(type, ALLOCATE_RESP);
+    ShmAllocateResponse resp;
+    ASSERT_TRUE(resp.ParseFromString(payload));
+    *out = resp.shm_offset();
+  };
+  auto release = [&](uint64_t offset) {
+    ShmReleaseRequest rel;
+    rel.add_offsets(offset);
+    std::string body;
+    rel.SerializeToString(&body);
+    REVERB_ASSERT_OK(c2s->Write(RELEASE, body));
+  };
+
+  uint64_t x = 0;
+  allocate(&x);
+  release(x);
+  release(x);  // double release: must be ignored
+
+  uint64_t a = 0, b = 0;
+  allocate(&a);
+  allocate(&b);
+  EXPECT_NE(a, b) << "double-freed block handed out twice (offset " << a
+                  << ")";
+}
+
 }  // namespace
 }  // namespace shm
 }  // namespace reverb

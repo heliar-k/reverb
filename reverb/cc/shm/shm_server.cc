@@ -841,10 +841,17 @@ void ShmServer::DrainPendingSamples(ClientState& state) {
 absl::Status ShmServer::HandleRelease(ClientState& state,
                                       const ShmReleaseRequest& req) {
   for (uint64_t offset : req.offsets()) {
+    // Only release offsets this server granted to THIS client. Deallocating
+    // an arbitrary offset corrupts the slab free lists (a double RELEASE
+    // hands the same block out twice; offset 0 would free the PoolHeader).
+    if (state.outstanding_offsets_.erase(offset) == 0) {
+      REVERB_LOG(REVERB_WARNING)
+          << "ShmServer: ignoring RELEASE of untracked offset " << offset;
+      continue;
+    }
     if (pool_.Unref(offset)) {  // ->0
       pool_.Deallocate(offset);
     }
-    state.outstanding_offsets_.erase(offset);
   }
   return absl::OkStatus();
 }
@@ -989,6 +996,26 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     if (ref.total_length() == 0) {
       return absl::InvalidArgumentError(
           "ShmServer::HandleInsert: zero-length chunk");
+    }
+    // Validate the peer-supplied offset/length BEFORE touching the pool:
+    // the offset must be a block this server granted to THIS client (via
+    // ALLOCATE, still outstanding), and the length must fit in its block.
+    // Otherwise ParseFromArray(pool_.At(offset), total_length) is an
+    // out-of-bounds read on client-controlled input. Reject with an ERROR
+    // response (not just a logged status) so the client's writer fails fast
+    // instead of hanging until its timeout cap.
+    if (!state.outstanding_offsets_.contains(ref.shm_offset()) ||
+        ref.total_length() > pool_.block_size_at(ref.shm_offset())) {
+      ShmError err;
+      err.set_code(ShmError::INVALID_ARGUMENT);
+      err.set_message(absl::StrCat(
+          "ShmServer::HandleInsert: chunk ", ref.chunk_key(),
+          " references offset ", ref.shm_offset(), " (len ",
+          ref.total_length(),
+          ") which is not an outstanding block granted to this client"));
+      std::string body;
+      err.SerializeToString(&body);
+      return EnqueueInsertS2C(state, ERROR, body);
     }
     ChunkData cd;
     if (!cd.ParseFromArray(pool_.At(ref.shm_offset()),
