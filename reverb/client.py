@@ -219,8 +219,16 @@ class _BaseClient:
     `NewStructuredWriter(vector<string>)` binding.
     """
 
-    def __init__(self):
+    _VALID_OUTPUT_FORMATS = ("numpy", "torch")
+
+    def __init__(self, *, output_format: str = "numpy"):
         # Subclasses assign `self._client` and `self._server_address` (gRPC only).
+        if output_format not in self._VALID_OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {self._VALID_OUTPUT_FORMATS}, "
+                f"got {output_format!r}"
+            )
+        self._output_format = output_format
         self._signature_cache: Dict[str, Any] = {}
 
     # Default for `sample(emit_timesteps=...)` when the caller omits the arg.
@@ -458,6 +466,11 @@ class _BaseClient:
 
         sampler = self._new_sampler(table, num_samples, buffer_size, timeout_ms)
 
+        if self._output_format == "torch":
+            convert = torch_support.from_numpy_leaf
+        else:
+            convert = lambda x: x
+
         for _ in range(num_samples):
             sample = sampler.GetNextTrajectory()
 
@@ -480,13 +493,15 @@ class _BaseClient:
                 for i in range(data[0].shape[0]):
                     timestep = replay_sample.ReplaySample(
                         info=info,
-                        data=unflatten([np.asarray(col[i], col.dtype) for col in data]),
+                        data=unflatten(
+                            [convert(np.asarray(col[i], col.dtype)) for col in data]
+                        ),
                     )
                     timesteps.append(timestep)
 
                 yield timesteps
             else:
-                yield replay_sample.ReplaySample(info, unflatten(data))
+                yield replay_sample.ReplaySample(info, unflatten([convert(x) for x in data]))
 
     def writer(
         self,
@@ -716,13 +731,14 @@ class Client(_BaseClient):
     at very small scale.
     """
 
-    def __init__(self, server_address: str):
+    def __init__(self, server_address: str, *, output_format: str = "numpy"):
         """Constructor of Client.
 
         Args:
           server_address: Address to the Reverb ReverbService.
+          output_format: "numpy" (default) or "torch"; see `_BaseClient`.
         """
-        super().__init__()
+        super().__init__(output_format=output_format)
         self._server_address = server_address
         self._client = pybind.Client(server_address)
 
@@ -770,8 +786,10 @@ class LocalClient(_BaseClient):
     exactly. `LocalClient` is not picklable (it holds in-process Table pointers).
     """
 
-    def __init__(self, internal_client: "pybind.InProcessClient"):
-        super().__init__()
+    def __init__(
+        self, internal_client: "pybind.InProcessClient", *, output_format: str = "numpy"
+    ):
+        super().__init__(output_format=output_format)
         self._client = internal_client
 
     def __repr__(self):
@@ -838,8 +856,8 @@ class ShmClient(_BaseClient):
     (ticket ⑫).
     """
 
-    def __init__(self, socket_path: str):
-        super().__init__()
+    def __init__(self, socket_path: str, *, output_format: str = "numpy"):
+        super().__init__(output_format=output_format)
         self._socket_path = socket_path
         # pybind.ShmClient.__init__ calls ShmClient::Connect (bootstrap + mmap);
         # raises on connection/handshake failure.

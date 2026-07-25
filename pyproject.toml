@@ -23,6 +23,11 @@ dependencies = [
   # older runtimes raise ImportError on import.
   "protobuf>=5.27",
 ]
+
+[project.optional-dependencies]
+# Optional torch.Tensor support (docs/torch-tensor-design.md). CPU 零拷贝;
+# CUDA tensor 写入时一次 D2H。reverb 本体不依赖 torch。
+torch = ["torch"]
 classifiers = [
   'Development Status :: 3 - Alpha',
   'Intended Audience :: Developers',

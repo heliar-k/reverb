@@ -31,7 +31,7 @@ except ImportError:
     torch = None
 
 
-def _make_server(table_name="t"):
+def _make_server(table_name="t", max_times_sampled=1, **server_kwargs):
     return reverb.Server(
         tables=[
             reverb.Table(
@@ -39,11 +39,12 @@ def _make_server(table_name="t"):
                 sampler=reverb.selectors.Fifo(),
                 remover=reverb.selectors.Fifo(),
                 max_size=10,
-                max_times_sampled=1,
+                max_times_sampled=max_times_sampled,
                 rate_limiter=reverb.rate_limiters.MinSize(1),
             )
         ],
         in_process=True,
+        **server_kwargs,
     )
 
 
@@ -143,6 +144,45 @@ class TorchWritePathTest(absltest.TestCase):
         samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
         np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
 
+    def test_output_format_torch_returns_tensors(self):
+        server = _make_server(max_times_sampled=0, output_format="torch")
+        client = server.in_process_client
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": np.array([1.0, 2.0], dtype=np.float32)})
+            w.create_item("t", priority=1.0, trajectory={"obs": w.history["obs"][:]})
+            w.flush()
+
+        # emit_timesteps=False: trajectory leaves are torch tensors.
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertIsInstance(samples[0].data[0], torch.Tensor)
+        np.testing.assert_allclose(samples[0].data[0].numpy(), [[1.0, 2.0]])
+
+        # emit_timesteps=True (LocalClient default): timestep leaves too.
+        draws = list(client.sample("t", num_samples=1))
+        leaf = draws[0][0].data[0]
+        self.assertIsInstance(leaf, torch.Tensor)
+        np.testing.assert_allclose(leaf.numpy(), [1.0, 2.0])
+
+    def test_output_format_torch_unsupported_dtype_falls_back(self):
+        server = _make_server(output_format="torch")
+        client = server.in_process_client
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"tag": np.array([b"ab"], dtype="S2")})
+            w.create_item("t", priority=1.0, trajectory={"tag": w.history["tag"][:]})
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        leaf = samples[0].data[0]
+        self.assertIsInstance(leaf, np.ndarray)
+        self.assertEqual(leaf.dtype, np.dtype("S2"))
+        self.assertEqual(leaf[0], b"ab")
+
+    def test_output_format_invalid_raises_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "output_format"):
+            _make_server(output_format="xml")
+        with self.assertRaisesRegex(ValueError, "output_format"):
+            reverb.Client("localhost:1", output_format="xml")
+
     def test_create_reference_step_and_infer_signature_accept_torch(self):
         step_spec = {
             "a": torch.zeros((), dtype=torch.float32),
@@ -160,6 +200,26 @@ class TorchWritePathTest(absltest.TestCase):
         self.assertEqual(signature["a"].dtype, np.float32)
         self.assertEqual(signature["b"].dtype, np.int32)
         self.assertEqual(tuple(signature["b"].shape), (2, 2, 2))
+
+
+class TorchUnavailableTest(absltest.TestCase):
+    """Runs only when torch is NOT installed (i.e. the bazel test env)."""
+
+    def setUp(self):
+        super().setUp()
+        if torch is not None:
+            self.skipTest("only meaningful without torch")
+
+    def test_torch_output_without_torch_raises_importerror(self):
+        server = _make_server(output_format="torch")
+        client = server.in_process_client
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": np.array([1.0], dtype=np.float32)})
+            w.create_item("t", priority=1.0, trajectory={"obs": w.history["obs"][:]})
+            w.flush()
+
+        with self.assertRaises(ImportError):
+            list(client.sample("t", num_samples=1, emit_timesteps=False))
 
 
 if __name__ == "__main__":

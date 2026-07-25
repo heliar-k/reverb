@@ -19,6 +19,7 @@ requires torch at import time. Conversion happens once per leaf at the
 writer/sample boundary; everything below stays opaque bytes.
 """
 
+import numpy as np
 import tree
 
 _TORCH = ...
@@ -43,6 +44,14 @@ def _torch():
 
 def is_available() -> bool:
     return _torch() is not None
+
+
+def _require_torch():
+    """Returns the torch module; raises ImportError with install hint if absent."""
+    torch = _torch()
+    if torch is None:
+        raise ImportError(_TORCH_UNAVAILABLE_MSG)
+    return torch
 
 
 def is_tensor(x) -> bool:
@@ -83,3 +92,20 @@ def to_numpy_tree(structure):
     if not is_available():
         return structure
     return tree.map_structure(to_numpy_leaf, structure)
+
+
+def from_numpy_leaf(x):
+    """Converts a numpy leaf to a zero-copy torch.Tensor when possible.
+
+    Leaves whose dtype torch cannot represent (e.g. strings, uint16/32/64)
+    are returned unchanged (fallback stays numpy).
+
+    Raises:
+        ImportError: if x is an ndarray but torch is not installed.
+    """
+    if not isinstance(x, np.ndarray):
+        return x
+    try:
+        return _require_torch().from_numpy(x)
+    except TypeError:
+        return x

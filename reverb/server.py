@@ -331,6 +331,7 @@ class Server:
         in_process: bool = False,
         shm: bool = False,
         shm_socket_path: Optional[str] = None,
+        output_format: str = "numpy",
     ):
         """Constructor of Server serving the ReverbService.
 
@@ -355,6 +356,8 @@ class Server:
           shm_socket_path: udsocket path for the SHM bootstrap server. If `None`
             (default), a path `/tmp/reverb_shm_<pid>.sock` is generated and cleaned
             up on `stop()`.
+          output_format: "numpy" (default) or "torch"; forwarded to the in-process
+            client's `sample` output. Only meaningful with `in_process=True`.
 
         Raises:
           ValueError: If tables is empty.
@@ -404,7 +407,9 @@ class Server:
                 import logging  # pylint: disable=g-import-not-at-top
 
                 logging.warning("No checkpoint to restore (first start): %s", e)
-            self._in_process_client = _client.LocalClient(internal_client)
+            self._in_process_client = _client.LocalClient(
+                internal_client, output_format=output_format
+            )
         else:
             if port is None:
                 port = portpicker.pick_unused_port()
