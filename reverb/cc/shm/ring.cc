@@ -245,11 +245,26 @@ void Ring::WriteSlots(MsgType msg_type, absl::Span<const char> payload,
     if (i > 0) s->flags |= kFlagIsContinuation;
     s->body_len = static_cast<uint32_t>(chunk_len);
     std::memcpy(SlotBody(s), src + i * body_cap, chunk_len);
-    // Publish: fill body first, then release seq. Consumer acquires seq before
-    // reading the body, so it sees all the writes above.
-    std::atomic_store_explicit(reinterpret_cast<std::atomic<uint64_t>*>(&s->seq),
-                               seq, std::memory_order_release);
+    // Publish continuation slots immediately; slot 0's seq is published LAST
+    // (below). Publishing in slot order let a consumer pass slot 0 while slot
+    // k+1 was still in flight -> spurious "continuation slot missing" on a
+    // normal race.
+    if (i > 0) {
+      std::atomic_store_explicit(
+          reinterpret_cast<std::atomic<uint64_t>*>(&s->seq), seq,
+          std::memory_order_release);
+    }
   }
+  // Batch publish: release the FIRST slot's seq only after every slot of the
+  // message is fully written. The consumer's acquire on slot 0
+  // synchronizes-with this store, making all writes above (headers, bodies,
+  // continuation seqs) visible as one atomic message — its continuation-slot
+  // checks then always pass, and "continuation slot missing" once again
+  // signals genuine corruption rather than a publish race.
+  SlotHeader* first = Slot(first_seq);
+  std::atomic_store_explicit(
+      reinterpret_cast<std::atomic<uint64_t>*>(&first->seq), first_seq,
+      std::memory_order_release);
   header_->head.store(first_seq + num_slots, std::memory_order_release);
 }
 

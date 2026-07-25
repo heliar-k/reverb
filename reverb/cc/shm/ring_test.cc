@@ -152,6 +152,60 @@ TEST(RingTest, MultiRoundWraparound) {
   }
 }
 
+TEST(RingTest, MultiSlotConcurrentReadNeverSeesPartialMessage) {
+  // Regression for the multi-slot publish race: WriteSlots used to release
+  // each slot's seq in order 0..n-1, so a consumer that passed slot 0 could
+  // find slot k+1 still unpublished (producer preempted mid-loop) and get
+  // InternalError("ring continuation slot missing") on a NORMAL race —
+  // fatal to the client's ReadBlocking. The fix publishes slot 0's seq LAST,
+  // so the consumer's acquire on slot 0 makes the whole message visible
+  // atomically. Every Read must be NOT_READY or a complete intact message.
+  auto s = Ring::Create(UniqueName("race"), 128, 64);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+
+  constexpr int kMessages = 500;
+  constexpr size_t kPayloadLen = 4800;  // 100 slots x 48-byte body
+  std::atomic<bool> reader_failed{false};
+  std::atomic<int> read_count{0};
+  absl::Status reader_status = absl::OkStatus();  // read after join
+
+  std::thread consumer([&] {
+    MsgType type;
+    std::string out;
+    while (read_count.load() < kMessages && !reader_failed.load()) {
+      absl::Status st = ring.Read(&type, &out);
+      if (absl::IsNotFound(st)) {
+        sched_yield();
+        continue;
+      }
+      if (!st.ok()) {
+        reader_status = st;
+        reader_failed.store(true);
+        return;
+      }
+      int idx = read_count.load();
+      EXPECT_EQ(type, INSERT);
+      EXPECT_EQ(out, std::string(kPayloadLen, static_cast<char>(idx % 251)))
+          << "corrupted payload at message " << idx;
+      read_count.store(idx + 1);
+    }
+  });
+
+  std::thread producer([&] {
+    for (int i = 0; i < kMessages && !reader_failed.load(); i++) {
+      std::string payload(kPayloadLen, static_cast<char>(i % 251));
+      REVERB_ASSERT_OK(ring.Write(INSERT, absl::MakeSpan(payload)));
+    }
+  });
+
+  producer.join();
+  consumer.join();
+  EXPECT_FALSE(reader_failed.load())
+      << "consumer saw a partial message: " << reader_status;
+  EXPECT_EQ(read_count.load(), kMessages);
+}
+
 TEST(RingTest, SeqCounterWraps) {
   // seq is uint64 starting at 1; we can't overflow it in a test, but we verify
   // the ring keeps working after many rounds (head/tail advance far beyond
