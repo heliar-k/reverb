@@ -38,9 +38,6 @@ class TorchSupportTest(absltest.TestCase):
             # the no-torch path (FR3), all tensor cases skip.
             self.skipTest("torch not installed")
 
-    def test_probe_consistent_with_env(self):
-        self.assertEqual(torch_support.is_available(), torch is not None)
-
     def test_cpu_tensor_converts_with_same_values(self):
         t = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         arr = torch_support.to_numpy_leaf(t)

@@ -115,6 +115,8 @@ class StructuredWriter:
         Raises:
           ValueError: If the number of items in the flattened data changes between
             calls.
+          ValueError: If a torch.Tensor leaf has a dtype with no numpy
+            counterpart (e.g. bfloat16).
         """
         # Accept torch.Tensor leaves (see TrajectoryWriter.append).
         data = torch_support.to_numpy_tree(data)

@@ -124,12 +124,101 @@ class TorchWritePathTest(absltest.TestCase):
         self.assertLen(samples, 1)
         np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
 
+    def test_legacy_writer_append_sequence_accepts_torch(self):
+        server = _make_server()
+        client = server.in_process_client
+        with client.writer(max_sequence_length=2, chunk_length=2) as w:
+            w.append_sequence({"obs": torch.tensor([[1.0], [2.0]])})
+            w.create_item("t", num_timesteps=2, priority=1.0)
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0], [2.0]])
+
+    def test_legacy_writer_append_sequence_bfloat16_raises(self):
+        server = _make_server()
+        client = server.in_process_client
+        with (
+            client.writer(max_sequence_length=2, chunk_length=2) as w,
+            self.assertRaisesRegex(ValueError, "torch.bfloat16"),
+        ):
+            w.append_sequence({"obs": torch.ones((2, 1), dtype=torch.bfloat16)})
+
+    def test_grpc_client_accepts_torch(self):
+        server = reverb.Server(
+            tables=[
+                reverb.Table(
+                    name="t",
+                    sampler=reverb.selectors.Fifo(),
+                    remover=reverb.selectors.Fifo(),
+                    max_size=10,
+                    max_times_sampled=1,
+                    rate_limiter=reverb.rate_limiters.MinSize(1),
+                )
+            ]
+        )
+        self.addCleanup(server.stop)
+        client = reverb.Client(f"localhost:{server.port}")
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": torch.tensor([1.0, 2.0])})
+            w.create_item("t", priority=1.0, trajectory={"obs": w.history["obs"][:]})
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
+
+    def test_shm_client_accepts_torch(self):
+        server = reverb.Server(
+            tables=[
+                reverb.Table(
+                    name="t",
+                    sampler=reverb.selectors.Fifo(),
+                    remover=reverb.selectors.Fifo(),
+                    max_size=10,
+                    max_times_sampled=1,
+                    rate_limiter=reverb.rate_limiters.MinSize(1),
+                )
+            ],
+            in_process=True,
+            shm=True,
+        )
+        self.addCleanup(server.stop)
+        client = reverb.ShmClient(server.shm_socket_path)
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": torch.tensor([1.0, 2.0])})
+            w.create_item("t", priority=1.0, trajectory={"obs": w.history["obs"][:]})
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
+
+    def test_output_format_uint16_converts_when_torch_supports(self):
+        # torch>=2.3 has uint16/32/64: from_numpy converts (no fallback).
+        # Older torch would fall back to numpy — both behaviors are valid;
+        # this test pins values being correct either way.
+        server = _make_server(output_format="torch")
+        client = server.in_process_client
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"x": np.array([7], dtype=np.uint16)})
+            w.create_item("t", priority=1.0, trajectory={"x": w.history["x"][:]})
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        leaf = samples[0].data[0]
+        self.assertIsInstance(leaf, (np.ndarray, torch.Tensor))
+        np.testing.assert_array_equal(np.asarray(leaf), [[7]])
+
     def test_bfloat16_write_raises_clear_error(self):
         server = _make_server()
         client = server.in_process_client
-        with client.trajectory_writer(num_keep_alive_refs=1) as w:
-            with self.assertRaisesRegex(ValueError, "torch.bfloat16"):
-                w.append({"obs": torch.ones(2, dtype=torch.bfloat16)})
+        with (
+            client.trajectory_writer(num_keep_alive_refs=1) as w,
+            self.assertRaisesRegex(ValueError, "torch.bfloat16"),
+        ):
+            w.append({"obs": torch.ones(2, dtype=torch.bfloat16)})
 
     def test_cuda_tensor_write_matches_cpu(self):
         if not torch.cuda.is_available():
@@ -175,13 +264,28 @@ class TorchWritePathTest(absltest.TestCase):
         leaf = samples[0].data[0]
         self.assertIsInstance(leaf, np.ndarray)
         self.assertEqual(leaf.dtype, np.dtype("S2"))
-        self.assertEqual(leaf[0], b"ab")
+        self.assertEqual(leaf[0][0], b"ab")
 
     def test_output_format_invalid_raises_at_construction(self):
         with self.assertRaisesRegex(ValueError, "output_format"):
             _make_server(output_format="xml")
         with self.assertRaisesRegex(ValueError, "output_format"):
             reverb.Client("localhost:1", output_format="xml")
+        # in_process=False must also reject (Spec FR2: 构造时即 ValueError)。
+        with self.assertRaisesRegex(ValueError, "output_format"):
+            reverb.Server(
+                tables=[
+                    reverb.Table(
+                        name="t",
+                        sampler=reverb.selectors.Fifo(),
+                        remover=reverb.selectors.Fifo(),
+                        max_size=10,
+                        max_times_sampled=1,
+                        rate_limiter=reverb.rate_limiters.MinSize(1),
+                    )
+                ],
+                output_format="xml",
+            )
 
     def test_create_reference_step_and_infer_signature_accept_torch(self):
         step_spec = {

@@ -278,6 +278,8 @@ class TrajectoryWriter:
         Raises:
           ValueError: If the same column is provided more than once in the same
             step.
+          ValueError: If a torch.Tensor leaf has a dtype with no numpy
+            counterpart (e.g. bfloat16).
         """
         # Accept torch.Tensor leaves (converted zero-copy on CPU; one D2H copy
         # on CUDA). No-op when torch is not installed.

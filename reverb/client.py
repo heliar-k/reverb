@@ -148,7 +148,8 @@ class Writer:
           sequence: Batched (possibly nested) structure to make available for items
             to reference.
         """
-        self._writer.AppendSequence(tree.flatten(sequence))
+        # Accept torch.Tensor leaves (see TrajectoryWriter.append).
+        self._writer.AppendSequence(tree.flatten(torch_support.to_numpy_tree(sequence)))
 
     def create_item(self, table: str, num_timesteps: int, priority: float):
         """Creates an item and sends it to the ReverbService.
@@ -217,6 +218,10 @@ class _BaseClient:
     `_fetch_server_info_proto`, `_new_sampler`, and `_new_trajectory_writer`.
     `structured_writer` needs no hook: all three C++ clients expose an identical
     `NewStructuredWriter(vector<string>)` binding.
+
+    `output_format` selects the leaf type yielded by `sample`: "numpy"
+    (default) returns numpy arrays; "torch" converts each leaf to a zero-copy
+    `torch.Tensor` where possible (unsupported dtypes stay numpy).
     """
 
     _VALID_OUTPUT_FORMATS = ("numpy", "torch")

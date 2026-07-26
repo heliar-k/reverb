@@ -333,6 +333,16 @@ class Server:
         shm_socket_path: Optional[str] = None,
         output_format: str = "numpy",
     ):
+        # 构造期即校验(FR2),无论最终是否创建 in-process client。
+        # ponytail: in_process=False 时 output_format 仅校验、不生效;若未来
+        # Server 需要为 gRPC client 持默认格式再接线。
+        from reverb import client as _client  # pylint: disable=g-import-not-at-top
+
+        if output_format not in _client._BaseClient._VALID_OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of "
+                f"{_client._BaseClient._VALID_OUTPUT_FORMATS}, got {output_format!r}"
+            )
         """Constructor of Server serving the ReverbService.
 
         Args:
