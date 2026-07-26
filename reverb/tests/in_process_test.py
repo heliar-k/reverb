@@ -19,6 +19,7 @@ plain numpy arrays, without TensorFlow. Migrated to absltest from the
 historical bare-assert + __main__ form.
 """
 
+import gc
 import os
 import tempfile
 import threading
@@ -87,6 +88,41 @@ class InProcessWriteSampleTest(absltest.TestCase):
         samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
         self.assertLen(samples, 1)
         np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
+
+    def test_sampled_arrays_are_zero_copy_views(self):
+        server = _make_server()
+        client = server.in_process_client
+
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": np.array([1.0, 2.0], dtype=np.float32)})
+            w.create_item(
+                table="t", priority=1.0, trajectory={"obs": w.history["obs"][:]}
+            )
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        arr = samples[0].data[0]
+        # 零拷贝契约:采样产出的数值数组是字节存储的视图而非新拷贝
+        # (存储由 base 链持有);值语义与拷贝路径一致。
+        self.assertFalse(arr.flags.owndata)
+        np.testing.assert_allclose(arr, [[1.0, 2.0]])
+
+    def test_sampled_arrays_outlive_client_and_sampler(self):
+        server = _make_server()
+        client = server.in_process_client
+
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": np.array([7.0], dtype=np.float32)})
+            w.create_item(
+                table="t", priority=1.0, trajectory={"obs": w.history["obs"][:]}
+            )
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        arr = samples[0].data[0]
+        del samples, client
+        gc.collect()
+        np.testing.assert_allclose(arr, [[7.0]])
 
     def test_in_process_multiple_steps(self):
         server = _make_server(table_name="q")

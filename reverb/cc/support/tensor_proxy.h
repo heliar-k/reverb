@@ -2,6 +2,7 @@
 #define REVERB_CC_SUPPORT_TENSOR_PROXY_H_
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,11 +33,17 @@ struct TensorSpec {
   std::vector<int64_t> shape;
 };
 
-// ponytail: 当前拷贝 bytes(std::string)语义,worker 线程零 GIL。
-// 若 profile 显示写入 memcpy 成瓶颈,改零拷贝裸指针 + DeferredFreeQueue:
-//   - FromNdArray 时 Py_INCREF 持 PyObject*,拿 PyArray_DATA 裸指针
-//   - worker 线程读裸指针,不持 GIL
-//   - 释放时入 DeferredFreeQueue,主线程持 GIL 统一 Py_DECREF
+// 存储模型:owner_ 持字节宿主(shared_ptr,任意线程可析构),bytes_ 是
+// 指向宿主的 view。维度操作(InsertBatchDim 等)共享宿主零拷贝;ToNdArray
+// 产出 view 该宿主的 numpy 数组(capsule 持 owner_ 副本)。
+//
+// 写入侧默认拷贝(append 时刻快照语义,worker 线程零 GIL)。
+// FromNdArray(zero_copy=true) 时视图 numpy 存储:Py_INCREF 持宿主,
+// 任意线程析构将 PyObject* 入 DeferredFreeQueue,主线程在下一次
+// FromNdArray/ToNdArray 入口(持 GIL)统一 DECREF。零拷贝丢失快照语义
+// (append 后原地复用 buffer 会写脏数据),故同时把源数组置 read-only,
+// 让原地改写立刻报错。开启方式:环境变量 REVERB_ZERO_COPY_APPEND=1
+// (type_caster 读取,见 pybind.cc)。
 //
 // ponytail: pybind11 把 pybind11 namespace 标为 visibility("hidden"),
 // 参数含 py::object 的方法 (FromNdArray/ToNdArray) 可见性被降为 hidden,
@@ -47,8 +54,9 @@ class __attribute__((visibility("default"))) TensorBuffer {
   TensorBuffer() = default;
   TensorBuffer(TensorSpec spec, std::string bytes);
 
-  // 主线程调用(持 GIL)
-  static absl::StatusOr<TensorBuffer> FromNdArray(py::object ndarray);
+  // 主线程调用(持 GIL)。zero_copy=true 时数值数组走视图(见类注释)。
+  static absl::StatusOr<TensorBuffer> FromNdArray(py::object ndarray,
+                                                  bool zero_copy = false);
   py::object ToNdArray() const;
 
   // worker 线程安全(零 GIL),只读
@@ -75,8 +83,13 @@ class __attribute__((visibility("default"))) TensorBuffer {
       const ::reverb::tensor::TensorProto& proto);
 
  private:
+  // 共享存储构造:维度操作与 view 派生共享同一字节宿主。
+  TensorBuffer(TensorSpec spec, std::shared_ptr<void> owner,
+               absl::string_view bytes);
+
   TensorSpec spec_;
-  std::string bytes_;  // ponytail: 升级路径见类顶部注释
+  std::shared_ptr<void> owner_;  // 字节宿主;空 = 无字节(默认构造)
+  absl::string_view bytes_;      // 指向 owner_ 内容,worker 零 GIL 可读
 };
 
 // DataType 与 proto 枚举、numpy 类型号互转

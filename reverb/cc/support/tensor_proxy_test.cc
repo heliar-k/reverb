@@ -81,6 +81,94 @@ TEST(TensorBuffer, RoundTripFloat32) {
   EXPECT_EQ(ReadScalar<float>(out, 2), 3.0f);
 }
 
+TEST(TensorBuffer, ToNdArraySharesStorage) {
+  // 零拷贝契约:数值数组的 ToNdArray 直接视图 TensorBuffer 的字节存储,
+  // 不做 memcpy;数组必须自带存储所有权(base 非空)以存活于源对象之后。
+  py::object arr = MakeArray({1.0f, 2.0f, 3.0f}, "float32");
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  py::object out = buf.ToNdArray();
+  PyArrayObject* out_arr = reinterpret_cast<PyArrayObject*>(out.ptr());
+  EXPECT_EQ(PyArray_DATA(out_arr), buf.bytes().data());
+  EXPECT_NE(PyArray_BASE(out_arr), nullptr);
+}
+
+TEST(TensorBuffer, ToNdArrayOutlivesSource) {
+  py::object out;
+  {
+    py::object arr = MakeArray({4.0f, 5.0f}, "float32");
+    auto buf = TensorBuffer::FromNdArray(arr).value();
+    out = buf.ToNdArray();
+  }  // buf 在此析构;out 必须仍持有有效字节。
+  EXPECT_EQ(ReadScalar<float>(out, 0), 4.0f);
+  EXPECT_EQ(ReadScalar<float>(out, 1), 5.0f);
+}
+
+TEST(TensorBuffer, FromNdArrayZeroCopySharesBuffer) {
+  // 零拷贝契约(opt-in):buffer 直接视图 numpy 存储,不做 memcpy;
+  // 源数组被置 read-only——append 后原地改写立刻报错而非静默写脏。
+  py::object arr = MakeArray({1.0f, 2.0f, 3.0f}, "float32");
+  auto buf = TensorBuffer::FromNdArray(arr, /*zero_copy=*/true).value();
+  PyArrayObject* a = reinterpret_cast<PyArrayObject*>(arr.ptr());
+  EXPECT_EQ(buf.bytes().data(), PyArray_DATA(a));
+  EXPECT_EQ(PyArray_FLAGS(a) & NPY_ARRAY_WRITEABLE, 0);
+  EXPECT_EQ(buf.TotalBytes(), 12);
+}
+
+TEST(TensorBuffer, DefaultCopySemanticsSnapshot) {
+  // 默认路径保持 append 时刻快照:改写源数组不影响已取字节。
+  py::object arr = MakeArray({1.0f}, "float32");
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  PyArrayObject* a = reinterpret_cast<PyArrayObject*>(arr.ptr());
+  ASSERT_NE(PyArray_FLAGS(a) & NPY_ARRAY_WRITEABLE, 0);
+  static_cast<float*>(PyArray_DATA(a))[0] = 9.0f;
+  EXPECT_EQ(reinterpret_cast<const float*>(buf.bytes().data())[0], 1.0f);
+}
+
+TEST(TensorBuffer, ZeroCopyHoldsArrayAlive) {
+  TensorBuffer buf;
+  {
+    py::object arr = MakeArray({3.0f}, "float32");
+    buf = TensorBuffer::FromNdArray(arr, /*zero_copy=*/true).value();
+  }  // py::object 释放;buffer 必须自持引用保活底层存储。
+  EXPECT_EQ(reinterpret_cast<const float*>(buf.bytes().data())[0], 3.0f);
+}
+
+TEST(TensorBuffer, ZeroCopyDestroyWithoutGILDefersFree) {
+  py::object arr = MakeArray({1.0f}, "float32");
+  PyObject* raw = arr.ptr();
+  Py_ssize_t before = Py_REFCNT(raw);
+  {
+    auto buf = TensorBuffer::FromNdArray(arr, /*zero_copy=*/true).value();
+    EXPECT_EQ(Py_REFCNT(raw), before + 1);
+    // 模拟 worker 线程析构:无 GIL → 引用入 DeferredFreeQueue 而非就地
+    // Py_DECREF。
+    py::gil_scoped_release release;
+    auto gone = std::move(buf);
+  }
+  // 尚未 drain:引用仍挂起。
+  EXPECT_EQ(Py_REFCNT(raw), before + 1);
+  // 主线程在 FromNdArray 入口顺带 drain。
+  auto dummy = TensorBuffer::FromNdArray(MakeArray({0.0f}, "float32")).value();
+  EXPECT_EQ(Py_REFCNT(raw), before);
+}
+
+TEST(TensorBuffer, FinishMimicSharedStorage) {
+  // 复刻 Writer::Finish 的对象图:InsertBatchDim 共享 owner 后,
+  // 按 Finish 的析构顺序销毁(concat 产物独立于源存活)。
+  py::object arr = MakeArray({1.0, 2.0}, "float64");
+  auto buf = TensorBuffer::FromNdArray(arr).value();
+  std::vector<TensorBuffer> buffer_col;
+  buffer_col.push_back(std::move(buf));
+  std::vector<TensorBuffer> tensors;
+  tensors.push_back(buffer_col[0].InsertBatchDim());
+  auto concat = TensorBuffer::Concat(tensors).value();
+  tensors.clear();
+  buffer_col.clear();
+  EXPECT_EQ(concat.TotalBytes(), 16);
+  py::object out = concat.ToNdArray();
+  EXPECT_EQ(ReadScalar<double>(out, 1), 2.0);
+}
+
 TEST(TensorBuffer, RoundTripInt64) {
   py::object arr = MakeArrayInt({10, 20, 30}, "int64");
   auto buf = TensorBuffer::FromNdArray(arr).value();

@@ -280,6 +280,13 @@ class TrajectoryWriter:
             step.
           ValueError: If a torch.Tensor leaf has a dtype with no numpy
             counterpart (e.g. bfloat16).
+
+        Note:
+          With `REVERB_ZERO_COPY_APPEND=1` set, appended numeric arrays are
+          viewed rather than copied, and each source array is marked read-only
+          at append time: the bytes are read lazily at serialization, so an
+          in-place rewrite raises instead of silently corrupting replay data.
+          If your loop reuses a buffer across appends, do NOT enable this.
         """
         # Accept torch.Tensor leaves (converted zero-copy on CPU; one D2H copy
         # on CUDA). No-op when torch is not installed.

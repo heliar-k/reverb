@@ -215,6 +215,16 @@ reverb_py_test(
     ],
 )
 
+# 写入路径零拷贝契约:env 开启后 append 视图 numpy 存储并置源 read-only。
+reverb_py_test(
+    name = "zero_copy_write_test",
+    srcs = ["zero_copy_write_test.py"],
+    env = {"REVERB_ZERO_COPY_APPEND": "1"},
+    deps = [
+        "//reverb",
+    ],
+)
+
 reverb_py_test(
     name = "grpc_roundtrip_test",
     srcs = ["grpc_roundtrip_test.py"],

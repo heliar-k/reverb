@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -190,8 +191,14 @@ struct type_caster<::deepmind::reverb::TensorBuffer> {
                        _("reverb.TensorBuffer"));
 
   bool load(handle src, bool) {
+    // 零拷贝写入 opt-in:首次 Append 时读一次环境变量(见 tensor_proxy.h
+    // 类注释的快照语义取舍);测试经 bazel env 属性控制。
+    static const bool kZeroCopyAppend = [] {
+      const char* v = std::getenv("REVERB_ZERO_COPY_APPEND");
+      return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
     auto buf = ::deepmind::reverb::TensorBuffer::FromNdArray(
-        pybind11::reinterpret_borrow<pybind11::object>(src));
+        pybind11::reinterpret_borrow<pybind11::object>(src), kZeroCopyAppend);
     if (!buf.ok()) {
       REVERB_LOG(REVERB_ERROR)
           << "TensorBuffer can't be extracted from the source ndarray: "

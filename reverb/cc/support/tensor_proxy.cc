@@ -1,6 +1,8 @@
 #include "reverb/cc/support/tensor_proxy.h"
 
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -110,10 +112,40 @@ std::string DecodeString(absl::string_view src, size_t* pos) {
   return s;
 }
 
+// 零拷贝视图持有的 PyObject* 不能在任意线程就地 Py_DECREF(需 GIL),
+// 统一入队,由主线程在 FromNdArray/ToNdArray 入口(必持 GIL,见头注释)
+// 顺带 drain。
+// ponytail: 无独立 drain 线程/atexit 钩子;进程退出时队列残留随进程回收。
+std::mutex g_deferred_free_mu;
+std::vector<PyObject*> g_deferred_free;
+
+void DeferredFree(PyObject* obj) {
+  std::lock_guard<std::mutex> l(g_deferred_free_mu);
+  g_deferred_free.push_back(obj);
+}
+
+void DrainDeferredFree() {
+  std::vector<PyObject*> batch;
+  {
+    std::lock_guard<std::mutex> l(g_deferred_free_mu);
+    if (g_deferred_free.empty()) return;
+    batch.swap(g_deferred_free);
+  }
+  for (PyObject* o : batch) Py_DECREF(o);
+}
+
 }  // namespace
 
 TensorBuffer::TensorBuffer(TensorSpec spec, std::string bytes)
-    : spec_(std::move(spec)), bytes_(std::move(bytes)) {}
+    : spec_(std::move(spec)) {
+  auto s = std::make_shared<std::string>(std::move(bytes));
+  bytes_ = absl::string_view(*s);
+  owner_ = std::move(s);
+}
+
+TensorBuffer::TensorBuffer(TensorSpec spec, std::shared_ptr<void> owner,
+                           absl::string_view bytes)
+    : spec_(std::move(spec)), owner_(std::move(owner)), bytes_(bytes) {}
 
 const char* DataTypeName(DataType dt) {
   for (const auto& m : kMappings) {
@@ -153,8 +185,10 @@ int64_t TensorBuffer::TotalBytes() const {
   return NumElements() * DataTypeItemsize(spec_.dtype);
 }
 
-absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray) {
+absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray,
+                                                       bool zero_copy) {
   ImportNumpyOnce();
+  DrainDeferredFree();
   // 保留输入维度:np.asarray 不提升 Python 标量(0-d 保持 0-d),
   // 而 np.ascontiguousarray 会把标量提升为 [1]——那是标量列 shape
   // 退化为 [N,1] 的根因。仅在非 0-d 且非 C-contiguous 时转连续。
@@ -221,6 +255,20 @@ absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray) {
       EncodeString(&bytes, s);
     } while (next(it));
     NpyIter_Deallocate(it);
+  } else if (zero_copy) {
+    // 视图 numpy 存储:holder 的引用转由 TensorBuffer 持有,任意线程析构时
+    // PyObject* 入 DeferredFreeQueue(见上)。read-only guard:append 后原地
+    // 改写立刻报错而非静默写脏(零拷贝丢失快照语义,见头文件类注释)。
+    PyArray_CLEARFLAGS(contig, NPY_ARRAY_WRITEABLE);
+    PyObject* raw = holder.ptr();
+    Py_INCREF(raw);
+    std::shared_ptr<void> owner(static_cast<void*>(raw), [](void* p) {
+      DeferredFree(static_cast<PyObject*>(p));
+    });
+    size_t nbytes = static_cast<size_t>(PyArray_NBYTES(contig));
+    absl::string_view view(static_cast<const char*>(PyArray_DATA(contig)),
+                           nbytes);
+    return TensorBuffer(std::move(spec), std::move(owner), view);
   } else {
     size_t nbytes = static_cast<size_t>(PyArray_NBYTES(contig));
     bytes.resize(nbytes);
@@ -232,6 +280,7 @@ absl::StatusOr<TensorBuffer> TensorBuffer::FromNdArray(py::object ndarray) {
 
 py::object TensorBuffer::ToNdArray() const {
   ImportNumpyOnce();
+  DrainDeferredFree();
   int npy_type = DataTypeToNpy(spec_.dtype);
 
   if (spec_.dtype == DataType::String) {
@@ -255,22 +304,43 @@ py::object TensorBuffer::ToNdArray() const {
   }
 
   std::vector<npy_intp> dims(spec_.shape.begin(), spec_.shape.end());
-  // ponytail: PyArray_SimpleNew 创建 C-contiguous 数组(strides 由 numpy 按
-  // C-order 计算)。原先用 PyArray_New + NPY_ARRAY_C_CONTIGUOUS 在 ndim>=2 时
-  // 误产 F-order strides(4,8,16),导致 2D+ 列采样数据交错。
-  PyArrayObject* out = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(
-      static_cast<int>(dims.size()),
-      dims.empty() ? nullptr : dims.data(), npy_type));
-  if (!out) {
-    PyErr_Clear();
-    // 回退:返回 None(不应发生在数值类型)。
-    return py::none();
-  }
   size_t nbytes = static_cast<size_t>(NumElements()) *
                   DataTypeItemsize(spec_.dtype);
-  if (nbytes > 0) {
-    std::memcpy(PyArray_DATA(out), bytes_.data(), nbytes);
+  if (nbytes == 0) {
+    // 空数组无字节可视图,走分配路径(data 不会被读)。
+    PyArrayObject* out = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(
+        static_cast<int>(dims.size()),
+        dims.empty() ? nullptr : dims.data(), npy_type));
+    if (!out) {
+      PyErr_Clear();
+      return py::none();
+    }
+    return py::reinterpret_steal<py::object>(reinterpret_cast<PyObject*>(out));
   }
+  // 零拷贝:视图 TensorBuffer 的字节存储,capsule 持 owner_ 副本使数组
+  // 独立于源对象存活。const_cast:数组可写,与旧 SimpleNew 路径行为一致。
+  // ponytail: SimpleNewFromData 与 SimpleNew 同语义,strides 按 C-order
+  // 计算;勿换成 PyArray_New + C_CONTIGUOUS(ndim>=2 误产 F-order strides)。
+  PyArrayObject* out = reinterpret_cast<PyArrayObject*>(
+      PyArray_SimpleNewFromData(static_cast<int>(dims.size()),
+                                dims.empty() ? nullptr : dims.data(),
+                                npy_type,
+                                const_cast<char*>(bytes_.data())));
+  if (!out) {
+    PyErr_Clear();
+    return py::none();
+  }
+  auto* holder = new std::shared_ptr<void>(owner_);
+  py::capsule cap(holder, [](void* p) {
+    delete static_cast<std::shared_ptr<void>*>(p);
+  });
+  if (PyArray_SetBaseObject(out, cap.ptr()) < 0) {
+    PyErr_Clear();
+    delete holder;
+    Py_DECREF(out);
+    return py::none();
+  }
+  cap.release();  // SetBaseObject 已窃取引用
   return py::reinterpret_steal<py::object>(reinterpret_cast<PyObject*>(out));
 }
 
@@ -282,13 +352,13 @@ TensorBuffer TensorBuffer::InsertBatchDim() const {
   if (!spec.shape.empty()) {
     spec.shape.insert(spec.shape.begin(), 1);
   }
-  return TensorBuffer(std::move(spec), bytes_);
+  return TensorBuffer(std::move(spec), owner_, bytes_);
 }
 
 TensorBuffer TensorBuffer::RemoveBatchDim() const {
   TensorSpec spec = spec_;
   if (!spec.shape.empty()) spec.shape.erase(spec.shape.begin());
-  return TensorBuffer(std::move(spec), bytes_);
+  return TensorBuffer(std::move(spec), owner_, bytes_);
 }
 
 TensorBuffer TensorBuffer::CopyReshaped(
@@ -297,7 +367,7 @@ TensorBuffer TensorBuffer::CopyReshaped(
   spec.shape = shape;
   // ponytail: NumElements 一致性由调用方保证;此处不校验以省一次乘法,
   // 若需防御可在上层加。
-  return TensorBuffer(std::move(spec), bytes_);
+  return TensorBuffer(std::move(spec), owner_, bytes_);
 }
 
 absl::StatusOr<TensorBuffer> TensorBuffer::Concat(
@@ -366,7 +436,8 @@ absl::StatusOr<TensorBuffer> TensorBuffer::Concat(
 
 TensorBuffer TensorBuffer::SubSlice(int64_t offset) const {
   if (spec_.shape.empty()) {
-    return TensorBuffer(spec_, bytes_);  // ponytail: 0-d 无 batch 维,原样返回
+    // ponytail: 0-d 无 batch 维,原样返回(共享存储)。
+    return TensorBuffer(spec_, owner_, bytes_);
   }
   if (offset < 0 || offset >= spec_.shape[0]) {
     // ponytail: 越界返回空 buffer,调用方应自行校验。生产路径可改 StatusOr。
@@ -378,8 +449,8 @@ TensorBuffer TensorBuffer::SubSlice(int64_t offset) const {
   TensorSpec spec = spec_;
   spec.shape.erase(spec.shape.begin());
 
-  std::string bytes;
   if (spec_.dtype == DataType::String) {
+    std::string bytes;
     // 跳过 offset 个元素,取 1 个元素编码。
     int64_t skip = offset;
     size_t pos = 0;
@@ -392,11 +463,13 @@ TensorBuffer TensorBuffer::SubSlice(int64_t offset) const {
       std::string s = DecodeString(bytes_, &pos);
       EncodeString(&bytes, s);
     }
+    return TensorBuffer(std::move(spec), std::move(bytes));
   } else {
+    // 视图共享宿主:去 batch 维只是偏移+shape 变化,无需物化拷贝。
     size_t start = static_cast<size_t>(offset * row_size);
-    bytes.assign(bytes_.data() + start, static_cast<size_t>(row_size));
+    return TensorBuffer(std::move(spec), owner_,
+                        bytes_.substr(start, static_cast<size_t>(row_size)));
   }
-  return TensorBuffer(std::move(spec), std::move(bytes));
 }
 
 absl::Status TensorBuffer::SerializeToProto(
