@@ -222,7 +222,7 @@ TEST(TensorCompressionTest, NonStringTensorWithDeltaRoundTrip) {
   ExpectTensorBufferEq<int32_t>(tensor, DeltaEncode(result, false));
 }
 
-TEST(TensorCompressionTest, IncompressibleSkipsCompression) {
+TEST(TensorCompressionTest, HighEntropyPayloadSkipsSnappy) {
   // 高熵 payload(随机 bytes,模拟 float 观测值):探测判定不可压 →
   // tensor_content 存原始字节 + uncompressed 标志,跳过 snappy。
   std::mt19937 rng(42);
@@ -240,8 +240,8 @@ TEST(TensorCompressionTest, IncompressibleSkipsCompression) {
   EXPECT_EQ(r->bytes(), raw);
 }
 
-TEST(TensorCompressionTest, CompressibleStillCompresses) {
-  // 可压 payload(常量值,模拟稀疏/图像观测):维持 snappy 全量压缩,
+TEST(TensorCompressionTest, LowEntropyPayloadStillCompresses) {
+  // 低熵 payload(常量值,模拟稀疏/图像观测):维持 snappy 全量压缩,
   // 标志位 false,wire 体积显著缩小,roundtrip 不变。
   std::string raw(32 * 1024, '\x2A');
   TensorBuffer tensor(TensorSpec{DataType::Float32, {8192}}, raw);
