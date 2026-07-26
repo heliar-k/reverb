@@ -966,9 +966,9 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     }
 
     // Assemble the unique referenced chunks, deduplicating by chunk key
-    // (mirrors RunLocalWorker). Serialize each ChunkData proto and ALLOCATE a
-    // pool offset for its bytes (C4: client asks the server, the sole
-    // allocator).
+    // (mirrors RunLocalWorker). Size each ChunkData proto, ALLOCATE a pool
+    // offset for its bytes, and serialize straight into the granted region
+    // (C4: client asks the server, the sole allocator).
     //
     // ponytail: ShmChunkRef.specs/sequence_range/delta_encoded are redundant —
     // ChunkData is self-describing and the server deserializes it whole. We
@@ -988,36 +988,34 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     std::vector<uint64_t> chunk_offsets;  // for RELEASE after ACK (C2)
     internal::flat_hash_set<uint64_t> sent_keys;
     bool alloc_failed = false;
+    // 统一失败收尾:标记 alloc_failed(循环后统一 RELEASE 已分配 offset)、
+    // 置流错误并唤醒等待者。调用后须立即 break。
+    auto fail_alloc = [&](absl::Status s) {
+      alloc_failed = true;
+      absl::MutexLock l(&mu_);
+      stream_ok_ = false;
+      stream_status_ = std::move(s);
+      unrecoverable_status_ = stream_status_;
+      data_cv_.Signal();
+    };
     for (const std::shared_ptr<CellRef>& ref : item_and_refs->refs) {
       uint64_t ck = ref->chunk_key();
       if (!sent_keys.insert(ck).second) continue;
 
       auto chunk_container = ref->GetChunk();
       const ChunkData* cd = chunk_container->get();
-      std::string bytes;
-      if (!cd->SerializeToString(&bytes)) {
-        absl::MutexLock l(&mu_);
-        stream_ok_ = false;
-        stream_status_ = absl::InternalError(absl::StrCat(
-            "RunShmWorker: failed to serialize ChunkData ", ck));
-        unrecoverable_status_ = stream_status_;
-        data_cv_.Signal();
-        return stream_status_;
-      }
+      // ponytail: 先算尺寸,ALLOCATE 后 SerializeToArray 直写 pool,省掉
+      // SerializeToString 中间 string + 一次 memcpy。
+      const size_t num_bytes = cd->ByteSizeLong();
       // C4: ask the server for a pool offset of the right size.
       ShmAllocateRequest areq;
-      areq.set_num_bytes(bytes.size());
+      areq.set_num_bytes(num_bytes);
       std::string areq_body;
       areq.SerializeToString(&areq_body);
       absl::Status ws = shm_conn_->insert_c2s.Write(ALLOCATE,
                                              absl::MakeSpan(areq_body));
       if (!ws.ok()) {
-        alloc_failed = true;
-        absl::MutexLock l(&mu_);
-        stream_ok_ = false;
-        stream_status_ = ws;
-        unrecoverable_status_ = ws;
-        data_cv_.Signal();
+        fail_alloc(ws);
         break;
       }
       MsgType atype;
@@ -1025,54 +1023,34 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       absl::Status rs = read_blocking(&shm_conn_->insert_s2c, &atype, &aresp_body,
                                        shm_conn_->control_fd, kInsertAckTimeout);
       if (!rs.ok()) {
-        alloc_failed = true;
-        absl::MutexLock l(&mu_);
-        stream_ok_ = false;
-        stream_status_ = rs;
-        unrecoverable_status_ = rs;
-        data_cv_.Signal();
+        fail_alloc(rs);
         break;
       }
       if (atype == ERROR) {
         // The server rejected the allocation (e.g. pool exhausted). Surface
         // the ShmError's real status instead of a generic type mismatch.
-        alloc_failed = true;
         ShmError err;
-        absl::MutexLock l(&mu_);
         if (err.ParseFromString(aresp_body) &&
             err.code() == ShmError::RESOURCE_EXHAUSTED) {
-          stream_status_ = absl::ResourceExhaustedError(err.message());
+          fail_alloc(absl::ResourceExhaustedError(err.message()));
         } else if (err.ParseFromString(aresp_body) &&
                    err.code() == ShmError::INVALID_ARGUMENT) {
-          stream_status_ = absl::InvalidArgumentError(err.message());
+          fail_alloc(absl::InvalidArgumentError(err.message()));
         } else {
-          stream_status_ = absl::InternalError(absl::StrCat(
-              "RunShmWorker: ALLOCATE rejected: ", aresp_body));
+          fail_alloc(absl::InternalError(absl::StrCat(
+              "RunShmWorker: ALLOCATE rejected: ", aresp_body)));
         }
-        stream_ok_ = false;
-        unrecoverable_status_ = stream_status_;
-        data_cv_.Signal();
         break;
       }
       if (atype != ALLOCATE_RESP) {
-        alloc_failed = true;
-        absl::MutexLock l(&mu_);
-        stream_status_ = absl::InternalError(absl::StrCat(
-            "RunShmWorker: expected ALLOCATE_RESP, got ", atype));
-        stream_ok_ = false;
-        unrecoverable_status_ = stream_status_;
-        data_cv_.Signal();
+        fail_alloc(absl::InternalError(absl::StrCat(
+            "RunShmWorker: expected ALLOCATE_RESP, got ", atype)));
         break;
       }
       ShmAllocateResponse aresp;
       if (!aresp.ParseFromString(aresp_body)) {
-        alloc_failed = true;
-        absl::MutexLock l(&mu_);
-        stream_status_ =
-            absl::InternalError("RunShmWorker: malformed ShmAllocateResponse");
-        stream_ok_ = false;
-        unrecoverable_status_ = stream_status_;
-        data_cv_.Signal();
+        fail_alloc(
+            absl::InternalError("RunShmWorker: malformed ShmAllocateResponse"));
         break;
       }
       uint64_t offset = aresp.shm_offset();
@@ -1080,26 +1058,30 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       // pointer arithmetic, so a buggy/corrupt ALLOCATE_RESP would otherwise
       // make us write outside our OWN RW mapping and corrupt this process.
       if (offset > shm_conn_->pool.size() ||
-          bytes.size() > shm_conn_->pool.size() - offset) {
-        alloc_failed = true;
-        absl::MutexLock l(&mu_);
-        stream_status_ = absl::InternalError(absl::StrCat(
+          num_bytes > shm_conn_->pool.size() - offset) {
+        fail_alloc(absl::InternalError(absl::StrCat(
             "RunShmWorker: ALLOCATE_RESP granted offset ", offset, " (len ",
-            bytes.size(), ") outside mapped pool of ",
-            shm_conn_->pool.size(), " bytes"));
-        stream_ok_ = false;
-        unrecoverable_status_ = stream_status_;
-        data_cv_.Signal();
+            num_bytes, ") outside mapped pool of ",
+            shm_conn_->pool.size(), " bytes")));
         break;
       }
-      // C4: client memcpy's the serialized bytes into the granted region
-      // (RW mmap). The region must stay valid until INSERT_ACK (C2).
-      std::memcpy(shm_conn_->pool.At(offset), bytes.data(), bytes.size());
+      // C4: client serializes straight into the granted region (RW mmap).
+      // The region must stay valid until INSERT_ACK (C2). ByteSizeLong and
+      // SerializeToArray walk the proto twice but share no intermediate
+      // buffer; failure (same source for the size, so only if the proto is
+      // malformed) takes the unified alloc_failed release path.
+      if (!cd->SerializeToArray(shm_conn_->pool.At(offset),
+                                static_cast<int>(num_bytes))) {
+        chunk_offsets.push_back(offset);
+        fail_alloc(absl::InternalError(absl::StrCat(
+            "RunShmWorker: failed to serialize ChunkData ", ck)));
+        break;
+      }
 
       ShmChunkRef* cref = req.add_chunks();
       cref->set_chunk_key(ck);
       cref->set_shm_offset(offset);
-      cref->set_total_length(bytes.size());
+      cref->set_total_length(num_bytes);
       chunk_offsets.push_back(offset);
     }
     if (alloc_failed) {
