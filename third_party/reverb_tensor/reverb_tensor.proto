@@ -30,6 +30,9 @@ message TensorProto {
   TensorShapeProto shape = 2;
   bytes tensor_content = 3;
   repeated bytes string_val = 4;
+  // true 时 tensor_content 为原始未压缩字节(写入侧探测判定不可压,
+  // 跳过 snappy);缺省 false = snappy 压缩态,旧数据行为不变。
+  bool uncompressed = 5;
 }
 
 // 精简版 StructuredValue,只含 Reverb 用到的 6 种节点

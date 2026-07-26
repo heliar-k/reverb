@@ -335,3 +335,16 @@ cc_test(
         "@com_google_protobuf//:protobuf",
     ],
 )
+
+# --- Tier 3 协议层拷贝成本微基准(诊断工具) ---
+cc_binary(
+    name = "tier3_bench",
+    srcs = ["tier3_bench.cc"],
+    copts = ["-Wno-sign-compare"],
+    deps = [
+        ":tensor_proxy",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:tensor_compression",
+        "@rules_python//python/cc:current_py_cc_libs",
+    ],
+)

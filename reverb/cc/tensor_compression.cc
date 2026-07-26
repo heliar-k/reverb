@@ -97,6 +97,35 @@ std::vector<TensorBuffer> DeltaEncodeList(
   return outputs;
 }
 
+namespace {
+
+// 自适应压缩探测阈值:payload ≥ 16KB 才探测(小于此压缩 CPU 可忽略,
+// 保持原有小 tensor 行为);采样首/中/尾 3×4KB 估算压缩率。
+constexpr size_t kProbeMinBytes = 16 * 1024;
+constexpr size_t kProbeChunk = 4096;
+// 样本压缩率 ≥ 0.9(即估计节省 <10%)判定不可压:float 观测值普遍高熵,
+// snappy 扫全量(~0.8GB/s)换 ~0 字节,纯浪费 CPU(profile 见
+// reverb/cc/support/tier3_bench.cc)。
+constexpr double kIncompressibleRatio = 0.9;
+
+// 采样估算 compressibility:true = 值得全量压缩。
+bool WorthCompressing(absl::string_view data) {
+  if (data.size() < kProbeMinBytes) return true;
+  const size_t offsets[3] = {0, (data.size() - kProbeChunk) / 2,
+                             data.size() - kProbeChunk};
+  size_t raw = 0, zipped = 0;
+  for (size_t off : offsets) {
+    std::string sample_compressed;
+    SnappyCompressFromString(data.substr(off, kProbeChunk),
+                             &sample_compressed);
+    raw += kProbeChunk;
+    zipped += sample_compressed.size();
+  }
+  return zipped < raw * kIncompressibleRatio;
+}
+
+}  // namespace
+
 absl::Status CompressTensorAsProto(
     const TensorBuffer& tensor, ::reverb::tensor::TensorProto* proto) {
   // SerializeToProto fills dtype/shape and either tensor_content (numeric) or
@@ -105,6 +134,11 @@ absl::Status CompressTensorAsProto(
   REVERB_RETURN_IF_ERROR(tensor.SerializeToProto(proto));
 
   if (tensor.dtype() != DataType::String) {
+    if (!WorthCompressing(proto->tensor_content())) {
+      // 不可压:tensor_content 已是原始字节,只置标志位,零额外拷贝。
+      proto->set_uncompressed(true);
+      return absl::OkStatus();
+    }
     std::string compressed;
     SnappyCompressFromString(proto->tensor_content(), &compressed);
     proto->set_tensor_content(std::move(compressed));
@@ -116,6 +150,12 @@ absl::StatusOr<TensorBuffer> DecompressTensorFromProto(
     const ::reverb::tensor::TensorProto& proto) {
   // String tensors: no compression was applied, deserialize directly.
   if (proto.dtype() == ::reverb::tensor::DT_STRING) {
+    return TensorBuffer::DeserializeFromProto(proto);
+  }
+
+  // 写入侧探测判定不可压:tensor_content 即原始字节,直接反序列化,
+  // 跳过 inflated proto 拷贝 + snappy 解压。
+  if (proto.uncompressed()) {
     return TensorBuffer::DeserializeFromProto(proto);
   }
 

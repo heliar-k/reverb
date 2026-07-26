@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -219,6 +220,40 @@ TEST(TensorCompressionTest, NonStringTensorWithDeltaRoundTrip) {
   REVERB_ASSERT_OK(r);
   TensorBuffer result = std::move(r).value();
   ExpectTensorBufferEq<int32_t>(tensor, DeltaEncode(result, false));
+}
+
+TEST(TensorCompressionTest, IncompressibleSkipsCompression) {
+  // 高熵 payload(随机 bytes,模拟 float 观测值):探测判定不可压 →
+  // tensor_content 存原始字节 + uncompressed 标志,跳过 snappy。
+  std::mt19937 rng(42);
+  std::string raw(32 * 1024, '\0');
+  for (auto& c : raw) c = static_cast<char>(rng());
+  TensorBuffer tensor(TensorSpec{DataType::Float32, {8192}}, raw);
+
+  ::reverb::tensor::TensorProto proto;
+  REVERB_ASSERT_OK(CompressTensorAsProto(tensor, &proto));
+  EXPECT_TRUE(proto.uncompressed());
+  EXPECT_EQ(proto.tensor_content().size(), raw.size());
+
+  absl::StatusOr<TensorBuffer> r = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r);
+  EXPECT_EQ(r->bytes(), raw);
+}
+
+TEST(TensorCompressionTest, CompressibleStillCompresses) {
+  // 可压 payload(常量值,模拟稀疏/图像观测):维持 snappy 全量压缩,
+  // 标志位 false,wire 体积显著缩小,roundtrip 不变。
+  std::string raw(32 * 1024, '\x2A');
+  TensorBuffer tensor(TensorSpec{DataType::Float32, {8192}}, raw);
+
+  ::reverb::tensor::TensorProto proto;
+  REVERB_ASSERT_OK(CompressTensorAsProto(tensor, &proto));
+  EXPECT_FALSE(proto.uncompressed());
+  EXPECT_LT(proto.tensor_content().size(), 32 * 1024 / 2);
+
+  absl::StatusOr<TensorBuffer> r = DecompressTensorFromProto(proto);
+  REVERB_ASSERT_OK(r);
+  EXPECT_EQ(r->bytes(), raw);
 }
 
 }  // namespace
