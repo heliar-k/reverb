@@ -620,6 +620,7 @@ cc_test(
     srcs = ["chunker_test.cc"],
     copts = ["-Wno-sign-compare"],
     # ponytail: :chunker -> :tensor_proxy(pybind11/numpy C-API),
+    # 链接期需 libpython 提供 Py_* 符号(同 tensor_proxy_test_bin 先例)。
     deps = [
         ":chunker",
         ":schema_cc_proto",
@@ -635,6 +636,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@com_google_protobuf//:protobuf",
+        "@rules_python//python/cc:current_py_cc_libs",
     ],
 )
 
