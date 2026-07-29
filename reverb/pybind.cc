@@ -34,7 +34,7 @@
 #include "reverb/cc/client.h"
 #include "reverb/cc/in_process_client.h"
 #include "reverb/cc/patterns.pb.h"
-#include "reverb/cc/platform/checkpointing.h"
+#include "reverb/cc/platform/default/simple_checkpointer.h"
 #include "reverb/cc/platform/checkpointing_utils.h"
 #include "reverb/cc/platform/logging.h"
 #include "reverb/cc/platform/server.h"
@@ -583,8 +583,11 @@ PYBIND11_MODULE(libpybind, m) {
       "create_default_checkpointer",
       [](const std::string& name, const std::string& group,
          std::optional<std::string> fallback_checkpoint_path) {
-        auto checkpointer = CreateDefaultCheckpointer(
-            name, group, std::move(fallback_checkpoint_path));
+        // ponytail: group 历史无效(TFRecordCheckpointer.Save 对非空 group 报错),
+        // SimpleCheckpointer 无 group 概念,忽略以保持构造期行为一致。
+        (void)group;
+        auto checkpointer = std::make_unique<SimpleCheckpointer>(
+            name, std::move(fallback_checkpoint_path));
         return std::shared_ptr<Checkpointer>(checkpointer.release());
       },
       py::call_guard<py::gil_scoped_release>());

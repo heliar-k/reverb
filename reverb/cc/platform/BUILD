@@ -15,28 +15,6 @@ package(
 licenses(["notice"])
 
 reverb_cc_library(
-    name = "checkpointing_hdr",
-    hdrs = ["checkpointing.h"],
-    deps = [
-        "//reverb/cc/checkpointing:interface",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/types:optional",
-    ],
-)
-
-reverb_cc_library(
-    name = "checkpointing",
-    hdrs = ["checkpointing.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = [
-        "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/platform/default:checkpointer",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/types:optional",
-    ],
-)
-
-reverb_cc_library(
     name = "checkpointing_utils_hdr",
     hdrs = ["checkpointing_utils.h"],
     visibility = ["//reverb:__subpackages__"],

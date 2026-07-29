@@ -35,7 +35,7 @@
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "reverb/cc/checkpointing/interface.h"
-#include "reverb/cc/platform/checkpointing.h"
+#include "reverb/cc/platform/default/simple_checkpointer.h"
 #include "reverb/cc/platform/status_macros.h"
 #include "reverb/cc/platform/status_matchers.h"
 #include "reverb/cc/platform/thread.h"
@@ -598,7 +598,7 @@ TEST(ReverbServiceImplTest, CheckpointAndLoadFromCheckpoint) {
   char* dir = mkdtemp(tmpl.data());
   REVERB_CHECK(dir != nullptr) << "mkdtemp failed for " << tmpl;
   std::string path = dir;
-  auto service = MakeService(10, CreateDefaultCheckpointer(path));
+  auto service = MakeService(10, std::make_unique<SimpleCheckpointer>(path));
   std::unique_ptr<grpc::Server> server(
       grpc::ServerBuilder().RegisterService(service.get()).BuildAndStart());
   /* grpc_gen:: */ReverbService::Stub stub(
@@ -638,7 +638,7 @@ TEST(ReverbServiceImplTest, CheckpointAndLoadFromCheckpoint) {
         std::make_shared<RateLimiter>(1.0, 1, -1, 1))
   };
   auto loaded_service =
-      MakeService(10, CreateDefaultCheckpointer(path), tables);
+      MakeService(10, std::make_unique<SimpleCheckpointer>(path), tables);
   EXPECT_EQ(loaded_service->tables()["dist"]->size(), 1);
 
   // Loading the checkpoint should edit the existing Table instances.

@@ -23,18 +23,6 @@ reverb_cc_library(
     alwayslink = 1,
 )
 
-reverb_cc_library(
-    name = "checkpointer",
-    srcs = ["default_checkpointer.cc"],
-    deps = [
-        "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/platform:checkpointing_hdr",
-        ":simple_checkpointer",
-        "@com_google_absl//absl/strings",
-    ],
-    alwayslink = 1,
-)
-
 cc_library(
     name = "checkpointing_utils",
     srcs = ["checkpointing_utils.cc"],

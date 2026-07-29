@@ -565,7 +565,7 @@ cc_test(
         ":table",
         ":task_worker",
         "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/platform:checkpointing",
+        "//reverb/cc/platform/default:simple_checkpointer",
         "//reverb/cc/platform:logging",
         "//reverb/cc/platform:status_macros",
         "//reverb/cc/platform:status_matchers",
