@@ -12,7 +12,7 @@ reverb_pytype_strict_library(
     srcs = ["checkpointers.py"],
     srcs_version = "PY3",
     deps = [
-        "//reverb/platform:checkpointers_lib",
+        "//reverb:pybind",
     ],
 )
 

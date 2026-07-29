@@ -290,7 +290,7 @@ def example_4_checkpointing():
     ckpt_server = reverb.Server(
         tables=[_ckpt_table()],
         in_process=True,
-        checkpointer=reverb.platform.checkpointers_lib.DefaultCheckpointer(
+        checkpointer=reverb.platform.default.checkpointers.DefaultCheckpointer(
             path=ckpt_root
         ),
     )
@@ -312,7 +312,7 @@ def example_4_checkpointing():
     restored_server = reverb.Server(
         tables=[_ckpt_table()],
         in_process=True,
-        checkpointer=reverb.platform.checkpointers_lib.DefaultCheckpointer(
+        checkpointer=reverb.platform.default.checkpointers.DefaultCheckpointer(
             path=ckpt_root
         ),
     )

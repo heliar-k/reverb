@@ -133,7 +133,6 @@ reverb_py_test(
     srcs = ["checkpointers_test.py"],
     deps = [
         "//reverb:pybind",
-        "//reverb/platform:checkpointers_lib",
         "//reverb/platform/default:checkpointers",
     ],
 )

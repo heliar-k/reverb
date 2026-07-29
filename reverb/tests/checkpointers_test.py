@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for reverb.platform.checkpointers_lib + checkpointers facade."""
+"""Tests for reverb.platform.default.checkpointers."""
 
 import os
 import tempfile
@@ -20,7 +20,6 @@ import tempfile
 from absl.testing import absltest
 
 from reverb import pybind
-from reverb.platform import checkpointers_lib
 from reverb.platform.default import checkpointers
 
 
@@ -28,83 +27,72 @@ class CheckpointerBaseTest(absltest.TestCase):
     def test_base_is_abstract(self):
         # CheckpointerBase is ABC; internal_checkpointer is abstract.
         with self.assertRaises(TypeError):
-            checkpointers_lib.CheckpointerBase()
+            checkpointers.CheckpointerBase()
 
 
 class TempDirCheckpointerTest(absltest.TestCase):
     def test_constructs_internal_checkpointer(self):
-        cp = checkpointers_lib.TempDirCheckpointer()
+        cp = checkpointers.TempDirCheckpointer()
         self.assertIsInstance(cp.internal_checkpointer(), pybind.Checkpointer)
 
     def test_path_is_tempdir(self):
-        cp = checkpointers_lib.TempDirCheckpointer()
+        cp = checkpointers.TempDirCheckpointer()
         self.assertTrue(os.path.isdir(cp.path))
         # A fresh temp dir should differ between instances.
-        cp2 = checkpointers_lib.TempDirCheckpointer()
+        cp2 = checkpointers.TempDirCheckpointer()
         self.assertNotEqual(cp.path, cp2.path)
 
 
 class DefaultCheckpointerTest(absltest.TestCase):
     def test_constructs_internal_checkpointer(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root)
+        cp = checkpointers.DefaultCheckpointer(path=root)
         self.assertIsInstance(cp.internal_checkpointer(), pybind.Checkpointer)
 
     def test_path_stored(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root)
+        cp = checkpointers.DefaultCheckpointer(path=root)
         self.assertEqual(cp.path, root)
 
     def test_group_default_empty(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root)
+        cp = checkpointers.DefaultCheckpointer(path=root)
         self.assertEqual(cp.group, "")
 
     def test_group_custom(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root, group="mygroup")
+        cp = checkpointers.DefaultCheckpointer(path=root, group="mygroup")
         self.assertEqual(cp.group, "mygroup")
 
     def test_fallback_path_default_none(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root)
+        cp = checkpointers.DefaultCheckpointer(path=root)
         self.assertIsNone(cp.fallback_checkpoint_path)
 
     def test_fallback_path_custom(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(
+        cp = checkpointers.DefaultCheckpointer(
             path=root, fallback_checkpoint_path="/some/ckpt"
         )
         self.assertEqual(cp.fallback_checkpoint_path, "/some/ckpt")
 
     def test_is_checkpointer_base(self):
         root = tempfile.mkdtemp()
-        cp = checkpointers_lib.DefaultCheckpointer(path=root)
-        self.assertIsInstance(cp, checkpointers_lib.CheckpointerBase)
+        cp = checkpointers.DefaultCheckpointer(path=root)
+        self.assertIsInstance(cp, checkpointers.CheckpointerBase)
 
 
 class TempDirIsDefaultCheckpointerTest(absltest.TestCase):
     def test_tempdir_inherits_default(self):
-        cp = checkpointers_lib.TempDirCheckpointer()
-        self.assertIsInstance(cp, checkpointers_lib.DefaultCheckpointer)
+        cp = checkpointers.TempDirCheckpointer()
+        self.assertIsInstance(cp, checkpointers.DefaultCheckpointer)
 
 
 class DefaultCheckpointerFacadeTest(absltest.TestCase):
     def test_default_checkpointer_returns_tempdir(self):
         cp = checkpointers.default_checkpointer()
-        self.assertIsInstance(cp, checkpointers_lib.TempDirCheckpointer)
-        self.assertIsInstance(cp, checkpointers_lib.CheckpointerBase)
-
-    def test_facade_reexports(self):
-        self.assertIs(
-            checkpointers.CheckpointerBase, checkpointers_lib.CheckpointerBase
-        )
-        self.assertIs(
-            checkpointers.DefaultCheckpointer, checkpointers_lib.DefaultCheckpointer
-        )
-        self.assertIs(
-            checkpointers.TempDirCheckpointer, checkpointers_lib.TempDirCheckpointer
-        )
+        self.assertIsInstance(cp, checkpointers.TempDirCheckpointer)
+        self.assertIsInstance(cp, checkpointers.CheckpointerBase)
 
 
 if __name__ == "__main__":
