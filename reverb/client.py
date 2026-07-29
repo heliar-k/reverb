@@ -506,7 +506,9 @@ class _BaseClient:
 
                 yield timesteps
             else:
-                yield replay_sample.ReplaySample(info, unflatten([convert(x) for x in data]))
+                yield replay_sample.ReplaySample(
+                    info, unflatten([convert(x) for x in data])
+                )
 
     def writer(
         self,

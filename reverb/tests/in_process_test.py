@@ -271,9 +271,7 @@ class InProcessBytesDtypeTest(absltest.TestCase):
         arr = np.array([b"abc", b"de"])  # dtype '|S3'
         with client.trajectory_writer(num_keep_alive_refs=1) as w:
             w.append({"v": arr})
-            w.create_item(
-                table="b", priority=1.0, trajectory={"v": w.history["v"][:]}
-            )
+            w.create_item(table="b", priority=1.0, trajectory={"v": w.history["v"][:]})
             w.flush()
 
         sample = next(client.sample("b", num_samples=1, emit_timesteps=False))

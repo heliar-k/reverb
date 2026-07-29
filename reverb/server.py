@@ -31,7 +31,6 @@ import tree
 from reverb import item_selectors, pybind, rate_limiters, reverb_types, signature_codec
 from reverb.platform.default import checkpointers
 
-
 # Per-process counter for default SHM socket paths (see Server.__init__).
 _SHM_PATH_COUNTER = itertools.count()
 
