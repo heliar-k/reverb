@@ -20,13 +20,13 @@ from typing import Any, Optional, Union
 from reverb import pybind, signature_codec
 from reverb.cc import schema_pb2
 
-Fifo = pybind.FifoSelector
-Heap = pybind.HeapSelector
-Lifo = pybind.LifoSelector
-Prioritized = pybind.PrioritizedSelector
-Uniform = pybind.UniformSelector
-
-SelectorType = Union[Fifo, Heap, Lifo, Prioritized, Uniform]
+SelectorType = Union[
+    pybind.FifoSelector,
+    pybind.HeapSelector,
+    pybind.LifoSelector,
+    pybind.PrioritizedSelector,
+    pybind.UniformSelector,
+]
 
 # Signatures are encoded/decoded via the pure-Python `signature_codec`, which
 # targets the same `reverb.tensor.SignatureProto` the C++ layer uses. No TF is
