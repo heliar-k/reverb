@@ -18,7 +18,6 @@ dependencies = [
   "dm-tree",
   "portpicker",
   "numpy",
-  "packaging",
   # >=5.27: generated _pb2.py uses google.protobuf.runtime_version (5.27+);
   # older runtimes raise ImportError on import.
   "protobuf>=5.27",

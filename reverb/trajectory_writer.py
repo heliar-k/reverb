@@ -743,18 +743,6 @@ class TrajectoryColumn:
         return np.stack([ref.numpy() for ref in self._data_references])
 
 
-def _tree_filter(source, filter_wih_path_flat):
-    """Extract `filter_` from `source`."""
-    path_to_index = {path: i for i, (path, _) in enumerate(filter_wih_path_flat)}
-
-    flat_target = [None] * len(path_to_index)
-    for path, leaf in tree.flatten_with_path(source):
-        if path in path_to_index:
-            flat_target[path_to_index[path]] = leaf
-
-    return flat_target
-
-
 def _is_named_tuple(x):
     # Classes that look syntactically as if they inherit from `NamedTuple` in
     # fact end up not doing so, so use this heuristic to detect them.

@@ -154,7 +154,6 @@ reverb_cc_shared_library(
         "//reverb/cc/selectors:lifo",
         "//reverb/cc/selectors:prioritized",
         "//reverb/cc/selectors:uniform",
-        "//reverb/cc/support:cleanup",
         "//reverb/cc/support:key_generators",
         "//reverb/cc/support:signature",
         "//reverb/cc/support:trajectory_util",
