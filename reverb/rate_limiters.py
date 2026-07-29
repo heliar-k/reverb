@@ -15,10 +15,9 @@
 """Rate limiters."""
 
 import abc
+import logging
 import sys
 from typing import Tuple, Union
-
-from absl import logging
 
 from reverb import pybind
 

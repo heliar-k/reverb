@@ -22,6 +22,9 @@ from __future__ import annotations
 import abc
 import collections
 import itertools
+import logging
+import os
+import tempfile
 import threading
 from typing import Optional, Sequence
 
@@ -411,8 +414,6 @@ class Server:
             try:
                 internal_client.load_latest()
             except FileNotFoundError as e:
-                import logging  # pylint: disable=g-import-not-at-top
-
                 logging.warning("No checkpoint to restore (first start): %s", e)
             self._in_process_client = _client.LocalClient(
                 internal_client, output_format=output_format
@@ -432,9 +433,6 @@ class Server:
             # ALL tables (ticket ⑨: routed by table name) and is an additional
             # transport layered on the owned Table, independent of
             # in_process/gRPC, so `shm=True` does NOT imply `in_process=True`.
-            import os  # pylint: disable=g-import-not-at-top
-            import tempfile  # pylint: disable=g-import-not-at-top
-
             if shm_socket_path is None:
                 # /tmp/reverb_shm_<pid>_<n>.sock: the per-process counter keeps
                 # two Server(shm=True) instances in one process from clobbering

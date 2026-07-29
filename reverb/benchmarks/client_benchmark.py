@@ -89,14 +89,8 @@ def _make_table(name=TABLE, max_size=20000):
 
 
 def _percentile(sorted_data, pct):
-    if not sorted_data:
-        return float("nan")
-    k = (len(sorted_data) - 1) * (pct / 100.0)
-    f = int(k)
-    c = min(f + 1, len(sorted_data) - 1)
-    if f == c:
-        return sorted_data[f]
-    return sorted_data[f] + (sorted_data[c] - sorted_data[f]) * (k - f)
+    # 输入已排序;np.percentile 的 linear 插值与原手搓实现语义一致。
+    return float(np.percentile(sorted_data, pct)) if sorted_data else float("nan")
 
 
 # ── payload generation ───────────────────────────────────────────────────────
