@@ -75,8 +75,6 @@ _DT_NAME_TO_NP = {
 
 def _normalize_dtype(dtype: Any) -> np.dtype:
     """Accept numpy dtype, numpy scalar type, or string; return np.dtype."""
-    if isinstance(dtype, str):
-        return np.dtype(dtype)
     return np.dtype(dtype)
 
 
@@ -203,18 +201,10 @@ def decode_signature(data: bytes) -> Any:
 
 def _decode(proto: reverb_tensor_pb2.SignatureProto) -> Any:
     kind = proto.WhichOneof("kind")
-    if kind == "tensor_spec":
-        ts = proto.tensor_spec
-        shape = tuple(None if d == -1 else d for d in ts.shape.dim)
-        return TensorSpec(
-            shape=shape,
-            dtype=_proto_dtype_to_np_dtype(ts.dtype),
-            name=ts.name or None,
-        )
-    if kind == "bounded_tensor_spec":
-        # ponytail: BoundedTensorSpec leaf not produced by this codec's encoder;
-        # decode as a plain TensorSpec (bounds dropped). Add when callers need them.
-        ts = proto.bounded_tensor_spec
+    if kind in ("tensor_spec", "bounded_tensor_spec"):
+        # ponytail: BoundedTensorSpec 的 bounds 被丢弃,按普通 TensorSpec 解码;
+        # encoder 不产生该叶子,需要 bounds 时再扩展。
+        ts = getattr(proto, kind)
         shape = tuple(None if d == -1 else d for d in ts.shape.dim)
         return TensorSpec(
             shape=shape,
@@ -240,6 +230,48 @@ def _decode(proto: reverb_tensor_pb2.SignatureProto) -> Any:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Structure-only 编解码(叶子一律为 None,不占 tensor_spec 语义)
+# ---------------------------------------------------------------------------
+
+
+def encode_structure(structure) -> reverb_tensor_pb2.SignatureProto:
+    """将嵌套结构(dict/list/tuple,叶子为 None)序列化为 SignatureProto。
+
+    TF 已移除;原 structured_writer 依赖 TF nested_structure_coder 编解码
+    pattern_structure,但 C++ 端完全忽略该字段(仅 Python unpack_pattern
+    用于重建结构)。叶子一律编码为空 tensor_spec;解码时还原为 None。
+    升级路径:若需 BoundedTensorSpec/NamedTuple,扩展下面两个函数。
+    """
+    proto = reverb_tensor_pb2.SignatureProto()
+    if isinstance(structure, dict):
+        for key, value in structure.items():
+            proto.dict_value.values[key].CopyFrom(encode_structure(value))
+    elif isinstance(structure, list):
+        for value in structure:
+            proto.list_value.values.add().CopyFrom(encode_structure(value))
+    elif isinstance(structure, tuple):
+        for value in structure:
+            proto.tuple_value.values.add().CopyFrom(encode_structure(value))
+    else:
+        # 叶子节点(实际为 None):用空 tensor_spec 占位,解码时还原 None。
+        proto.tensor_spec.SetInParent()
+    return proto
+
+
+def decode_structure(proto: reverb_tensor_pb2.SignatureProto):
+    """encode_structure 的逆运算,还原嵌套结构(叶子为 None)。"""
+    kind = proto.WhichOneof("kind")
+    if kind == "dict_value":
+        return {k: decode_structure(v) for k, v in proto.dict_value.values.items()}
+    if kind == "list_value":
+        return [decode_structure(v) for v in proto.list_value.values]
+    if kind == "tuple_value":
+        return tuple(decode_structure(v) for v in proto.tuple_value.values)
+    # tensor_spec / 未设置 / 其它:叶子节点。
+    return None
+
+
 if __name__ == "__main__":
     # Round-trip self-check.
     spec = {
@@ -256,4 +288,13 @@ if __name__ == "__main__":
     encoded = encode_signature(spec)
     decoded = decode_signature(encoded)
     assert decoded == spec, f"round-trip mismatch:\n  want={spec!r}\n  got ={decoded!r}"
+    # encode/decode_structure 往返自检(dict/list/tuple + None 叶子)。
+    for struct in (
+        {"a": None, "b": {"c": None}},
+        [None, None, None],
+        ({"x": None}, [None]),
+        None,
+    ):
+        got = decode_structure(encode_structure(struct))
+        assert got == struct, (struct, got)
     print("signature_codec round-trip OK")

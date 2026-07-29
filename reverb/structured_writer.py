@@ -25,51 +25,10 @@ import tree
 
 from reverb import pybind, reverb_types, signature_codec, torch_support
 from reverb.cc import patterns_pb2
-from third_party.reverb_tensor import reverb_tensor_pb2
 
-# ponytail: TF 已从 reverb 移除。structured_writer 原依赖 TF 的
-# nested_structure_coder 编解码 pattern_structure,但 C++ 端完全忽略该字段
-# (仅 Python unpack_pattern 在测试中用于重建结构),且项目已换成对齐 numpy 的
-# 自定义 SignatureProto。故用纯 Python 实现 encode/decode_structure,覆盖
-# Reverb 实际用到的 dict/list/tuple 容器 + None 叶子(tree.map_structure(
-# lambda _: None, pattern) 产生)。infer_signature 改用
-# signature_codec.TensorSpec(numpy dtype/shape),不再惰性 import TF。
-# 升级路径:若需 BoundedTensorSpec/NamedTuple,扩展下面两个函数。
-
-
-def encode_structure(structure) -> reverb_tensor_pb2.SignatureProto:
-    """纯 Python 版 nested_structure_coder.encode_structure。
-
-    将嵌套结构(dict/list/tuple,叶子为任意值,实际调用方传 None)序列化为
-    自定义 SignatureProto。叶子一律编码为空 tensor_spec;解码时还原为 None。
-    """
-    proto = reverb_tensor_pb2.SignatureProto()
-    if isinstance(structure, dict):
-        for key, value in structure.items():
-            proto.dict_value.values[key].CopyFrom(encode_structure(value))
-    elif isinstance(structure, list):
-        for value in structure:
-            proto.list_value.values.add().CopyFrom(encode_structure(value))
-    elif isinstance(structure, tuple):
-        for value in structure:
-            proto.tuple_value.values.add().CopyFrom(encode_structure(value))
-    else:
-        # 叶子节点(实际为 None):用空 tensor_spec 占位,解码时还原 None。
-        proto.tensor_spec.SetInParent()
-    return proto
-
-
-def decode_structure(proto: reverb_tensor_pb2.SignatureProto):
-    """encode_structure 的逆运算,还原嵌套结构(叶子为 None)。"""
-    kind = proto.WhichOneof("kind")
-    if kind == "dict_value":
-        return {k: decode_structure(v) for k, v in proto.dict_value.values.items()}
-    if kind == "list_value":
-        return [decode_structure(v) for v in proto.list_value.values]
-    if kind == "tuple_value":
-        return tuple(decode_structure(v) for v in proto.tuple_value.values)
-    # tensor_spec / 未设置 / 其它:叶子节点。
-    return None
+# encode_structure/decode_structure 已并入 signature_codec.py(一个模块管
+# SignatureProto);C++ 端忽略 pattern_structure 字段,仅 Python unpack_pattern
+# 用于重建结构。
 
 
 # TODO(b/204423296): Expose Python abstractions rather than the raw protos.
@@ -324,7 +283,7 @@ def create_config(
         priority = constant_priority_fn(1.0)
     return patterns_pb2.StructuredWriterConfig(
         flat=tree.flatten(pattern),
-        pattern_structure=encode_structure(structure),
+        pattern_structure=signature_codec.encode_structure(structure),
         table=table,
         priority=priority,
         conditions=conditions,
@@ -334,7 +293,7 @@ def create_config(
 def unpack_pattern(config: Config) -> Pattern:
     if not config.HasField("pattern_structure"):
         return config.flat
-    structure = decode_structure(config.pattern_structure)
+    structure = signature_codec.decode_structure(config.pattern_structure)
     return tree.unflatten_as(structure, config.flat)
 
 
@@ -555,16 +514,3 @@ def td_error(
             max_priority_weight=max_priority_weight, flat_source_index=index
         )
     )
-
-
-if __name__ == "__main__":
-    # ponytail: encode/decode_structure 往返自检(dict/list/tuple + None 叶子)。
-    for struct in (
-        {"a": None, "b": {"c": None}},
-        [None, None, None],
-        ({"x": None}, [None]),
-        None,
-    ):
-        got = decode_structure(encode_structure(struct))
-        assert got == struct, (struct, got)
-    print("PASS")
