@@ -82,7 +82,7 @@ signature 用 TF 的 `nested_structure_coder` 编解码，checkpoint 用 TFRecor
 
 | 编号 | 决策 | 理由 |
 | ------ | ------ | ------ |
-| A1 | 内嵌只做 `TrajectoryWriter` + `StructuredWriter`(旧 `Writer`/`StreamingTrajectoryWriter` 本地路径砍掉) | 这两个是现代推荐 API；旧 writer 本地路径价值低，砍掉省复杂度。**`Writer` 部分被 [ADR-0001](adr/0001-embedded-writer-local-path.md) 推翻**(`StreamingTrajectoryWriter` 部分保留) |
+| A1 | 内嵌只做 `TrajectoryWriter` + `StructuredWriter`(旧 `Writer`/`StreamingTrajectoryWriter` 本地路径砍掉) | 这两个是现代推荐 API；旧 writer 本地路径价值低，砍掉省复杂度。**`Writer` 部分被 [ADR-0001](../adr/0001-embedded-writer-local-path.md) 推翻**(`StreamingTrajectoryWriter` 部分保留) |
 | A2 | 保留 gRPC 层 | 一套 C++ 代码两种模式（内嵌 + 分布式），不为内嵌牺牲分布式能力 |
 | A3 | 彻底去 TF，fork 精简 proto 到 `third_party/` | TF proto 链式拉入一堆传递依赖，精简 fork 切断 `@org_tensorflow` |
 | B1 | `TensorBuffer` 用拷贝 bytes（`std::string`） | worker 线程零 GIL，简单正确；预留零拷贝升级路径（`ponytail:` 标注） |
@@ -529,7 +529,7 @@ Python 闭包零 TF（无 `tf_nightly`/`keras`）。首次 `bazel build` 不再�
 ## 6. 附录：本地 Writer 解绑与本地化（D1/D2/D3-a 摘录）
 
 > 本节摘录自 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) 与
-> [adr/0001-embedded-writer-local-path.md](adr/0001-embedded-writer-local-path.md)，
+> [adr/0001-embedded-writer-local-path.md](../adr/0001-embedded-writer-local-path.md)，
 > 是上文 §3.2/§3.4/§3.5 当前实现背后的完整背景与决策记录（含早期“绑定单一 table”
 > 折中如何被推翻）。
 

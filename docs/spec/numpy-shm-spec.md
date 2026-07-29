@@ -1,6 +1,6 @@
 # SHM 传输层实现规格说明书
 
-> 本文档由 [numpy-shm-design.md](numpy-shm-design.md) 转化而来，补充了文件结构、
+> 本文档由 [numpy-shm-design.md](../design/numpy-shm-design.md) 转化而来，补充了文件结构、
 > BUILD 规则、类声明、测试策略和集成细节，供直接开发使用。面向已阅读设计文档
 > 的开发者。
 

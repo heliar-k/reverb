@@ -124,7 +124,7 @@ Minimal standalone scripts for each transport and writer path:
 
 Reverb 支持纯 numpy 的进程内模式,无需 TensorFlow,零网络开销,适合单机训练内嵌使用。
 完整的设计方案(动机、与原版差异、不得不做的变更、使用样例对比)见
-[docs/numpy-embed-design.md](docs/numpy-embed-design.md)。
+[docs/design/numpy-embed-design.md](docs/design/numpy-embed-design.md)。
 
 ```python
 import reverb
@@ -170,7 +170,7 @@ for sample in client.sample('my_table', num_samples=4):
 
 当 server 与 client 在同一台机器、不同进程时,可启用 POSIX 共享内存传输:
 零拷贝、无序列化,比 gRPC loopback 快约 9-11×(基准见
-[docs/shm-benchmark.md](docs/shm-benchmark.md))。API 与 `Client`/
+[docs/benchmark/shm-benchmark.md](docs/benchmark/shm-benchmark.md))。API 与 `Client`/
 `LocalClient` 完全一致,仅传输层不同,用户代码无需改动即可切换。
 
 ```python

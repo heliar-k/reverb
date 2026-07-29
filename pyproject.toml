@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional torch.Tensor support (docs/torch-tensor-design.md). CPU 零拷贝;
+# Optional torch.Tensor support (docs/design/torch-tensor-design.md). CPU 零拷贝;
 # CUDA tensor 写入时一次 D2H。reverb 本体不依赖 torch。
 torch = ["torch"]
 classifiers = [

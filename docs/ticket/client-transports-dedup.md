@@ -2,7 +2,7 @@
 
 > 归档自原 `tickets.md` 活动板。本组 ticket 全部结案。
 
-基于 `docs/client-transports.md` 文档审计和全库扫描，将 Python/C++/pybind 三层中发现的高价值重复代码合并，降低维护面。
+基于 `docs/guide/client-transports.md` 文档审计和全库扫描，将 Python/C++/pybind 三层中发现的高价值重复代码合并，降低维护面。
 
 工作方式：从**前沿**（所有阻塞已完成的 ticket）开始，四张 ticket 无相互依赖，可并行推进。
 

@@ -1,8 +1,8 @@
 # torch.Tensor 支持 — Phase 1 Spec
 
-> 上游设计文档：[torch-tensor-design.md](torch-tensor-design.md)（架构论证、
+> 上游设计文档：[torch-tensor-design.md](../design/torch-tensor-design.md)（架构论证、
 > GPU 事实考证、Phase 2/3 规划）；外部事实来源：
-> [torch-tensor-research.md](torch-tensor-research.md)。
+> [torch-tensor-research.md](../research/torch-tensor-research.md)。
 > 本文档是 **Phase 1 MVP** 的可构建规格，不含 Phase 2/3。
 
 ## 已拍板决策（2026-07-25）

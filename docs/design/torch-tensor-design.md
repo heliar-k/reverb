@@ -3,7 +3,7 @@
 > 本文档阐述在本 fork（纯 numpy、无 TensorFlow）中引入 `torch.Tensor` 作为 numpy
 > 之外第二种数据格式的方案，重点回答"GPU 上的 torch Tensor 能为传输和训练加速
 > 带来什么、带不来什么"。外部事实的考证见
-> [torch-tensor-research.md](torch-tensor-research.md)（41 处官方来源引用），
+> [torch-tensor-research.md](../research/torch-tensor-research.md)（41 处官方来源引用），
 > 本文只做设计决策。
 
 ## 目录

@@ -14,3 +14,14 @@ repos:
     rev: v0.9.3
     hooks:
       - id: taplo-format
+
+  # docs/ 根目录只许 README.md，其余 md 必须进子目录(规则见 docs/README.md)
+  - repo: local
+    hooks:
+      - id: docs-layout
+        name: docs layout (no stray md at docs root)
+        entry: >-
+          bash -c 'echo "docs/ 根目录只放 README.md，请按类型归入子目录(规则见 docs/README.md)，违规文件: $1" >&2; exit 1' --
+        language: system
+        files: '^docs/[^/]+\.md$'
+        exclude: '^docs/README\.md$'

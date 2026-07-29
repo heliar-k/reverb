@@ -2,8 +2,8 @@
 
 > 归档自原 `tickets.md` 活动板。本组 ticket 全部结案。
 
-基于 `docs/torch-tensor-spec.md`(上游设计 `docs/torch-tensor-design.md`,外部考证
-`docs/torch-tensor-research.md`)。核心架构结论:全链路收敛于 `TensorBuffer` 字节枢纽,
+基于 `docs/spec/torch-tensor-spec.md`(上游设计 `docs/design/torch-tensor-design.md`,外部考证
+`docs/research/torch-tensor-research.md`)。核心架构结论:全链路收敛于 `TensorBuffer` 字节枢纽,
 转换只做在两个边缘,C++/proto/SHM/checkpoint 零改动。两张 ticket 串行交付后,
 双轴 code-review 追加一张修复。已拍板:隐式自动转换(写入)、client 构造参数(采样)、
 torch 为可选依赖(懒导入 + `[torch]` extra)。

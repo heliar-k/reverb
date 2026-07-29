@@ -2,7 +2,7 @@
 
 Benchmark of the **sample path** (the design's core pain point — N repeated
 decompressions per sample) across three transports, plus a feasibility spike on
-the v2 optimization from `docs/numpy-shm-spec.md` §6 / `docs/numpy-shm-design.md`
+the v2 optimization from `docs/spec/numpy-shm-spec.md` §6 / `docs/design/numpy-shm-design.md`
 §6.
 
 ## 1. Methodology
@@ -101,7 +101,7 @@ so the ratio is stable.
 
 ## 4. v2 Spike: insert bytes reused as sample slice source
 
-Source: `docs/numpy-shm-design.md` §6 / `docs/numpy-shm-spec.md` §6.
+Source: `docs/design/numpy-shm-design.md` §6 / `docs/spec/numpy-shm-spec.md` §6.
 
 ### 4.1 The idea
 

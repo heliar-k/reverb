@@ -333,5 +333,5 @@ flowchart TB
 - **「给我看代码」** → [examples/demo.py](../examples/demo.py)（核心教程，覆盖轨迹写入、队列、优先级、checkpoint）
 - **「我要选传输层」** → [docs/client-transports.md](client-transports.md)（三种 Client 的完整对比与避坑）
 - **「我要生产级用法」** → [examples/production_patterns.py](../examples/production_patterns.py)（Queue、Stack、SampleToInsertRatio、flush 背压等 10 个模式）
-- **「我要了解设计决策」** → [docs/numpy-embed-design.md](numpy-embed-design.md)（为什么去掉 TensorFlow、架构变更记录）
+- **「我要了解设计决策」** → [docs/numpy-embed-design.md](../design/numpy-embed-design.md)（为什么去掉 TensorFlow、架构变更记录）
 - **「我要完整 API」** → 参考 `reverb/__init__.py` 中的导出列表，以及各模块的 docstring
