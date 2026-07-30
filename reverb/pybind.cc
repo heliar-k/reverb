@@ -597,9 +597,9 @@ PYBIND11_MODULE(libpybind, m) {
           py::init([](std::vector<std::shared_ptr<Table>> priority_tables,
                       int port,
                       std::shared_ptr<Checkpointer> checkpointer = nullptr) {
-            std::unique_ptr<Server> server;
-            MaybeRaiseFromStatus(StartServer(std::move(priority_tables), port,
-                                             std::move(checkpointer), &server));
+            auto server = std::make_unique<Server>(port);
+            MaybeRaiseFromStatus(server->Initialize(
+                std::move(priority_tables), std::move(checkpointer)));
             return server.release();
           }),
           py::arg("priority_tables"), py::arg("port"),

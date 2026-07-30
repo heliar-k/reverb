@@ -16,37 +16,67 @@
 #define REVERB_CC_PLATFORM_SERVER_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "reverb/cc/checkpointing/interface.h"
+#include "reverb/cc/support/periodic_closure.h"
 #include "reverb/cc/table.h"
+
+namespace grpc {
+class Server;
+}  // namespace grpc
 
 namespace deepmind {
 namespace reverb {
 
+class ReverbServiceImpl;
+
 // Unlimited.
 constexpr int kMaxMessageSize = -1;
 
+// gRPC server hosting the tables' ReverbService.
 class Server {
  public:
-  virtual ~Server() = default;
+  explicit Server(int port);
+  ~Server();
+
+  // Builds and starts the gRPC server. Must be called exactly once.
+  absl::Status Initialize(std::vector<std::shared_ptr<Table>> tables,
+                          std::shared_ptr<Checkpointer> checkpointer);
 
   // Terminates the server and blocks until it has been terminated.
-  virtual void Stop() = 0;
+  void Stop();
 
   // Blocks until the server has terminated. Does not terminate the server
   // itself. Use this to want to wait indefinitely. Returns true if the server
   // was stopped by a SIGINT signal.
-  virtual bool Wait() = 0;
+  bool Wait();
 
   // Returns a summary string description.
-  virtual std::string DebugString() const = 0;
-};
+  std::string DebugString() const;
 
-absl::Status StartServer(std::vector<std::shared_ptr<Table>> tables, int port,
-                         std::shared_ptr<Checkpointer> checkpointer,
-                         std::unique_ptr<Server> *server);
+ private:
+  void SignalStop();
+
+  int port_;
+  std::unique_ptr<ReverbServiceImpl> reverb_service_;
+  std::unique_ptr<grpc::Server> server_;
+
+  absl::Mutex mu_;
+  bool running_ ABSL_GUARDED_BY(mu_) = false;
+
+  // We can't call Stop directly from the signal handler as it requires mutex
+  // locking which could result in deadlocks caused by recursive calls to the
+  // the handler. We therefore use the indirect method of simply setting this
+  // bool flag to true from the signal handler and deligate the actuall call
+  // to Stop to a worker thread which periodically wakes up to check if Stop
+  // should be called.
+  bool stop_signalled_ = false;
+  internal::PeriodicClosure signal_worker_;
+};
 
 }  // namespace reverb
 }  // namespace deepmind

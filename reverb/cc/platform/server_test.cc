@@ -30,17 +30,15 @@ namespace {
 
 TEST(ServerTest, StartServer) {
   int port = internal::PickUnusedPortOrDie();
-  std::unique_ptr<Server> server;
-  REVERB_EXPECT_OK(StartServer(/*tables=*/{},
-                               /*port=*/port, /*checkpointer=*/nullptr,
-                               &server));
+  Server server(port);
+  REVERB_EXPECT_OK(server.Initialize(/*tables=*/{},
+                                     /*checkpointer=*/nullptr));
 }
 
 TEST(ServerTest, ErrorOnUnavailablePort) {
   // We expect that port==-1 to always be unavailable.
-  std::unique_ptr<Server> server;
-  auto status = StartServer(/*tables=*/{},
-                            /*port=*/-1, /*checkpointer=*/nullptr, &server);
+  Server server(-1);
+  auto status = server.Initialize(/*tables=*/{}, /*checkpointer=*/nullptr);
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(std::string(status.message()),
               ::testing::HasSubstr("Failed to BuildAndStart gRPC server"));

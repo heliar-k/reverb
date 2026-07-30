@@ -55,7 +55,9 @@ reverb_cc_library(
     deps = [
         "//reverb/cc:table",
         "//reverb/cc/checkpointing:interface",
+        "//reverb/cc/support:periodic_closure",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -67,7 +69,9 @@ reverb_cc_library(
         "//reverb/cc:table",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform/default:server",
+        "//reverb/cc/support:periodic_closure",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
     ] + reverb_grpc_deps(),
 )
 

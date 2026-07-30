@@ -38,113 +38,84 @@ void signal_handler(int signal) {
   stop_server_fn();
 }
 
-class ServerImpl : public Server {
- public:
-  ServerImpl(int port)
-      : port_(port),
-        signal_worker_(
-            [this] {
-              if (stop_signalled_) {
-                Stop();
-              }
-            },
-            absl::Milliseconds(250)) {}
-
-  absl::Status Initialize(std::vector<std::shared_ptr<Table>> tables,
-                          std::shared_ptr<Checkpointer> checkpointer) {
-    absl::WriterMutexLock lock(&mu_);
-    REVERB_CHECK(!running_) << "Initialize() called twice?";
-    REVERB_RETURN_IF_ERROR(ReverbServiceImpl::Create(
-        std::move(tables), std::move(checkpointer), &reverb_service_));
-    server_ = grpc::ServerBuilder()
-                  .AddListeningPort(absl::StrCat("[::]:", port_),
-                                    MakeServerCredentials())
-                  .RegisterService(reverb_service_.get())
-                  .SetMaxSendMessageSize(kMaxMessageSize)
-                  .SetMaxReceiveMessageSize(kMaxMessageSize)
-                  .BuildAndStart();
-    if (!server_) {
-      return absl::InvalidArgumentError("Failed to BuildAndStart gRPC server");
-    }
-    running_ = true;
-    REVERB_LOG(REVERB_INFO) << "Started replay server on port " << port_;
-    REVERB_RETURN_IF_ERROR(signal_worker_.Start());
-    return absl::OkStatus();
-  }
-
-  ~ServerImpl() override {
-    signal_worker_.Stop().IgnoreError();
-    Stop();
-  }
-
-  void Stop() override {
-    absl::WriterMutexLock lock(&mu_);
-    if (!running_) return;
-    REVERB_LOG(REVERB_INFO) << "Shutting down replay server";
-
-    reverb_service_->Close();
-
-    // Set a deadline as the sampler streams never closes by themselves.
-    server_->Shutdown(std::chrono::system_clock::now());
-
-    running_ = false;
-  }
-
-  bool Wait() override {
-    {
-      absl::MutexLock lock(&mu_);
-      if (!running_) return false;
-    }
-
-    // Register a signal handler for notifying the server about SIGINT signals.
-    stop_server_fn = [server_ptr = this] { server_ptr->SignalStop(); };
-    std::signal(SIGINT, signal_handler);
-
-    server_->Wait();
-
-    // Disable the signal handler by removing the callback.
-    stop_server_fn = []() {};
-
-    return stop_signalled_;
-  }
-
-  std::string DebugString() const override {
-    return absl::StrCat("Server(port=", port_,
-                        ", reverb_service=", reverb_service_->DebugString(),
-                        ")");
-  }
-
-  void SignalStop() { stop_signalled_ = true; }
-
- private:
-  int port_;
-  std::unique_ptr<ReverbServiceImpl> reverb_service_;
-  std::unique_ptr<grpc::Server> server_ = nullptr;
-
-  absl::Mutex mu_;
-  bool running_ ABSL_GUARDED_BY(mu_) = false;
-
-  // We can't call Stop directly from the signal handler as it requires mutex
-  // locking which could result in deadlocks caused by recursive calls to the
-  // the handler. We therefore use the indirect method of simply setting this
-  // bool flag to true from the signal handler and deligate the actuall call
-  // to Stop to a worker thread which periodically wakes up to check if Stop
-  // should be called.
-  bool stop_signalled_ = false;
-  internal::PeriodicClosure signal_worker_;
-};
-
 }  // namespace
 
-absl::Status StartServer(std::vector<std::shared_ptr<Table>> tables, int port,
-                         std::shared_ptr<Checkpointer> checkpointer,
-                         std::unique_ptr<Server> *server) {
-  auto s = std::make_unique<ServerImpl>(port);
-  REVERB_RETURN_IF_ERROR(
-      s->Initialize(std::move(tables), std::move(checkpointer)));
-  *server = std::move(s);
+Server::Server(int port)
+    : port_(port),
+      signal_worker_(
+          [this] {
+            if (stop_signalled_) {
+              Stop();
+            }
+          },
+          absl::Milliseconds(250)) {}
+
+absl::Status Server::Initialize(
+    std::vector<std::shared_ptr<Table>> tables,
+    std::shared_ptr<Checkpointer> checkpointer) {
+  absl::WriterMutexLock lock(&mu_);
+  REVERB_CHECK(!running_) << "Initialize() called twice?";
+  REVERB_RETURN_IF_ERROR(ReverbServiceImpl::Create(
+      std::move(tables), std::move(checkpointer), &reverb_service_));
+  server_ = grpc::ServerBuilder()
+                .AddListeningPort(absl::StrCat("[::]:", port_),
+                                  MakeServerCredentials())
+                .RegisterService(reverb_service_.get())
+                .SetMaxSendMessageSize(kMaxMessageSize)
+                .SetMaxReceiveMessageSize(kMaxMessageSize)
+                .BuildAndStart();
+  if (!server_) {
+    return absl::InvalidArgumentError("Failed to BuildAndStart gRPC server");
+  }
+  running_ = true;
+  REVERB_LOG(REVERB_INFO) << "Started replay server on port " << port_;
+  REVERB_RETURN_IF_ERROR(signal_worker_.Start());
   return absl::OkStatus();
 }
+
+Server::~Server() {
+  signal_worker_.Stop().IgnoreError();
+  Stop();
+}
+
+void Server::Stop() {
+  absl::WriterMutexLock lock(&mu_);
+  if (!running_) return;
+  REVERB_LOG(REVERB_INFO) << "Shutting down replay server";
+
+  reverb_service_->Close();
+
+  // Set a deadline as the sampler streams never closes by themselves.
+  server_->Shutdown(std::chrono::system_clock::now());
+
+  running_ = false;
+}
+
+bool Server::Wait() {
+  {
+    absl::MutexLock lock(&mu_);
+    if (!running_) return false;
+  }
+
+  // Register a signal handler for notifying the server about SIGINT signals.
+  stop_server_fn = [server_ptr = this] { server_ptr->SignalStop(); };
+  std::signal(SIGINT, signal_handler);
+
+  server_->Wait();
+
+  // Disable the signal handler by removing the callback.
+  stop_server_fn = []() {};
+
+  return stop_signalled_;
+}
+
+std::string Server::DebugString() const {
+  return absl::StrCat("Server(port=", port_,
+                      ", reverb_service=", reverb_service_->DebugString(),
+                      ")");
+}
+
+void Server::SignalStop() { stop_signalled_ = true; }
 
 }  // namespace reverb
 }  // namespace deepmind
