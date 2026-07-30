@@ -110,8 +110,9 @@ bool Server::Wait() {
 }
 
 std::string Server::DebugString() const {
-  return absl::StrCat("Server(port=", port_,
-                      ", reverb_service=", reverb_service_->DebugString(),
+  return absl::StrCat("Server(port=", port_, ", reverb_service=",
+                      reverb_service_ ? reverb_service_->DebugString()
+                                      : "<uninitialized>",
                       ")");
 }
 
