@@ -23,7 +23,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "reverb/cc/checkpointing/interface.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 #include "reverb/cc/reverb_service.grpc.pb.h"
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/schema.pb.h"

@@ -18,7 +18,7 @@ reverb_cc_library(
     deps = [
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "//reverb/cc/support:tensor_proxy",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/log:check",

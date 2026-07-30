@@ -22,8 +22,8 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/support/grpc_util.h"
 #include "reverb/cc/task_worker.h"
 

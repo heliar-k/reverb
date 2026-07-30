@@ -36,7 +36,7 @@
 #include "reverb/cc/patterns.pb.h"
 #include "reverb/cc/platform/default/simple_checkpointer.h"
 #include "reverb/cc/platform/checkpointing_utils.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 #include "reverb/cc/platform/server.h"
 #include "reverb/cc/rate_limiter.h"
 #include "reverb/cc/sampler.h"

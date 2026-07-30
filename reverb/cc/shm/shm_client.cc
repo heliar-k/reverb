@@ -28,8 +28,8 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "reverb/cc/errors.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/reverb_service.pb.h"  // ticket ⑩: MutatePrioritiesRequest/ResetRequest
 #include "reverb/cc/sampler.h"

@@ -22,7 +22,7 @@
 #include "absl/types/span.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/shm/ring.h"
 #include "reverb/cc/shm/shm_protocol.pb.h"
 

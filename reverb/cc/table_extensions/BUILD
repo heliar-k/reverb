@@ -28,7 +28,7 @@ reverb_cc_library(
     deps = [
         ":interface",
         "//reverb/cc:table",
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",

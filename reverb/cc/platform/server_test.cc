@@ -22,7 +22,7 @@
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "reverb/cc/platform/net.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 
 namespace deepmind {
 namespace reverb {

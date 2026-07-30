@@ -21,8 +21,8 @@
 #include "absl/status/status.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/platform/thread.h"
 
 namespace deepmind {

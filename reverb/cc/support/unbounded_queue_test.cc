@@ -17,7 +17,7 @@
 #include "gtest/gtest.h"
 #include "absl/synchronization/notification.h"
 #include "reverb/cc/platform/thread.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 
 namespace deepmind {
 namespace reverb {

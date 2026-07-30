@@ -22,8 +22,8 @@
 #include "absl/strings/str_cat.h"
 #include "reverb/cc/checkpointing/interface.h"
 #include "reverb/cc/platform/grpc_utils.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/reverb_service_impl.h"
 #include "reverb/cc/support/periodic_closure.h"
 

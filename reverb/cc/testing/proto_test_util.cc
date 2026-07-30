@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "absl/log/check.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/tensor_compression.h"

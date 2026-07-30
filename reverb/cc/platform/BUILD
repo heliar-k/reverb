@@ -81,7 +81,7 @@ reverb_cc_test(
     deps = [
         ":net",
         ":server",
-        ":status_matchers",
+        "//reverb/cc/platform/default:status_matchers",
         "@com_google_absl//absl/status",
     ] + reverb_grpc_deps(),
 )
@@ -103,21 +103,6 @@ reverb_cc_library(
         "//reverb/cc/platform/default:snappy",
         "@com_google_absl//absl/strings:string_view",
     ],
-)
-
-reverb_cc_library(
-    name = "status_macros",
-    hdrs = ["status_macros.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = ["//reverb/cc/platform/default:status_macros"],
-)
-
-reverb_cc_library(
-    name = "status_matchers",
-    testonly = True,
-    hdrs = ["status_matchers.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = ["//reverb/cc/platform/default:status_matchers"],
 )
 
 reverb_cc_library(
@@ -146,27 +131,6 @@ reverb_cc_test(
 )
 
 reverb_cc_library(
-    name = "hash_map",
-    hdrs = ["hash_map.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = ["//reverb/cc/platform/default:hash_map"],
-)
-
-reverb_cc_library(
-    name = "hash_set",
-    hdrs = ["hash_set.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = ["//reverb/cc/platform/default:hash_set"],
-)
-
-reverb_cc_library(
-    name = "logging",
-    hdrs = ["logging.h"],
-    visibility = ["//reverb:__subpackages__"],
-    deps = ["//reverb/cc/platform/default:logging"],
-)
-
-reverb_cc_library(
     name = "net_hdr",
     hdrs = ["net.h"],
 )
@@ -182,7 +146,7 @@ reverb_cc_test(
     name = "net_test",
     srcs = ["net_test.cc"],
     deps = [
-        ":logging",
+        "//reverb/cc/platform/default:logging",
         ":net",
     ],
 )

@@ -7,7 +7,7 @@ load(
     "reverb_grpc_deps",
 )
 
-package(default_visibility = ["//reverb/cc/platform:__pkg__"])
+package(default_visibility = ["//reverb:__subpackages__"])
 
 licenses(["notice"])
 
@@ -48,9 +48,9 @@ reverb_cc_library(
         "//reverb/cc:reverb_service_impl",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:grpc_utils",
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform:server_hdr",
-        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform/default:status_macros",
         "//reverb/cc/support:periodic_closure",
         "@com_google_absl//absl/strings",
     ] + reverb_grpc_deps(),
@@ -64,7 +64,7 @@ reverb_cc_library(
         "status_matchers.h",
     ],
     deps = [
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "@com_google_absl//absl/status",
     ],
 )
@@ -135,7 +135,7 @@ reverb_cc_library(
     name = "net",
     srcs = ["net.cc"],
     deps = [
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform:net_hdr",
     ],
     alwayslink = 1,
@@ -156,10 +156,10 @@ cc_library(
         "//reverb/cc/checkpointing:checkpoint_cc_proto",
         "//reverb/cc/checkpointing:interface",
         "//reverb/cc/platform:checkpointing_utils",
-        "//reverb/cc/platform:hash_map",
-        "//reverb/cc/platform:hash_set",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform/default:hash_map",
+        "//reverb/cc/platform/default:hash_set",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_macros",
         "//reverb/cc/support:length_delimited_io",
         "//reverb/cc/support:trajectory_util",
         "//reverb/cc/table_extensions:interface",
@@ -196,8 +196,8 @@ cc_test(
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:table",
         "//reverb/cc/checkpointing:interface",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
         "//reverb/cc/selectors:fifo",
         "//reverb/cc/selectors:uniform",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",

@@ -25,7 +25,7 @@
 #include "reverb/cc/chunker.h"
 #include "reverb/cc/chunk_store.h"
 #include "reverb/cc/patterns.pb.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 #include "reverb/cc/sampler.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/structured_writer.h"

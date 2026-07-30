@@ -17,7 +17,7 @@
 
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 
 namespace deepmind {
 namespace reverb {

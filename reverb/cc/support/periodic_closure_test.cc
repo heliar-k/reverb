@@ -21,7 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/testing/time_testutil.h"
 
 namespace deepmind {

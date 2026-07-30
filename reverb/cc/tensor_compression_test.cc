@@ -24,7 +24,7 @@
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 

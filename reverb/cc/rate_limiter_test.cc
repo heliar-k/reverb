@@ -23,7 +23,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/selectors/uniform.h"
 #include "reverb/cc/table.h"

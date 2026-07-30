@@ -24,7 +24,7 @@
 #include <cstring>
 #include <unordered_set>
 
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 
 namespace deepmind {
 namespace reverb {

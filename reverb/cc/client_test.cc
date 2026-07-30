@@ -24,7 +24,7 @@
 #include "gtest/gtest.h"
 #include "absl/status/status.h"
 #include "reverb/cc/chunker.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/reverb_service.pb.h"
 #include "reverb/cc/reverb_service_mock.grpc.pb.h"
 #include "reverb/cc/sampler.h"

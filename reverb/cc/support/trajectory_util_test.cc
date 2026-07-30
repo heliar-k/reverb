@@ -26,7 +26,7 @@
 #include "google/protobuf/text_format.h"
 #include "google/protobuf/util/message_differencer.h"
 #include "reverb/cc/chunk_store.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/tensor_compression.h"

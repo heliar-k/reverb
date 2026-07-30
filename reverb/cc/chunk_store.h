@@ -24,7 +24,7 @@
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 #include "reverb/cc/schema.pb.h"
 
 namespace deepmind {

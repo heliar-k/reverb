@@ -17,7 +17,7 @@
 
 // IWYU pragma: private
 #include "absl/status/status.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 
 // Evaluates an expression that produces a `absl::Status`. If the status
 // is not ok, returns it from the current function.

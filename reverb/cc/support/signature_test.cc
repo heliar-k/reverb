@@ -18,8 +18,8 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_matchers.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_matchers.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 // ponytail: 本地内联 proto 匹配工具,避免拉入 //reverb/cc/testing:proto_test_util
 // (该 cc_library 的 .cc 仍依赖 TF CompressTensorAsProto,Task 4 后未迁移)。

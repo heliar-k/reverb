@@ -22,9 +22,9 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 #include "reverb/cc/platform/snappy.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 

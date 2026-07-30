@@ -23,7 +23,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "reverb/cc/checkpointing/checkpoint.pb.h"
-#include "reverb/cc/platform/hash_set.h"
+#include "reverb/cc/platform/default/hash_set.h"
 #include "reverb/cc/schema.pb.h"
 
 namespace deepmind {

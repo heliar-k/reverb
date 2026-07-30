@@ -39,7 +39,7 @@ reverb_cc_library(
     name = "queue",
     hdrs = ["queue.h"],
     deps = [
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
@@ -53,7 +53,7 @@ reverb_cc_library(
     srcs = ["intrusive_heap.cc"],
     hdrs = ["intrusive_heap.h"],
     deps = [
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
     ],
 )
 
@@ -71,7 +71,7 @@ reverb_cc_library(
     srcs = ["periodic_closure.cc"],
     hdrs = ["periodic_closure.h"],
     deps = [
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform:thread",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
@@ -85,8 +85,8 @@ reverb_cc_test(
     srcs = ["queue_test.cc"],
     deps = [
         ":queue",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
         "//reverb/cc/platform:thread",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/synchronization",
@@ -99,7 +99,7 @@ reverb_cc_test(
     srcs = ["periodic_closure_test.cc"],
     deps = [
         ":periodic_closure",
-        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:status_matchers",
         "//reverb/cc/testing:time_testutil",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
@@ -115,9 +115,9 @@ cc_library(
         ":tensor_proxy",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:table",
-        "//reverb/cc/platform:hash_map",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform/default:hash_map",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_macros",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -134,8 +134,8 @@ cc_test(
     # ponytail: :signature 依赖 :tensor_proxy(pybind11/numpy),运行时需 libpython。
 deps = [
         ":signature",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:string_view",
@@ -152,7 +152,7 @@ reverb_cc_library(
         "state_statistics.h",
     ],
     deps = [
-        "//reverb/cc/platform:hash_map",
+        "//reverb/cc/platform/default:hash_map",
         "@com_google_absl//absl/time",
     ],
 )
@@ -191,7 +191,7 @@ reverb_cc_test(
     srcs = ["unbounded_queue_test.cc"],
     deps = [
         ":unbounded_queue",
-        "//reverb/cc/platform:logging",
+        "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform:thread",
         "@com_google_absl//absl/synchronization",
     ],
@@ -208,9 +208,9 @@ cc_library(
         "//reverb/cc:chunk_store",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
-        "//reverb/cc/platform:hash_set",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_macros",
+        "//reverb/cc/platform/default:hash_set",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_macros",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -231,8 +231,8 @@ deps = [
         "//reverb/cc:chunk_store",
         "//reverb/cc:schema_cc_proto",
         "//reverb/cc:tensor_compression",
-        "//reverb/cc/platform:logging",
-        "//reverb/cc/platform:status_matchers",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_googletest//:gtest",

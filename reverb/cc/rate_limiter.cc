@@ -27,8 +27,8 @@
 #include "absl/time/time.h"
 #include "reverb/cc/checkpointing/checkpoint.pb.h"
 #include "reverb/cc/errors.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/table.h"
 

@@ -22,7 +22,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "reverb/cc/platform/logging.h"
+#include "reverb/cc/platform/default/logging.h"
 #include "reverb/cc/platform/thread.h"
 
 namespace deepmind {

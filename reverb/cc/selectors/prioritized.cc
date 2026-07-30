@@ -21,8 +21,8 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/selectors/interface.h"
 

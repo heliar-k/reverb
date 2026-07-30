@@ -22,7 +22,7 @@
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "reverb/cc/checkpointing/checkpoint.pb.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 #include "reverb/cc/selectors/interface.h"
 
 namespace deepmind {

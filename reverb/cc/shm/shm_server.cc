@@ -31,9 +31,9 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "reverb/cc/chunk_store.h"
-#include "reverb/cc/platform/hash_map.h"
-#include "reverb/cc/platform/logging.h"
-#include "reverb/cc/platform/status_macros.h"
+#include "reverb/cc/platform/default/hash_map.h"
+#include "reverb/cc/platform/default/logging.h"
+#include "reverb/cc/platform/default/status_macros.h"
 #include "reverb/cc/reverb_service.pb.h"  // ticket ⑩: MutatePrioritiesRequest/ResetRequest
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/support/tensor_proxy.h"

@@ -21,7 +21,7 @@
 
 #include "absl/status/status.h"
 #include "absl/types/optional.h"
-#include "reverb/cc/platform/hash_map.h"
+#include "reverb/cc/platform/default/hash_map.h"
 #include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/table.h"
