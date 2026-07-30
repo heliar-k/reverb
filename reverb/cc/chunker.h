@@ -245,7 +245,7 @@ class Chunker : public std::enable_shared_from_this<Chunker> {
   uint64_t next_chunk_key_ ABSL_GUARDED_BY(mu_);
 
   // Used to generate chunk keys.
-  std::unique_ptr<internal::KeyGenerator> key_generator_;
+  internal::UniformKeyGenerator key_generator_;
 
   // Circular buffer of `CellRef`s that can be referenced in by new items.
   // When the size exceeds `num_keep_alive_refs_` then the oldest item is

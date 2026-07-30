@@ -114,8 +114,7 @@ absl::Status CellRef::GetSpec(internal::TensorSpec* spec) const {
 Chunker::Chunker(internal::TensorSpec spec,
                  std::shared_ptr<ChunkerOptions> options)
     : spec_(std::move(spec)),
-      options_(std::move(options)),
-      key_generator_(std::make_unique<internal::UniformKeyGenerator>()) {
+      options_(std::move(options)) {
   if (!options_->GetCompressionDisabled()){
     REVERB_CHECK_GE(options_->GetNumKeepAliveRefs(),
                     options_->GetMaxChunkLength());
@@ -321,7 +320,7 @@ absl::Status Chunker::FlushLocked() {
   }
 
   buffer_.clear();
-  next_chunk_key_ = key_generator_->Generate();
+  next_chunk_key_ = key_generator_.Generate();
   offset_ = 0;
 
   return absl::OkStatus();
@@ -335,7 +334,7 @@ void Chunker::Reset() {
   }
   uncompressed_data_.clear();
   offset_ = 0;
-  next_chunk_key_ = key_generator_->Generate();
+  next_chunk_key_ = key_generator_.Generate();
   active_refs_.clear();
 }
 

@@ -302,8 +302,7 @@ TrajectoryWriter::TrajectoryWriter(
     const Options& options)
     : stub_(std::move(stub)),
       options_(options),
-      key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
-      episode_id_(key_generator_->Generate()),
+      episode_id_(key_generator_.Generate()),
       episode_step_(0),
       closed_(false),
       stream_worker_(
@@ -357,8 +356,7 @@ TrajectoryWriter::TrajectoryWriter(
     : is_local_(true),
       tables_(std::move(tables)),
       options_(options),
-      key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
-      episode_id_(key_generator_->Generate()),
+      episode_id_(key_generator_.Generate()),
       episode_step_(0),
       closed_(false),
       stream_worker_(
@@ -373,8 +371,7 @@ TrajectoryWriter::TrajectoryWriter(shm::ShmConnection* conn,
                                    const Options& options)
     : shm_conn_(conn),
       options_(options),
-      key_generator_(std::make_unique<internal::UniformKeyGenerator>()),
-      episode_id_(key_generator_->Generate()),
+      episode_id_(key_generator_.Generate()),
       episode_step_(0),
       closed_(false),
       stream_worker_(
@@ -511,7 +508,7 @@ absl::Status TrajectoryWriter::CreateItem(
     }
   }
 
-  item_and_refs->item.set_key(key_generator_->Generate());
+  item_and_refs->item.set_key(key_generator_.Generate());
   item_and_refs->item.set_table(table.data(), table.size());
   item_and_refs->item.set_priority(priority);
 
@@ -1479,7 +1476,7 @@ absl::Status TrajectoryWriter::EndEpisode(bool clear_buffers,
     }
   }
 
-  episode_id_ = key_generator_->Generate();
+  episode_id_ = key_generator_.Generate();
   episode_step_ = 0;
   return absl::OkStatus();
 }

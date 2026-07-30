@@ -22,15 +22,9 @@
 
 namespace deepmind::reverb::internal {
 
-class KeyGenerator {
+class UniformKeyGenerator {
  public:
-  virtual ~KeyGenerator() = default;
-  virtual uint64_t Generate() = 0;
-};
-
-class UniformKeyGenerator : public KeyGenerator {
- public:
-  uint64_t Generate() override {
+  uint64_t Generate() {
     return absl::Uniform<uint64_t>(bit_gen_, 0,
                                    std::numeric_limits<uint64_t>::max());
   }
