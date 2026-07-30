@@ -28,7 +28,7 @@ namespace deepmind {
 namespace reverb {
 namespace {
 
-TEST(ServerTest, StartServer) {
+TEST(ServerTest, Initialize) {
   int port = internal::PickUnusedPortOrDie();
   Server server(port);
   REVERB_EXPECT_OK(server.Initialize(/*tables=*/{},
