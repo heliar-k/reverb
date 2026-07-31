@@ -145,6 +145,17 @@ void ShmServer::Stop() {
   if (!running_.exchange(false)) return;
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
 
+  // review #1 (shm-clientstate-lifetime): stop tables BEFORE touching
+  // clients_. Table workers + callback executors fire insert/sample
+  // completion callbacks that dereference ClientState; Table::Stop() (Close
+  // + join worker + drain the callback executor) guarantees none can fire
+  // after it returns, so clear()/~ClientState below cannot race a callback.
+  // The HandleDisconnect path can't stop the (shared) table per-client — it
+  // is covered by the callbacks' shared_ptr<ClientState> capture instead.
+  for (const auto& [name, table] : tables_) {
+    table->Stop();
+  }
+
   // Clean up clients: ReleaseAll outstanding offsets (C3), close fds. The
   // rings are unlinked by their Ring destructors (owner_=true) when
   // `clients_` clears, so we pass unlink_rings=false to avoid a redundant
@@ -339,7 +350,7 @@ bool ShmServer::TryAccept() {
     return false;
   }
 
-  auto state = std::make_unique<ClientState>();
+  auto state = std::make_shared<ClientState>();
   state->fd = client_fd;
   state->client_pid = client_pid;
   state->conn.insert_c2s = std::move(*ins_c2s);
@@ -379,7 +390,7 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
               << client_id;
           break;
         }
-        auto st = HandleInsert(state, req);
+        auto st = HandleInsert(clients_[client_id], req);
         if (!st.ok()) {
           REVERB_LOG(REVERB_WARNING)
               << "ShmServer: HandleInsert failed for client " << client_id
@@ -511,7 +522,7 @@ void ShmServer::HandleSampleRequests(size_t client_id) {
               << client_id;
           break;
         }
-        auto st = HandleSample(state, req);
+        auto st = HandleSample(clients_[client_id], req);
         if (!st.ok()) {
           REVERB_LOG(REVERB_WARNING)
               << "ShmServer: HandleSample failed for client " << client_id
@@ -658,8 +669,9 @@ absl::StatusOr<std::shared_ptr<Table>> ShmServer::FindTable(
   return it->second;
 }
 
-absl::Status ShmServer::HandleSample(ClientState& state,
+absl::Status ShmServer::HandleSample(std::shared_ptr<ClientState> state_sp,
                                      const ShmSampleRequest& req) {
+  ClientState& state = *state_sp;
   // 0. ticket ⑨: route by table name. Unknown table -> ShmError::NOT_FOUND on
   //    the sample s2c flow (mirrors the DEADLINE_EXCEEDED error path below);
   //    the client's FetchOne maps it to absl::NotFoundError.
@@ -691,7 +703,10 @@ absl::Status ShmServer::HandleSample(ClientState& state,
   absl::Duration timeout = (req.timeout_ms() < 0)
                                ? absl::InfiniteDuration()
                                : absl::Milliseconds(req.timeout_ms());
-  ClientState* state_ptr = &state;
+  // review #1: the callback captures state_sp (shared_ptr<ClientState>),
+  // not a raw pointer — the state then stays alive until the callback
+  // returns even if clients_.erase()/clear() ran first (HandleDisconnect /
+  // Stop racing an in-flight callback).
   ShmSampleRequest req_copy = req;  // 回调攥住请求（table 名等在回调里不再用，
                                     // 但保留以备将来按请求配对）
   // Keepalive + 自清：shared_ptr<SamplingCallback> 存 pending_sample_callbacks
@@ -715,7 +730,7 @@ absl::Status ShmServer::HandleSample(ClientState& state,
   // Ceil: 高并发可改 hash_set 按指针查。Upgrade: 同。
   auto cb_raw_box = std::make_shared<Table::SamplingCallback*>();
   auto cb = std::make_shared<Table::SamplingCallback>(
-      [state_ptr, cb_raw_box, req_copy = std::move(req_copy)](
+      [state_sp, cb_raw_box, req_copy = std::move(req_copy)](
           Table::SampleRequest* sample) mutable {
         ClientState::PendingSample ps;
         ps.req = std::move(req_copy);
@@ -723,11 +738,11 @@ absl::Status ShmServer::HandleSample(ClientState& state,
         if (sample->status.ok() && !sample->samples.empty()) {
           ps.item = std::move(sample->samples.front());
         }
-        absl::MutexLock lock(&state_ptr->pending_samples_mu);
-        state_ptr->pending_samples.push_back(std::move(ps));
+        absl::MutexLock lock(&state_sp->pending_samples_mu);
+        state_sp->pending_samples.push_back(std::move(ps));
         // 自清 keepalive：erase 指向自己的 shared_ptr 拷贝。
         Table::SamplingCallback* raw = *cb_raw_box;
-        auto& cbs = state_ptr->pending_sample_callbacks;
+        auto& cbs = state_sp->pending_sample_callbacks;
         for (auto it = cbs.begin(); it != cbs.end(); ++it) {
           if (it->get() == raw) {
             cbs.erase(it);
@@ -1060,8 +1075,9 @@ absl::Status ShmServer::HandleServerInfo(ClientState& state) {
   return EnqueueInsertS2C(state, SERVER_INFO_RESP, body);
 }
 
-absl::Status ShmServer::HandleInsert(ClientState& state,
+absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
                                       const ShmInsertRequest& req) {
+  ClientState& state = *state_sp;
   // 1. Deserialize each referenced ChunkData from the pool (C4: client wrote
   //    serialized bytes at the granted offset). ChunkData is self-describing,
   //    so ShmChunkRef.specs/sequence_range/delta_encoded are redundant metadata
@@ -1160,7 +1176,8 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
 
   auto remaining = std::make_shared<std::atomic<int>>(num_items);
   auto ack_keys = std::make_shared<std::vector<uint64_t>>();
-  ClientState* state_ptr = &state;
+  // review #1: capture state_sp (shared_ptr<ClientState>), not a raw
+  // pointer — see HandleSample.
   auto offsets = std::make_shared<std::vector<uint64_t>>(std::move(chunk_offsets));
 
   // ticket ⑨: route each item to its named table via FindTable. If ANY item
@@ -1229,7 +1246,7 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
     // touch the S→C ring directly; it pushes the completed key, and when the
     // last item completes it enqueues the aggregate ACK into the outbox.
     auto cb = std::make_shared<Table::InsertCallback>(
-        [remaining, ack_keys, offsets, state_ptr](uint64_t completed_key) {
+        [remaining, ack_keys, offsets, state_sp](uint64_t completed_key) {
           ack_keys->push_back(completed_key);
           if (remaining->fetch_sub(1) == 1) {
             InsertAck ack;
@@ -1242,13 +1259,13 @@ absl::Status ShmServer::HandleInsert(ClientState& state,
             // dispatch thread, the direct write would race the dispatch
             // thread's S→C producer. Route through the outbox unconditionally
             // instead.
-            absl::MutexLock lock(&state_ptr->insert_outbox_mu);
-            state_ptr->insert_outbox.emplace_back(
+            absl::MutexLock lock(&state_sp->insert_outbox_mu);
+            state_sp->insert_outbox.emplace_back(
                 static_cast<uint16_t>(INSERT_ACK), std::move(body));
             // All inserts confirmed: drop the keepalive so the callbacks (and
             // what they capture) are reclaimed. This breaks the would-be
             // cycle (cb -> lambda -> ... ; the lambda does NOT capture cb).
-            state_ptr->pending_insert_callbacks.clear();
+            state_sp->pending_insert_callbacks.clear();
           }
         });
     // Keepalive: InsertOrAssignAsync stores a weak_ptr; the table worker fires

@@ -413,6 +413,18 @@ class Table {
   // abandoned after `Close` called.
   void Close();
 
+  // Close() + block until the table worker has exited AND all already-
+  // scheduled callbacks have run to completion (the callback executor is
+  // drained and closed). After Stop() returns no insert/sampling callback
+  // can fire — unlike Close(), which is asynchronous (callbacks may still
+  // be scheduled or in flight). Idempotent; ~Table re-enters the same path
+  // safely. Object must be abandoned after Stop().
+  //
+  // Used by ShmServer::Stop() to guarantee table callbacks cannot touch
+  // per-client state after clients are torn down (ticket:
+  // shm-clientstate-lifetime, review #1).
+  void Stop();
+
   // Asserts that `mu_` is held at runtime and calls UpdateItem.
   absl::Status UnsafeUpdateItem(Key key, double priority)
       ABSL_ASSERT_EXCLUSIVE_LOCK(mu_);

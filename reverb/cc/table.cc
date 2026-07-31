@@ -812,6 +812,27 @@ void Table::Close() {
   }
 }
 
+void Table::Stop() {
+  Close();
+  // Join the worker: after this no new callbacks are scheduled (the
+  // shutdown path already fired every pending request: FinalizeSampleRequest
+  // for sampling, NotifyPendingInserts for inserts).
+  table_worker_ = nullptr;
+  // Drain + close the callback executor: callbacks scheduled but not yet
+  // executed run to completion here, so no callback can fire after Stop()
+  // returns. TaskExecutor::Close is idempotent and ~Table's member teardown
+  // re-enters it safely. Scheduled callbacks do not take `mu_`, so running
+  // them from this thread cannot deadlock.
+  std::shared_ptr<TaskExecutor> executor;
+  {
+    absl::MutexLock lock(mu_);
+    executor = callback_executor_;
+  }
+  if (executor != nullptr) {
+    executor->Close();
+  }
+}
+
 absl::Status Table::DeleteItem(Table::Key key,
                                std::shared_ptr<Item>* deleted_item) {
   auto it = data_.find(key);

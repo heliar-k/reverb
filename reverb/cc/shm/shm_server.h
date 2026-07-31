@@ -134,7 +134,9 @@ class ShmServer {
   // Launch the dispatch thread.
   absl::Status Start();
 
-  // Stop the dispatch thread, clean up clients, unlink SHM segments.
+  // Stop the dispatch thread, stop all tables (Table::Stop: Close + join
+  // worker + drain callback executor — guarantees no table callback can fire
+  // afterwards, review #1), then clean up clients and unlink SHM segments.
   void Stop();
 
   const std::string& socket_path() const { return socket_path_; }
@@ -177,7 +179,12 @@ class ShmServer {
   // 攒进 ClientState::pending_samples；DrainPendingSamples 在 dispatch 线程做
   // unpack+pool+SAMPLE_RESP（保持 pool_/outstanding_offsets_ 单线程不变式）。
   // 未知表仍同步返 ERROR（不入队）。
-  absl::Status HandleSample(ClientState& state, const ShmSampleRequest& req);
+  // review #1: takes shared_ptr so the completion callback can capture it —
+  // the ClientState then outlives clients_.erase()/clear() until the
+  // callback returns (HandleDisconnect path, where the table can't be
+  // stopped per-client).
+  absl::Status HandleSample(std::shared_ptr<ClientState> state,
+                            const ShmSampleRequest& req);
 
   // 取出异步完成的 sample，在 dispatch 线程做 unpack+pool memcpy+写 SAMPLE_RESP
   // （或写 ERROR on 失败/超时）。镜像 HandleInsert 的 callback→outbox 模式。
@@ -192,7 +199,9 @@ class ShmServer {
   // table-worker completion callback stashes InsertAck{keys,
   // offsets_to_release} into the client's outbox (C2); the dispatch thread —
   // the sole S→C producer — drains it via FlushOutbox.
-  absl::Status HandleInsert(ClientState& state, const ShmInsertRequest& req);
+  // review #1: shared_ptr param, see HandleSample.
+  absl::Status HandleInsert(std::shared_ptr<ClientState> state,
+                            const ShmInsertRequest& req);
 
   // C4 allocate path: client requests a pool offset; server (sole allocator)
   // grants it. Mirrors byte_pool_echo_test's inline handler.
@@ -267,7 +276,12 @@ class ShmServer {
   // constructs ShmServer without one (shouldn't happen in practice — Server
   // always builds a default checkpointer — but C++ defends itself).
   std::shared_ptr<Checkpointer> checkpointer_;
-  std::vector<std::unique_ptr<ClientState>> clients_;
+  // review #1 (shm-clientstate-lifetime): shared_ptr so insert/sample
+  // completion callbacks (fired on table callback-executor threads, capturing
+  // the ClientState) keep the state alive until they return — erase()/clear()
+  // only drop the server's reference. The Stop()-path window is additionally
+  // closed deterministically by stopping tables before clearing clients.
+  std::vector<std::shared_ptr<ClientState>> clients_;
 
   std::thread dispatch_thread_;
   std::atomic<bool> running_{false};

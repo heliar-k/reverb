@@ -18,6 +18,10 @@
 // (R6), its ClientState erased — WITHOUT affecting other clients and while the
 // server keeps running. A new client must reconnect cleanly afterward.
 //
+// Review #1 (shm-clientstate-lifetime): the last two tests keep insert/sample
+// callbacks pending on a rate-limiter-blocked table while Stop()/disconnect
+// tears down ClientState — a pre-fix heap-use-after-free, caught by ASan/TSan.
+//
 // ponytail: we simulate a crash by closing the client's control_fd
 // (ShmConnection::control_fd), which is exactly the liveness signal the server
 // poll()s (spec §8.8). This avoids fork/SIGKILL and the PID-collision issue
@@ -34,6 +38,7 @@
 #include <future>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <sys/mman.h>  // shm_open
 #include <sys/wait.h>  // waitpid
@@ -51,6 +56,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "reverb/cc/chunk_store.h"
+#include "reverb/cc/chunker.h"
 #include "reverb/cc/platform/default/logging.h"
 #include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/sampler.h"
@@ -59,9 +65,12 @@
 #include "reverb/cc/shm/bootstrap.h"
 #include "reverb/cc/shm/shm_client.h"
 #include "reverb/cc/shm/shm_server.h"
+#include "reverb/cc/structured_writer.h"
 #include "reverb/cc/support/tensor_proxy.h"
 #include "reverb/cc/table.h"
+#include "reverb/cc/table_extensions/interface.h"
 #include "reverb/cc/tensor_compression.h"
+#include "reverb/cc/trajectory_writer.h"
 #include "third_party/reverb_tensor/reverb_tensor.pb.h"
 
 namespace deepmind {
@@ -209,6 +218,81 @@ bool WaitFor(std::function<bool()> cond, absl::Duration timeout) {
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   return cond();
+}
+
+// ── ClientState lifetime (ticket: shm-clientstate-lifetime, review #1) ──
+//
+// A table whose rate limiter blocks BOTH inserts and samples forever keeps
+// every async insert/sample callback pending until the table worker shuts
+// down. Stop()/HandleDisconnect then deterministically race the shutdown-time
+// callbacks with ClientState teardown — pre-fix that was a heap-use-after-free
+// (clients_ cleared/erased while table workers still fired callbacks that
+// dereference raw ClientState*; caught by ASan/TSan). Post-fix the callbacks
+// hold shared_ptr<ClientState> and ShmServer::Stop stops tables before
+// clearing clients.
+std::shared_ptr<Table> MakeBlockingTable() {
+  // RateLimiter(1, 1, min_diff=1, max_diff=0): the first insert is free
+  // (inserts+1 <= min_size_to_sample), everything after is blocked:
+  // CanInsert diff=(1+n)*1-0 > 0 for n>=1, and CanSample diff=1*1-0-1=0 <
+  // min_diff=1. The caller seeds ONE item synchronously to consume the free
+  // insert, after which every async insert/sample stays pending until worker
+  // shutdown.
+  return std::make_shared<Table>(
+      /*name=*/"queue",
+      /*sampler=*/std::make_shared<FifoSelector>(),
+      /*remover=*/std::make_shared<FifoSelector>(),
+      /*max_size=*/100,
+      /*max_times_sampled=*/1,
+      /*rate_limiter=*/std::make_shared<RateLimiter>(1, 1, /*min_diff=*/1,
+                                                     /*max_diff=*/0));
+}
+
+using Step = std::vector<std::optional<TensorBuffer>>;
+using StepRef = std::vector<std::optional<std::weak_ptr<CellRef>>>;
+
+TensorBuffer MakeZeroInt32() {
+  int32_t zero = 0;
+  std::string bytes(sizeof(int32_t), '\0');
+  std::memcpy(bytes.data(), &zero, sizeof(int32_t));
+  return TensorBuffer(TensorSpec{DataType::Int32, {1}}, std::move(bytes));
+}
+
+// Fire-and-forget insert on a background thread: Append + CreateItem + Flush.
+// Flush blocks awaiting INSERT_ACK, which with a blocking table never comes —
+// the call returns (with an error) only when the connection drops at
+// Stop/disconnect. The server-side insert callback stays pending until the
+// table worker shuts down.
+void InsertOneItemAsync(ShmClient* client) {
+  std::unique_ptr<TrajectoryWriter> writer;
+  if (!client
+           ->NewTrajectoryWriter(
+               TrajectoryWriter::Options{
+                   .chunker_options =
+                       std::make_shared<ConstantChunkerOptions>(1, 1)},
+               &writer)
+           .ok()) {
+    return;
+  }
+  StepRef refs;
+  if (!writer->Append(Step({MakeZeroInt32()}), &refs).ok()) return;
+  std::vector<std::weak_ptr<CellRef>> col{refs[0].value()};
+  if (!writer->CreateItem("queue", 1.0, {TrajectoryColumn(col, /*squeeze=*/false)})
+           .ok()) {
+    return;
+  }
+  (void)writer->Flush();  // errors on connection close; ignored
+}
+
+// Fire-and-forget sample on a background thread. The empty blocking table
+// never serves the request (infinite rate_limiter_timeout -> no server-side
+// deadline), so the completion callback stays pending until table shutdown;
+// the client call errors out when the connection drops.
+void SampleOneItemAsync(ShmClient* client) {
+  std::unique_ptr<ShmSampler> sampler;
+  if (!client->NewSampler("queue", {1}, &sampler).ok()) return;
+  std::vector<TensorBuffer> data;
+  (void)sampler->GetNextTrajectory(&data);  // blocks; errors on conn close
+  sampler->Close();
 }
 
 // ── Crash recovery (single client) ──
@@ -484,6 +568,246 @@ TEST(ShmCrashTest, ClientFailsFastWhenServerStops) {
   // dispatch thread's join in Stop() completes.
   table->Close();
   (*server)->Stop();
+}
+
+// ── ClientState lifetime: Server.stop() with in-flight callbacks (review #1) ──
+
+// An insert and a sample are in flight (callbacks pending on the blocking
+// table) when the server stops. Pre-fix, Stop() cleared clients_ while the
+// table workers were still alive; the pending callbacks then fired at ~Table
+// (NotifyPendingInserts / FinalizeSampleRequest on the callback executor) and
+// dereferenced the freed ClientState — a heap-use-after-free under ASan/TSan.
+// Post-fix, Stop() stops the tables (Close + join worker + drain callback
+// executor) BEFORE clearing clients_, and the callbacks hold
+// shared_ptr<ClientState>. Without sanitizers this exercises the same path
+// and asserts the client threads fail fast instead of hanging.
+TEST(ShmCrashTest, StopWithInFlightCallbacksDoesNotUaf) {
+  auto table = MakeBlockingTable();
+  // Seed one item to consume the rate limiter's free first insert, so the
+  // client's insert below stays pending (and the seeded item keeps the
+  // sample request servable-but-rate-limited rather than unservable).
+  InsertItem(table.get(), /*key=*/1, /*priority=*/1.0,
+             /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
+  std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("stop") + ".sock";
+  auto server = ShmServer::Create({table}, sock);
+  REVERB_ASSERT_OK(server.status());
+  REVERB_ASSERT_OK((*server)->Start());
+
+  auto client = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(client.status());
+
+  std::thread writer_thread([&] { InsertOneItemAsync(client->get()); });
+  std::thread sampler_thread([&] { SampleOneItemAsync(client->get()); });
+
+  // Let the dispatch thread enqueue both requests server-side. A dispatch
+  // pass costs ~50us; 300ms is thousands of passes, after which both
+  // callbacks are pending on the blocking table with overwhelming margin.
+  absl::SleepFor(absl::Milliseconds(300));
+
+  // Stop with both callbacks in flight: must stop tables before clearing
+  // clients, and must unblock the client threads (fd close -> EOF).
+  (*server)->Stop();
+  writer_thread.join();
+  sampler_thread.join();
+
+  EXPECT_EQ(table->size(), 1)
+      << "only the seeded item may land; the client insert stays pending";
+  // ~ShmServer re-enters Stop() (idempotent) and destroys the table.
+}
+
+// ── The actual UAF repro: Server.stop() mid-callback-stream (statistical) ──
+//
+// Why the Stop path and not disconnect: the dispatch dead-check only runs at
+// the top of a pass, so HandleDisconnect lands one full drain pass after the
+// fd close (measured: 3-11ms under ASan) — by then any callback stream has
+// ended, structurally. Stop() has no such delay: the dispatch join only
+// waits for the CURRENT pass, and clients_.clear() runs immediately after,
+// at a moment the test thread picks. The race window (review #1) is a
+// callback that already lock()ed its keepalive and is mid-body (touching
+// state->pending_samples_mu) when clear() frees the ClientState.
+//
+// The window is sub-microsecond, so the test engineers a long, hot callback
+// stream and lands clear() in its middle:
+//  - 8 tables share the one client's ClientState; each has its own worker +
+//    callback executor -> 8 parallel callback streams into one ClientState.
+//  - A SlowSampleExtension (OnSample busy-spins 300us) throttles each worker
+//    to 300us/sample via WaitForBackgroundWork (extension queue cap 10), so
+//    the stream outlives the dispatch drain pass (throttle > per-request
+//    enqueue cost) and the pool never exhausts pre-clear (completions < 256).
+//  - Stop() is called mid-stream; the dispatch join returns as the drain
+//    pass ends, with most of each worker's backlog still pending — clear()
+//    then races 8 hot streams. 300 rounds make the pre-fix failure
+//    near-certain under ASan/TSan (duty per event is only a few %%,
+//    inflated by ASan instrumentation of the body).
+// Post-fix, Stop() stops the tables (Close + join worker + drain executor)
+// BEFORE clearing clients, and callbacks hold shared_ptr<ClientState>.
+class SlowSampleExtension : public TableExtension {
+ public:
+  bool CanRunAsync() const override { return true; }
+  std::string DebugString() const override { return "SlowSampleExtension"; }
+
+ protected:
+  void OnInsert(absl::Mutex*, const ExtensionItem&) override {}
+  void OnDelete(absl::Mutex*, const ExtensionItem&) override {}
+  void OnUpdate(absl::Mutex*, const ExtensionItem&) override {}
+  void OnSample(absl::Mutex*, const ExtensionItem&) override {
+    absl::Time end = absl::Now() + absl::Microseconds(300);
+    while (absl::Now() < end) {
+    }
+  }
+  void OnReset(absl::Mutex*) override {}
+  absl::Status RegisterTable(absl::Mutex*, Table*) override {
+    return absl::OkStatus();
+  }
+  void UnregisterTable(absl::Mutex*, Table*) override {}
+};
+
+//
+// The shutdown-path tests above CANNOT hit the bug: when ClientState is
+// destroyed, the keepalive callbacks (its members) die too, so the table's
+// weak_ptr.lock() fails and no callback body ever runs on the freed state.
+// The real window (review #1) is a callback that ALREADY lock()ed its
+// keepalive and is mid-body (touching state->pending_samples_mu) when
+// HandleDisconnect frees the ClientState. That window is sub-microsecond
+// (the self-erase scan is O(1) in FIFO completion order), so ONE sample
+// stream gives only a few %% hit chance per erase. This test multiplies the
+// odds: EIGHT tables share the one client's ClientState — each has its own
+// worker + callback executor, so a raw SAMPLE blast across all 8 keeps 8
+// callback streams firing in parallel, all touching the same ClientState.
+// The disconnect lands while the workers grind their backlogs; 30 rounds
+// make the pre-fix failure near-certain under ASan/TSan. Post-fix the
+// callback's shared_ptr keeps the ClientState alive through the body.
+//
+// Sizing: the blast must stay UNDER the pool's 256-block tier — every
+// completed sample holds one pool block outstanding until the client
+// RELEASEs (this test never does), so a blast >256 exhausts the tier and
+// every subsequent DrainPendingSamples fails with a per-item log line,
+// inflating the dispatch pass to tens of ms. The erase then lands long
+// after the callback stream ended and the race window is never sampled.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr int kStormRounds = 300;
+#else
+constexpr int kStormRounds = 5;  // plain builds: mechanics only, keep it fast
+#endif
+
+TEST(ShmCrashTest, StopDuringSampleCallbackStormDoesNotUaf) {
+  constexpr int kNumTables = 8;
+  constexpr int kBlastPerTable = 10;
+
+  // One request body per table (raw blast: no ShmSampler, whose worker
+  // thread would make sample_c2s multi-producer).
+  std::vector<std::string> bodies(kNumTables);
+  for (int t = 0; t < kNumTables; t++) {
+    ShmSampleRequest req;
+    req.set_table(absl::StrCat("t", t));
+    req.set_num_samples(1);
+    req.set_timeout_ms(-1);  // infinite: never expires server-side
+    bodies[t] = req.SerializeAsString();
+  }
+
+  for (int round = 0; round < kStormRounds; round++) {
+    // Fresh tables per round: Stop() stops them permanently (post-fix), and
+    // each round's items are sampled out anyway.
+    std::vector<std::shared_ptr<Table>> tables;
+    for (int t = 0; t < kNumTables; t++) {
+      auto table = std::make_shared<Table>(
+          /*name=*/absl::StrCat("t", t),
+          /*sampler=*/std::make_shared<FifoSelector>(),
+          /*remover=*/std::make_shared<FifoSelector>(),
+          /*max_size=*/100,
+          /*max_times_sampled=*/1,  // every sample also DeleteItems
+          /*rate_limiter=*/std::make_shared<RateLimiter>(
+              1, 1, /*min_diff=*/-1e9, /*max_diff=*/1e9),  // never blocks
+          /*extensions=*/
+          std::vector<std::shared_ptr<TableExtension>>{
+              std::make_shared<SlowSampleExtension>()});
+      // One item per blast request: each is sampled (and deleted) once.
+      for (int k = 1; k <= kBlastPerTable; k++) {
+        InsertItem(table.get(), /*key=*/k, /*priority=*/1.0,
+                   /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
+      }
+      tables.push_back(std::move(table));
+    }
+
+    std::string sock =
+        "/tmp/reverb_shm_crash_" + UniqueTag(absl::StrCat("storm", round)) +
+        ".sock";
+    auto server = ShmServer::Create(std::move(tables), sock);
+    REVERB_ASSERT_OK(server.status());
+    REVERB_ASSERT_OK((*server)->Start());
+    auto client = ShmClient::Connect(sock);
+    REVERB_ASSERT_OK(client.status());
+    ShmConnection* conn = (*client)->connection();
+
+    // Blast all 8 tables interleaved. The dispatch drains the ring over the
+    // next few hundred us; the throttled workers (100us/sample) grind their
+    // 10-deep backlogs for ~3ms, their executors firing completion
+    // callbacks — all into ONE ClientState.
+    for (int i = 0; i < kBlastPerTable; i++) {
+      for (int t = 0; t < kNumTables; t++) {
+        REVERB_ASSERT_OK(
+            conn->sample_c2s.Write(SAMPLE, absl::MakeSpan(bodies[t])));
+      }
+    }
+    // Land clients_.clear() mid-stream: the dispatch join in Stop() returns
+    // as the drain pass ends (~250us from now), with most of each worker's
+    // backlog — and all 8 callback streams — still hot.
+    absl::SleepFor(absl::Microseconds(250));
+    (*server)->Stop();
+    client->reset();
+  }
+}
+
+// ── ClientState lifetime: HandleDisconnect with in-flight callbacks ──
+
+// Per-client teardown (HandleDisconnect) cannot stop the table — other
+// clients share it. Each round leaves one insert + one sample callback
+// pending on the blocking table whose captured ClientState is erased at
+// disconnect; Stop() then fires every accumulated callback at table
+// shutdown. Pre-fix each of those touched a ClientState freed rounds earlier
+// (ASan/TSan); post-fix the callbacks' shared_ptr keeps the state alive
+// until they return.
+TEST(ShmCrashTest, DisconnectWithInFlightCallbacksDoesNotUaf) {
+  constexpr int kRounds = 10;
+  auto table = MakeBlockingTable();
+  InsertItem(table.get(), /*key=*/1, /*priority=*/1.0,
+             /*sequence_lengths=*/{5}, /*offset=*/0, /*length=*/5);
+  std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("disc") + ".sock";
+  auto server = ShmServer::Create({table}, sock);
+  REVERB_ASSERT_OK(server.status());
+  REVERB_ASSERT_OK((*server)->Start());
+  // Ring names are getpid()-keyed (same process every round), so reclaim is
+  // observable via the unlink of this constant set of names.
+  ShmSegmentNames names = MakeShmNames(sock, getpid());
+
+  for (int round = 0; round < kRounds; round++) {
+    auto client = ShmClient::Connect(sock);
+    REVERB_ASSERT_OK(client.status());
+    ShmConnection* conn = (*client)->connection();
+
+    std::thread writer_thread([&] { InsertOneItemAsync(client->get()); });
+    std::thread sampler_thread([&] { SampleOneItemAsync(client->get()); });
+    absl::SleepFor(absl::Milliseconds(100));  // let dispatch enqueue both
+
+    // Crash: the server's HandleDisconnect erases this ClientState while its
+    // insert/sample callbacks are still pending on the blocking table.
+    ASSERT_GE(conn->control_fd, 0);
+    close(conn->control_fd);
+    conn->control_fd = -1;  // prevent ~ShmConnection double-close
+
+    ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
+                        absl::Seconds(5)))
+        << "round " << round << ": server did not reclaim the crashed client";
+    writer_thread.join();
+    sampler_thread.join();
+    client->reset();
+  }
+
+  // Table shutdown fires every accumulated pending callback (kRounds inserts
+  // via NotifyPendingInserts, kRounds samples via FinalizeSampleRequest),
+  // each dereferencing a ClientState erased rounds ago.
+  (*server)->Stop();
+  EXPECT_EQ(table->size(), 1);  // only the seeded item
 }
 
 }  // namespace

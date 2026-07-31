@@ -239,8 +239,14 @@ reverb_cc_library(
 
 # ---- Sample-path integration test (ticket ③) ----
 
+# size=medium: SecondConcurrentSamplerRejected inherently waits out the
+# client FetchOne 60s hard cap (kReadBlockingHardCap) when the sampler
+# worker enters FetchOne before Close() lands — a scheduling race that
+# ASan (slower main thread) makes deterministic, exceeding small's 60s
+# bazel timeout. Pre-existing test-design race, not a code regression.
 reverb_cc_test(
     name = "shm_sample_test",
+    size = "medium",
     srcs = ["shm_sample_test.cc"],
     deps = [
         ":shm_client",
@@ -308,10 +314,14 @@ reverb_cc_test(
         ":shm_server",
         ":shm_protocol_cc_proto",
         "//reverb/cc:chunk_store",
+        "//reverb/cc:chunker",
         "//reverb/cc:sampler",
         "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:structured_writer",
         "//reverb/cc:table",
+        "//reverb/cc/table_extensions:interface",
         "//reverb/cc:tensor_compression",
+        "//reverb/cc:trajectory_writer",
         "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform/default:status_matchers",
         "//reverb/cc/selectors:fifo",
