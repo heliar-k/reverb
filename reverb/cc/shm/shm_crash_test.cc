@@ -31,6 +31,7 @@
 // _exit() it abruptly. Same byte/shape assertion rationale as shm_sample_test
 // (no CPython interpreter in this binary).
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -891,6 +892,63 @@ TEST(ShmCrashTest, SecondServerSameSocketDoesNotClobberLiveSegments) {
   close(ring_fd);
   (*s2)->Stop();
   (*s1)->Stop();
+}
+
+// ── Writer ctor member-init race (ticket: shm-writer-worker-race-sigsegv) ──
+
+// Regression for an initialization-order race: the SHM ctor's member-init
+// started the RunShmWorker thread while later members (stream_ok_,
+// stream_status_) were still UNCONSTRUCTED (members initialize in
+// declaration order, and stream_worker_ preceded them). Under CPU
+// contention the fresh worker could be scheduled mid-ctor: a garbage
+// stream_ok_=false made it skip the data_cv_ wait and copy an unconstructed
+// stream_status_, dereferencing a wild StatusRep pointer (SIGSEGV,
+// ~3%/suite-run under 10-way parallel load; same signature in Python
+// shm_test's concurrent writer test). Fixed by declaring stream_worker_
+// LAST in trajectory_writer.h so all members exist before the thread starts
+// (ShmSampler never had it: its worker starts in Create(), post-ctor).
+//
+// The race needs no server traffic: an idle writer's worker evaluates
+// stream_ok_ immediately. Hammer create/destroy from several threads to
+// maximize the chance a worker gets scheduled mid-ctor. Pre-fix this loop
+// segfaults within seconds under load (the whole binary dies — that is the
+// regression signal); post-fix it is clean.
+TEST(ShmCrashTest, WriterCtorDoesNotRaceMemberInit) {
+  auto table = MakeTable();
+  std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("ctor") + ".sock";
+  auto server = ShmServer::Create({table}, sock);
+  REVERB_ASSERT_OK(server.status());
+  REVERB_ASSERT_OK((*server)->Start());
+  auto client = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(client.status());
+
+  std::atomic<bool> stop{false};
+  std::atomic<int64_t> created{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 4; ++t) {
+    threads.emplace_back([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        std::unique_ptr<TrajectoryWriter> writer;
+        if (!(*client)
+                 ->NewTrajectoryWriter(
+                     TrajectoryWriter::Options{
+                         .chunker_options =
+                             std::make_shared<ConstantChunkerOptions>(1, 1)},
+                     &writer)
+                 .ok()) {
+          return;  // connection trouble; nothing left to hammer
+        }
+        created.fetch_add(1, std::memory_order_relaxed);
+        // ~TrajectoryWriter at scope end: dtor flush + Close + worker join.
+      }
+    });
+  }
+  absl::SleepFor(absl::Seconds(5));
+  stop.store(true, std::memory_order_relaxed);
+  for (auto& th : threads) th.join();
+  // Sanity: the loop really hammered (didn't instantly error out).
+  EXPECT_GT(created.load(), 100);
+  (*server)->Stop();
 }
 
 }  // namespace

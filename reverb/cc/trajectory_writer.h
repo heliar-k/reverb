@@ -507,11 +507,6 @@ class TrajectoryWriter : public ColumnWriter,
   // concurrent `Close` calls and creation of new streams.
   std::unique_ptr<grpc::ClientContext> context_ ABSL_GUARDED_BY(mu_);
 
-  // Creates `context_` and calls `RunStreamWorker` until `Close` called or
-  // until the stream returns a non transient error. In both cases
-  // `unrecoverable_status_` is populated before the thread is joinable.
-  std::unique_ptr<internal::Thread> stream_worker_;
-
   // Response received from the server. It is only accessed by the onReadDone.
   InsertStreamResponse response_;
 
@@ -526,6 +521,23 @@ class TrajectoryWriter : public ColumnWriter,
 
   // In case `stream_done_` == false, tha status of the terminated connection.
   absl::Status stream_status_ ABSL_GUARDED_BY(mu_);
+
+  // Creates `context_` and calls `RunStreamWorker` until `Close` called or
+  // until the stream returns a non transient error. In both cases
+  // `unrecoverable_status_` is populated before the thread is joinable.
+  //
+  // DECLARED LAST on purpose: the constructors' member-init for
+  // `stream_worker_` STARTS the worker thread, and members are initialized in
+  // declaration order — so every member the worker may touch must precede it.
+  // Previously `stream_worker_` sat before response_/write_inflight_/
+  // stream_done_/stream_ok_/stream_status_: under CPU contention the freshly
+  // spawned worker could be scheduled before the ctor finished those inits,
+  // read a garbage stream_ok_ (false), skip the data_cv_ wait and copy an
+  // UNCONSTRUCTED stream_status_ — dereferencing a wild StatusRep pointer
+  // (the shm_crash_test SIGSEGV, docs/ticket/shm-writer-worker-race-sigsegv.md).
+  // Bonus: destruction is reverse-order, so the worker is now also joined
+  // before any member it uses is destroyed.
+  std::unique_ptr<internal::Thread> stream_worker_;
 };
 
 class TrajectoryColumn {
