@@ -29,5 +29,13 @@
 
 **Blocked by**：None。
 
-- [ ] 决定：状态通道（改 proto/回调签名）或文档化语义
-- [ ] 若做状态通道：SHM + gRPC 两端测试「关闭时 pending insert → 客户端收到明确错误」
+- [x] 决定：状态通道（改 proto/回调签名）或文档化语义 → **已拍板：文档化语义**
+- [x] ~~若做状态通道：SHM + gRPC 两端测试~~（不选该分支，无需测试）
+
+## 结案记录（2026-07-31，文档化分支）
+
+用户拍板走文档化：语义已写入 [`concepts.md`](../guide/concepts.md) §3.5「写入耐久性」一节——
+`flush()` 成功 ≠ 已落表；关闭无状态通道；SHM 在 #1 修复后假成功窗口实质关闭
+（Stop 先 join dispatch 再停表，丢弃 ACK 发不出去，客户端拿连接错误）；唯一会
+「静默丢数据报成功」的是 gRPC server 主动 Close/重启场景；崩溃路径依赖超时/EOF
+检出。协议不改，`InsertCallback` 签名维持无 status 参数。

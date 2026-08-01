@@ -13,5 +13,6 @@
 | 2026-07-26 | Tier 3 协议层自适应压缩 | [tier3-adaptive-compression.md](tier3-adaptive-compression.md) | `TensorProto.uncompressed` 标志;`WorthCompressing` 采样探测(≥16KB 取首/中/尾 3×4KB 估压缩率,≥0.9 判不可压)跳过 snappy;解压侧分流免 proto 拷贝;shm 768KB float insert +83%、sample +42% |
 | 2026-07-31 | ShmServer ClientState 生命周期（UAF，并发评审 #1） | [shm-clientstate-lifetime.md](shm-clientstate-lifetime.md) | `Table::Stop()`=Close+join worker+drain callback executor;`clients_` 改 `shared_ptr<ClientState>`、insert/sample 回调捕获共享所有权;`ShmServer::Stop()` 先停表后清客户端;storm 回归测试 ASan 红绿验证（预改 0.4s 抓到 UAF）;`shm_sample_test` size→medium（预存在 Close-60s 竞态被 ASan 暴露） |
 | 2026-07-31 | dispatch 线程 HOL + Ring 写侧 liveness（并发评审 #3+#2） | [dispatch-thread-hol.md](dispatch-thread-hol.md)、[ring-write-liveness.md](ring-write-liveness.md) | checkpoint `Save` 移出 dispatch（专用 `TaskExecutor` + outbox 回传，`Stop()` 先 drain）;新增 `WriteBlocking`（`TryWrite` 轮询+EOF 探测+60s 上限）接入全部 10 个客户端写调用点;红绿验证：闩锁 checkpointer 断言次客户端 5s 内有响应（预改超时、修复 8ms） |
+| 2026-07-31 | 关闭时 insert 假 ACK 语义（并发评审 #5，文档化结案） | [table-close-insert-ack.md](table-close-insert-ack.md) | 拍板文档化不改协议;语义写入 [`concepts.md`](../guide/concepts.md) §3.5「写入耐久性」:#1 修复后 SHM 假成功窗口实质关闭，唯一假成功场景是 gRPC server 主动 Close/重启 |
 
 新增 ticket 时直接在本目录开新文件，结案后把一行总结追加到上表。

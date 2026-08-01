@@ -206,6 +206,14 @@ writer.flush()  # 或由 StructuredWriter 在退出时自动 flush
 
 > 历史遗留：`client.writer()` 返回一个更早的 `Writer` 对象，功能与 `TrajectoryWriter` 重叠但不支持轨迹构造。新代码请统一使用 `TrajectoryWriter`。`Writer` 已从 `ShmClient` 中移除。
 
+**写入耐久性：in-flight insert 与 server 关闭**。`flush()` 成功代表数据已送达 server 并入队，不代表已落表。若 server 在插入完成前关闭，在飞 insert 会被丢弃，且**没有**对客户端的状态通道（并发评审 #5，已拍板接受该语义、不改协议）。各传输的实际表现：
+
+- **SHM**：`Stop()` 先 join dispatch 再停表，丢弃产生的 ACK 永远发不出去，客户端实际拿到的是连接错误（可重试），不会假成功。
+- **gRPC**：server 主动 `Close()` 时表 worker 的关闭路径会对 pending insert 回调并上报**成功**——这是唯一会「静默丢数据报成功」的场景（典型于 server 重启）。
+- 崩溃路径（任何传输）本就无法通知，客户端依赖各自读侧超时/EOF 检出。
+
+要求严格不丢数据的应用：在 `server.stop()` 前确认 writer 已 `flush()` 且 server 消化完积压（`server_info()` 观察表尺寸/rate limiter 稳定），或靠 checkpoint 恢复。
+
 ### 3.6 Selector（选择策略）
 
 决定「取哪条」和「淘汰哪条」。所有 Selector 都可用于 `sampler` 或 `remover`。
