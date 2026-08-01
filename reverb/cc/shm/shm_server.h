@@ -154,7 +154,8 @@ class ShmServer {
  private:
   ShmServer(std::vector<std::shared_ptr<Table>> tables, std::string socket_path,
             ShmBytePool pool, ShmBootstrapServer bootstrap,
-            std::shared_ptr<Checkpointer> checkpointer);
+            std::shared_ptr<Checkpointer> checkpointer,
+            std::string name_token);
 
   // dispatch thread main loop
   void DispatchLoop();
@@ -277,6 +278,11 @@ class ShmServer {
   // add an ordered vector only if a test starts asserting table_info order.
   internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
   std::string socket_path_;
+  // ticket #7: socket path + per-server epoch, used as the token for all SHM
+  // segment names (pool + per-client rings). A crash-restarted server on the
+  // same socket path gets a fresh epoch, so it never collides with — and
+  // unlink-and-retries out from under — a live client's segments.
+  std::string name_token_;
   ShmBytePool pool_;
   ShmBootstrapServer bootstrap_;
   // ticket ⑪: optional, injected at Create. nullptr when the Python Server

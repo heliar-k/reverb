@@ -83,8 +83,10 @@ void InstallSignalHandlers() {
 ShmServer::ShmServer(std::vector<std::shared_ptr<Table>> tables,
                      std::string socket_path, ShmBytePool pool,
                      ShmBootstrapServer bootstrap,
-                     std::shared_ptr<Checkpointer> checkpointer)
+                     std::shared_ptr<Checkpointer> checkpointer,
+                     std::string name_token)
     : socket_path_(std::move(socket_path)),
+      name_token_(std::move(name_token)),
       pool_(std::move(pool)),
       bootstrap_(std::move(bootstrap)),
       checkpointer_(std::move(checkpointer)) {
@@ -121,13 +123,20 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
 
   // The pool name is derived from the socket path (unique per server
   // instance) — NOT the PID alone, which made a second in-process ShmServer
-  // unlink the first's live pool (scan #12).
-  std::string pool_name = MakePoolShmName(socket_path);
+  // unlink the first's live pool (scan #12). ticket #7: plus a per-server
+  // epoch (PID + boot nanos), so a crash-restarted server on the same socket
+  // path never names a segment a live client still has mapped (Create's
+  // EEXIST unlink-and-retry would orphan the client's writes). The client
+  // learns every name from Welcome, so only the server needs the formula.
+  std::string name_token = absl::StrCat(socket_path, "_", getpid(), "_",
+                                        absl::ToUnixNanos(absl::Now()));
+  std::string pool_name = MakePoolShmName(name_token);
   REVERB_ASSIGN_OR_RETURN(
       ShmBytePool pool, ShmBytePool::Create(pool_name));
   return absl::WrapUnique(
       new ShmServer(std::move(tables), socket_path, std::move(pool),
-                    std::move(bootstrap), std::move(checkpointer)));
+                    std::move(bootstrap), std::move(checkpointer),
+                    std::move(name_token)));
 }
 
 ShmServer::~ShmServer() { Stop(); }
@@ -198,11 +207,11 @@ void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
   if (unlink_rings) {
     // R6: unlink this client's FOUR ring segments so a restart doesn't see
     // stale segments (decision D: insert + sample pairs). Recompute the names
-    // (A3: keyed by server+client PID). The Ring destructor ALSO unlinks
-    // (owner_=true), but explicit unlink here is safe (second unlink is a
-    // harmless ENOENT) and makes the cleanup intent obvious at the disconnect
-    // site.
-    ShmSegmentNames names = MakeShmNames(socket_path_, state.client_pid);
+    // (A3: keyed by server token + client PID). The Ring destructor ALSO
+    // unlinks (owner_=true), but explicit unlink here is safe (second unlink
+    // is a harmless ENOENT) and makes the cleanup intent obvious at the
+    // disconnect site.
+    ShmSegmentNames names = MakeShmNames(name_token_, state.client_pid);
     shm_unlink(names.insert_c2s.c_str());
     shm_unlink(names.insert_s2c.c_str());
     shm_unlink(names.sample_c2s.c_str());
@@ -302,7 +311,7 @@ bool ShmServer::TryAccept() {
     return false;
   }
 
-  ShmSegmentNames names = MakeShmNames(socket_path_, client_pid);
+  ShmSegmentNames names = MakeShmNames(name_token_, client_pid);
   // Decision D: create FOUR rings per client — one SPSC pair for the insert
   // flow (TrajectoryWriter) and one for the sample flow (ShmSampler). Each
   // pair keeps the SPSC invariant intact (one client-thread producer per c2s)

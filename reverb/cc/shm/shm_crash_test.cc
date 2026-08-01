@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>  // opendir/readdir
 #include <functional>
 #include <future>
 #include <memory>
@@ -41,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <sys/mman.h>  // shm_open
+#include <sys/stat.h>  // fstat
 #include <sys/wait.h>  // waitpid
 #include <fcntl.h>
 #include <thread>
@@ -208,6 +210,37 @@ bool ShmSegmentExists(const std::string& name) {
   return false;
 }
 
+// The four ring names the server assigned this connection via Welcome. Ticket
+// #7: names carry a per-server epoch, so tests can no longer recompute them
+// from socket path + PID — read them off the connection instead.
+ShmSegmentNames NamesFromConn(const ShmConnection& conn) {
+  ShmSegmentNames names;
+  names.pool = conn.pool_shm_name;
+  names.insert_c2s = conn.insert_c2s.shm_name();
+  names.insert_s2c = conn.insert_s2c.shm_name();
+  names.sample_c2s = conn.sample_c2s.shm_name();
+  names.sample_s2c = conn.sample_s2c.shm_name();
+  return names;
+}
+
+// Count segments in /dev/shm whose name ends with `suffix`. For asserting a
+// forked CHILD's rings were reclaimed when the parent can't read the child's
+// connection (ticket #7: epoch-keyed names, matched here by `_<pid>` suffix).
+int CountShmSegmentsWithSuffix(const std::string& suffix) {
+  DIR* dir = opendir("/dev/shm");
+  if (dir == nullptr) return 0;
+  int n = 0;
+  while (dirent* e = readdir(dir)) {
+    std::string name = e->d_name;
+    if (name.size() >= suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      n++;
+    }
+  }
+  closedir(dir);
+  return n;
+}
+
 // Poll until `cond()` is true or `deadline` passes. The server's disconnect
 // detection happens on its dispatch thread, so the test must wait a few loop
 // iterations for HandleDisconnect to fire after the client fd closes.
@@ -332,9 +365,8 @@ TEST(ShmCrashTest, ClientFdCloseReclaimsOffsetsAndUnlinksRings) {
   // The client's liveness fd. Closing it is the crash signal (spec §8.8).
   ShmConnection* conn = (*client)->connection();
   ASSERT_GE(conn->control_fd, 0);
-  // Recompute this client's ring names to assert unlink later. The client sent
-  // getpid() as its PID; the server's PID is also getpid() (same process).
-  ShmSegmentNames names = MakeShmNames(sock, getpid());
+  // Read this client's ring names off the connection to assert unlink later.
+  ShmSegmentNames names = NamesFromConn(*conn);
   // Sanity: all four rings exist while the client is connected (decision D).
   ASSERT_TRUE(ShmSegmentExists(names.insert_c2s));
   ASSERT_TRUE(ShmSegmentExists(names.insert_s2c));
@@ -415,10 +447,11 @@ TEST(ShmCrashTest, RepeatedCrashDoesNotExhaustPool) {
     // Wait for the server to detect the disconnect. We can't observe
     // outstanding_offsets_ directly (private), but the next round's Connect
     // would fail/block if the server were wedged. Poll the ring unlink as the
-    // reclamation-completed signal: ring names are getpid()/getpid() each
-    // round (same process), so the server must unlink before the next round's
-    // Ring::Create(names.insert_c2s) can succeed with O_EXCL.
-    ShmSegmentNames names = MakeShmNames(sock, getpid());
+    // reclamation-completed signal: ring names are identical each round
+    // (same server epoch + same process PID), so the server must unlink
+    // before the next round's Ring::Create(names.insert_c2s) can succeed
+    // with O_EXCL.
+    ShmSegmentNames names = NamesFromConn(*conn);
     ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
                         absl::Seconds(5)))
         << "round " << i << ": server did not reclaim after crash";
@@ -481,11 +514,14 @@ TEST(ShmCrashTest, OtherClientUnaffectedByChildCrash) {
   ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "child did not sample successfully";
 
-  // Give the server a moment to detect the child's fd EOF + reclaim.
-  ShmSegmentNames child_names = MakeShmNames(sock, pid);
-  ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(child_names.insert_c2s); },
-                      absl::Seconds(5)))
-      << "server did not unlink crashed child's insert c2s ring";
+  // Give the server a moment to detect the child's fd EOF + reclaim. The
+  // parent can't read the child's connection, so match ring names by
+  // client-PID suffix (ticket #7: epoch-keyed names).
+  const std::string child_suffix = absl::StrCat("_", pid);
+  ASSERT_TRUE(
+      WaitFor([&] { return CountShmSegmentsWithSuffix(child_suffix) == 0; },
+              absl::Seconds(5)))
+      << "server did not unlink crashed child's rings";
 
   // The parent client must STILL be able to sample (unaffected by the crash).
   std::vector<TensorBuffer> data1;
@@ -776,14 +812,13 @@ TEST(ShmCrashTest, DisconnectWithInFlightCallbacksDoesNotUaf) {
   auto server = ShmServer::Create({table}, sock);
   REVERB_ASSERT_OK(server.status());
   REVERB_ASSERT_OK((*server)->Start());
-  // Ring names are getpid()-keyed (same process every round), so reclaim is
-  // observable via the unlink of this constant set of names.
-  ShmSegmentNames names = MakeShmNames(sock, getpid());
-
   for (int round = 0; round < kRounds; round++) {
     auto client = ShmClient::Connect(sock);
     REVERB_ASSERT_OK(client.status());
     ShmConnection* conn = (*client)->connection();
+    // Ring names are constant across rounds (same server epoch + same PID),
+    // so reclaim is observable via the unlink of this round's names.
+    ShmSegmentNames names = NamesFromConn(*conn);
 
     std::thread writer_thread([&] { InsertOneItemAsync(client->get()); });
     std::thread sampler_thread([&] { SampleOneItemAsync(client->get()); });
@@ -808,6 +843,54 @@ TEST(ShmCrashTest, DisconnectWithInFlightCallbacksDoesNotUaf) {
   // each dereferencing a ClientState erased rounds ago.
   (*server)->Stop();
   EXPECT_EQ(table->size(), 1);  // only the seeded item
+}
+
+// ── Server epoch in segment names (ticket #7) ──
+
+// A second ShmServer on the SAME socket path (crash-restart while the old
+// client's segments are still live) must NOT unlink-and-recreate them: the
+// old client would keep writing into an orphaned inode nobody reads (silent
+// data loss). Segment names carry a per-server epoch so names never collide.
+// Observable: fstat nlink on an already-open fd drops to 0 when the segment
+// is unlinked out from under us.
+TEST(ShmCrashTest, SecondServerSameSocketDoesNotClobberLiveSegments) {
+  std::string sock = "/tmp/reverb_shm_crash_" + UniqueTag("epoch") + ".sock";
+  auto s1 = ShmServer::Create({MakeTable()}, sock);
+  REVERB_ASSERT_OK(s1.status());
+  REVERB_ASSERT_OK((*s1)->Start());
+  auto c1 = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(c1.status());
+  ShmConnection* conn1 = (*c1)->connection();
+  const std::string pool1 = conn1->pool_shm_name;
+  const std::string ring1 = conn1->insert_c2s.shm_name();
+
+  int pool_fd = shm_open(pool1.c_str(), O_RDWR, 0600);
+  ASSERT_GE(pool_fd, 0);
+  int ring_fd = shm_open(ring1.c_str(), O_RDWR, 0600);
+  ASSERT_GE(ring_fd, 0);
+
+  // Second server on the same socket path; its client has the SAME PID
+  // (in-process), so without a server epoch every segment name collides.
+  auto s2 = ShmServer::Create({MakeTable()}, sock);
+  REVERB_ASSERT_OK(s2.status());
+  REVERB_ASSERT_OK((*s2)->Start());
+  auto c2 = ShmClient::Connect(sock);
+  REVERB_ASSERT_OK(c2.status());
+
+  struct stat st;
+  ASSERT_EQ(fstat(pool_fd, &st), 0);
+  EXPECT_EQ(st.st_nlink, 1) << "second server unlinked the live pool segment";
+  ASSERT_EQ(fstat(ring_fd, &st), 0);
+  EXPECT_EQ(st.st_nlink, 1) << "second server unlinked a live client ring";
+  EXPECT_NE((*c2)->connection()->pool_shm_name, pool1)
+      << "segment names carry no server epoch";
+  EXPECT_NE((*c2)->connection()->insert_c2s.shm_name(), ring1)
+      << "segment names carry no server epoch";
+
+  close(pool_fd);
+  close(ring_fd);
+  (*s2)->Stop();
+  (*s1)->Stop();
 }
 
 }  // namespace

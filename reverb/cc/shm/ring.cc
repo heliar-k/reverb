@@ -165,6 +165,20 @@ absl::StatusOr<Ring> Ring::Open(std::string shm_name) {
     return absl::InternalError(
         absl::StrCat("bad ring magic in ", shm_name));
   }
+  // ticket #7: don't trust in-segment geometry from a stale/corrupt segment.
+  // Version mismatch must be an error, not a reinterpret under new layout.
+  if (hdr.version != kRingVersion) {
+    close(fd);
+    return absl::InternalError(absl::StrCat(
+        "unsupported ring version ", hdr.version, " in ", shm_name,
+        " (expected ", kRingVersion, ")"));
+  }
+  if (hdr.capacity == 0 || (hdr.capacity & (hdr.capacity - 1)) != 0 ||
+      hdr.slot_size <= sizeof(SlotHeader)) {
+    close(fd);
+    return absl::InternalError(
+        absl::StrCat("bad ring geometry in ", shm_name));
+  }
 
   size_t total = TotalBytes(hdr.capacity, hdr.slot_size);
   void* base =
@@ -284,6 +298,11 @@ absl::Status Ring::Read(MsgType* msg_type, std::string* payload) {
   payload->clear();
   size_t i = 0;
   while (true) {
+    // ticket #7: a corrupt segment can carry an out-of-range body_len; reject
+    // instead of reading past the slot (the red test segfaulted here).
+    if (s->body_len > SlotBodyCap()) {
+      return absl::InternalError("ring slot body_len out of range");
+    }
     payload->append(SlotBody(s), s->body_len);
     if (!(s->flags & kFlagHasContinuation)) break;
     i++;

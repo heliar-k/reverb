@@ -61,12 +61,14 @@ class ShmBootstrapServer {
 };
 
 // A3/D-format SHM segment names for one (server, client) pair. The server owns
-// generation (spec A3). `server_token` is the server's udsocket path (already
-// unique per server instance); it is sanitized (non-alnum -> '_') so the names
-// are valid POSIX shm names. Keying by socket path — NOT by server PID — is
-// what lets two ShmServers coexist in one process: PID-keyed names made the
-// second server's Create unlink the FIRST server's live segments (scan #12).
-// Decision D splits the control rings into a per-flow SPSC pair.
+// generation (spec A3). `server_token` is the server's udsocket path PLUS a
+// per-server epoch (ticket #7: PID + boot nanos), sanitized (non-alnum -> '_')
+// so the names are valid POSIX shm names. Keying by socket path — NOT by
+// server PID alone — is what lets two ShmServers coexist in one process
+// (scan #12); the epoch keeps a crash-RESTARTED server on the same socket
+// path from colliding with a live client's segments. Clients learn the names
+// from Welcome and never need the formula. Decision D splits the control
+// rings into a per-flow SPSC pair.
 //   /reverb_shm_pool_<token>
 //   /reverb_shm_insert_c2s_<token>_<client_pid>
 //   /reverb_shm_insert_s2c_<token>_<client_pid>

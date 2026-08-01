@@ -15,5 +15,6 @@
 | 2026-07-31 | dispatch 线程 HOL + Ring 写侧 liveness（并发评审 #3+#2） | [dispatch-thread-hol.md](dispatch-thread-hol.md)、[ring-write-liveness.md](ring-write-liveness.md) | checkpoint `Save` 移出 dispatch（专用 `TaskExecutor` + outbox 回传，`Stop()` 先 drain）;新增 `WriteBlocking`（`TryWrite` 轮询+EOF 探测+60s 上限）接入全部 10 个客户端写调用点;红绿验证：闩锁 checkpointer 断言次客户端 5s 内有响应（预改超时、修复 8ms） |
 | 2026-07-31 | 关闭时 insert 假 ACK 语义（并发评审 #5，文档化结案） | [table-close-insert-ack.md](table-close-insert-ack.md) | 拍板文档化不改协议;语义写入 [`concepts.md`](../guide/concepts.md) §3.5「写入耐久性」:#1 修复后 SHM 假成功窗口实质关闭，唯一假成功场景是 gRPC server 主动 Close/重启 |
 | 2026-07-31 | DeleteItem 错误路径部分修改（并发评审 #6） | [table-deleteitem-partial-mutation.md](table-deleteitem-partial-mutation.md) | `DeleteItem` 改两阶段（先全量校验 `episode_id` 再递减），失败不再留下部分修改的 `episode_refs_`;`TableTestPeer` 注入不一致状态做红绿验证（公开 API 不可达） |
+| 2026-07-31 | Ring Open/Read 防御性校验缺口（并发评审 #7） | [ring-open-defensive-gaps.md](ring-open-defensive-gaps.md) | Open 补 version/几何校验（`RingHeader.version` 早已存在，只补校验）;Read 校验 `body_len`（旧代码红测直接 SIGSEGV）;EEXIST 根治 = 段名折入 server epoch（socket+pid+boot_nanos），同 socket 重启不再 unlink 活段，协议无破坏（段名本就走 Welcome 下发） |
 
 新增 ticket 时直接在本目录开新文件，结案后把一行总结追加到上表。

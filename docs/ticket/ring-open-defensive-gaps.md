@@ -32,6 +32,35 @@
 
 **Blocked by**：None — 低优先级加固。
 
-- [ ] `RingHeader` 版本字段 + Open 几何校验（2 的幂 / slot_size 下限）
-- [ ] EEXIST 路径不再盲目 unlink（校验后打开或确认归属）
-- [ ] Read 校验 `body_len`
+- [x] `RingHeader` 版本字段 + Open 几何校验（2 的幂 / slot_size 下限）
+- [x] EEXIST 路径不再盲目 unlink（校验后打开或确认归属）
+- [x] Read 校验 `body_len`
+
+## 修复记录（2026-07-31，已完成）
+
+三项一起做完（红测先行，均确定性复现，无时序竞态）：
+
+1. **Open 校验**（ring.cc）：`version != kRingVersion` 报错；`capacity` 非 2 幂 / `slot_size
+   <= sizeof(SlotHeader)` 报错。注：`RingHeader.version` 字段早已存在（Create 侧已写入），
+   本票只补 Open 侧校验，无 header 布局变更。
+2. **EEXIST 根治 = 段名加 server epoch**：`ShmServer::Create` 生成
+   `name_token = <socket_path>_<pid>_<boot_nanos>`，pool 与四条 ring 名全部折进该 token
+   （`MakeShmNames`/`MakePoolShmName` 签名不变）。客户端段名本就从 Welcome 下发
+   （shm_client.cc 不自己算名），故**协议无破坏**——只有服务端命名变化。碰撞消失后
+   `Ring::Create`/`ShmBytePool::Create` 里的 unlink-and-retry 实际成为死代码（保留作防御）。
+   权衡：崩溃残留段不再被重启清理（tmpfs 少量泄漏，重启自清）；刻意不加启动扫描清理——
+   两活 server 同 socket 的误配置场景下扫描会误删对方活段，违背本票初衷。
+3. **Read 校验 `body_len > SlotBodyCap()`**（覆盖首槽与 continuation 槽，一处 guard）。
+
+**复现教训**：
+
+- 红测全部免时序：Open/Read 用手搓坏 header/slot（`PokeSegment`：shm_open+mmap 第三映射
+  写字段）；body_len 红测在旧代码下直接 **SIGSEGV**（段外读），证明越界读风险真实。
+- epoch 红测用「同 socket_path 起第二个 server + 同进程同 PID 客户端」：旧代码下第二个
+  server 的 Create 把活 pool/ring unlink 到 nlink=0（fstat 观测），段名逐字节相等；修复后
+  nlink 保持 1 且段名相异。测试在 `shm_crash_test.cc`
+  （`SecondServerSameSocketDoesNotClobberLiveSegments`）。
+- 手算段名的既有断言改为从连接读名（`NamesFromConn`）；fork 子进程场景父进程读不到子
+  连接，改用 /dev/shm 按 `_<pid>` 后缀计数（`CountShmSegmentsWithSuffix`）。
+- `docs/spec/numpy-shm-spec.md`、`docs/design/numpy-shm-design.md` 中的段名公式早已落后于
+  scan #12（socket token），本次 epoch 后更旧；以 `bootstrap.h` 注释为准，未同步改文档。

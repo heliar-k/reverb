@@ -14,9 +14,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
+#include <functional>
 #include <sched.h>
 #include <string>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -55,6 +59,19 @@ std::string UniqueName(const std::string& tag) {
   return "/reverb_shm_ring_test_" + tag + "_" +
          std::to_string(getpid()) + "_" +
          std::to_string(reinterpret_cast<uintptr_t>(&tag));
+}
+
+// Map the existing segment `name` and run `fn` on its raw bytes, to simulate
+// a corrupted/stale segment (ticket #7: Open/Read defensive validation).
+void PokeSegment(const std::string& name, size_t len,
+                 std::function<void(char*)> fn) {
+  int fd = shm_open(name.c_str(), O_RDWR, 0600);
+  ASSERT_GE(fd, 0);
+  void* base = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  ASSERT_NE(base, MAP_FAILED);
+  fn(static_cast<char*>(base));
+  munmap(base, len);
 }
 
 // Fills `ring` with 1-slot messages until TryWrite reports RING_FULL, so a
@@ -387,6 +404,62 @@ TEST(RingTest, TwoRingsSameSegment) {
   REVERB_ASSERT_OK(client.Read(&type, &out));
   EXPECT_EQ(type, SAMPLE);
   EXPECT_EQ(out, payload);
+}
+
+TEST(RingTest, OpenRejectsBadVersion) {
+  auto name = UniqueName("badver");
+  auto s = Ring::Create(name, 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring server = std::move(s).value();
+  PokeSegment(name, Ring::TotalBytes(16, 256), [](char* base) {
+    reinterpret_cast<RingHeader*>(base)->version = 999;
+  });
+  auto c = Ring::Open(name);
+  ASSERT_FALSE(c.ok());
+  EXPECT_THAT(std::string(c.status().message()), HasSubstr("version"));
+}
+
+TEST(RingTest, OpenRejectsBadGeometry) {
+  // Capacity not a power of two (Create's own checks are :90-94; Open must
+  // not trust in-segment geometry from a stale/corrupt segment either).
+  auto n1 = UniqueName("badgeo_cap");
+  auto s1 = Ring::Create(n1, 16, 256);
+  REVERB_ASSERT_OK(s1.status());
+  Ring r1 = std::move(s1).value();
+  PokeSegment(n1, Ring::TotalBytes(16, 256), [](char* base) {
+    reinterpret_cast<RingHeader*>(base)->capacity = 12;
+  });
+  EXPECT_FALSE(Ring::Open(n1).ok());
+
+  // slot_size too small to hold even a SlotHeader.
+  auto n2 = UniqueName("badgeo_slot");
+  auto s2 = Ring::Create(n2, 16, 256);
+  REVERB_ASSERT_OK(s2.status());
+  Ring r2 = std::move(s2).value();
+  PokeSegment(n2, Ring::TotalBytes(16, 256), [](char* base) {
+    reinterpret_cast<RingHeader*>(base)->slot_size = 8;
+  });
+  EXPECT_FALSE(Ring::Open(n2).ok());
+}
+
+TEST(RingTest, ReadRejectsCorruptBodyLen) {
+  auto name = UniqueName("badlen");
+  auto s = Ring::Create(name, 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  std::string payload = "abc";
+  REVERB_ASSERT_OK(ring.Write(HELLO, absl::MakeSpan(payload)));
+  // head/tail start at 1, so the first message lives in slot index 1.
+  PokeSegment(name, Ring::TotalBytes(16, 256), [](char* base) {
+    auto* slot =
+        reinterpret_cast<SlotHeader*>(base + sizeof(RingHeader) + 256);
+    slot->body_len = 0xFFFFFFFF;  // way beyond slot_size - sizeof(SlotHeader)
+  });
+  MsgType type;
+  std::string out;
+  absl::Status st = ring.Read(&type, &out);
+  ASSERT_FALSE(st.ok());
+  EXPECT_THAT(std::string(st.message()), HasSubstr("body_len"));
 }
 
 }  // namespace
