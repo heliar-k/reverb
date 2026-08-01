@@ -31,6 +31,21 @@
 
 **Blocked by**：None — 可与 #3 并行；#2 依赖 #3 的场景仅在复现测试中需要。
 
-- [ ] `Ring::Write` 增加带 control_fd + deadline 的变体（或参数化），超时返回明确错误
-- [ ] 三个写调用点接入 liveness 检查
-- [ ] 回归测试：关闭服务端 fd 后写侧在 ≤60s 内返回错误而非永久自旋
+- [x] `Ring::Write` 增加带 control_fd + deadline 的变体（或参数化），超时返回明确错误
+- [x] 三个写调用点接入 liveness 检查
+- [x] 回归测试：关闭服务端 fd 后写侧在 ≤60s 内返回错误而非永久自旋
+
+## 修复记录（2026-07-31，已完成，选方案 1 的 helper 形态）
+
+未改 `Ring` 本体（镜像读侧设计：阻塞策略是调用方职责）。新增
+`shm_connection.{h,cc}` 的 `WriteBlocking`（`TryWrite` 轮询 + `IsPeerClosed(control_fd)`
+EOF 探测 + `kWriteBlockingHardCap`=60s 上限；EOF→UnavailableError，超时→
+DeadlineExceededError，镜像读侧 `ReadBlocking`/`kReadBlockingHardCap`）。10 个写调用点
+全部接入：trajectory_writer.cc ×7（ALLOCATE/INSERT/5×RELEASE）、shm_client.cc ×3
+（SendInsertFlowRequest、FetchOne SAMPLE、sample RELEASE）。服务端 S→C 本来就是
+TryWrite+outbox，无需动。
+
+回归测试在 `reverb/cc/shm/ring_test.cc`：socketpair 扮演 control_fd 的确定性 EOF
+（关对端 → UnavailableError 快速返回）+ 满 ring 上 200ms 短超时 →
+DeadlineExceededError。集成级 EOF 由既有 `ClientFailsFastWhenServerStops`（读侧）与
+crash 套件覆盖。

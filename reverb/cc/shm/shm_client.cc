@@ -112,7 +112,7 @@ absl::Status SendInsertFlowRequest(ShmConnection* conn, const Req& request,
 
   absl::MutexLock lock(&conn->insert_flow_mu);
   REVERB_RETURN_IF_ERROR(
-      conn->insert_c2s.Write(req_type, absl::MakeSpan(body)));
+      WriteBlocking(&conn->insert_c2s, req_type, absl::MakeSpan(body), conn->control_fd));
 
   MsgType resp_type;
   std::string resp_body;
@@ -275,7 +275,7 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
   std::string req_body;
   req.SerializeToString(&req_body);
   REVERB_RETURN_IF_ERROR(
-      conn_->sample_c2s.Write(SAMPLE, absl::MakeSpan(req_body)));
+      WriteBlocking(&conn_->sample_c2s, SAMPLE, absl::MakeSpan(req_body), conn_->control_fd));
 
   // 2. Poll the sample S→C ring for the response. A server-side timeout comes
   //    back as ERROR with DEADLINE_EXCEEDED; surface it so the worker/sampler
@@ -367,7 +367,7 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
   std::string rel_body;
   rel.SerializeToString(&rel_body);
   REVERB_RETURN_IF_ERROR(
-      conn_->sample_c2s.Write(RELEASE, absl::MakeSpan(rel_body)));
+      WriteBlocking(&conn_->sample_c2s, RELEASE, absl::MakeSpan(rel_body), conn_->control_fd));
 
   return sample;
 }

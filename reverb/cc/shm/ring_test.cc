@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
 #include <chrono>
 #include <sched.h>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "reverb/cc/platform/default/status_matchers.h"
 #include "reverb/cc/shm/ring.h"
+#include "reverb/cc/shm/shm_connection.h"
 #include "reverb/cc/shm/shm_protocol.pb.h"
 
 namespace deepmind {
@@ -50,6 +55,66 @@ std::string UniqueName(const std::string& tag) {
   return "/reverb_shm_ring_test_" + tag + "_" +
          std::to_string(getpid()) + "_" +
          std::to_string(reinterpret_cast<uintptr_t>(&tag));
+}
+
+// Fills `ring` with 1-slot messages until TryWrite reports RING_FULL, so a
+// subsequent WriteBlocking has to WAIT (the only situation where its
+// liveness/deadline checks run).
+void FillRing(Ring* ring) {
+  std::string payload = "x";
+  while (true) {
+    absl::Status s = ring->TryWrite(SAMPLE, absl::MakeSpan(payload));
+    if (absl::IsResourceExhausted(s)) return;
+    REVERB_ASSERT_OK(s);
+  }
+}
+
+// review #2: WriteBlocking must fail fast when the peer dies mid-wait,
+// instead of spinning on sched_yield forever (the old Ring::Write behaviour
+// — 100% CPU hang with a wedged/dead server). Deterministic EOF: a
+// socketpair plays the control_fd role, closing the peer end is the
+// liveness signal.
+TEST(RingTest, WriteBlockingFailsFastOnPeerDeath) {
+  auto s = Ring::Create(UniqueName("wb_eof"), 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  FillRing(&ring);
+
+  int fds[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  std::string payload = "y";
+  std::atomic<absl::StatusCode> result{absl::StatusCode::kOk};
+  std::thread writer([&] {
+    result.store(
+        WriteBlocking(&ring, SAMPLE, absl::MakeSpan(payload), fds[0],
+                      absl::Seconds(30))
+            .code());
+  });
+  // Let the writer settle into the wait loop (ring is full).
+  absl::SleepFor(absl::Milliseconds(100));
+  close(fds[1]);  // peer death -> IsPeerClosed(fds[0]) sees EOF
+  writer.join();
+  close(fds[0]);
+  EXPECT_EQ(result.load(), absl::StatusCode::kUnavailable);
+}
+
+// review #2: with no liveness signal (control_fd=-1) and a peer that never
+// reads, WriteBlocking must still give up at the deadline instead of
+// spinning forever.
+TEST(RingTest, WriteBlockingRespectsDeadline) {
+  auto s = Ring::Create(UniqueName("wb_cap"), 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  FillRing(&ring);
+
+  std::string payload = "y";
+  absl::Time start = absl::Now();
+  absl::Status st = WriteBlocking(&ring, SAMPLE, absl::MakeSpan(payload),
+                                  /*control_fd=*/-1,
+                                  absl::Milliseconds(200));
+  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded);
+  EXPECT_LT(absl::Now() - start, absl::Seconds(5))
+      << "WriteBlocking overshot its 200ms deadline";
 }
 
 TEST(RingTest, SingleSlotWriteRead) {

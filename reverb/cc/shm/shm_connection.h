@@ -18,7 +18,9 @@
 #include <string>
 #include <utility>
 
+#include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "reverb/cc/shm/byte_pool.h"
 #include "reverb/cc/shm/ring.h"
 
@@ -34,6 +36,23 @@ namespace shm {
 //     spinning forever.
 // fd < 0 (no fd, e.g. moved-from / server side) => false (nothing to probe).
 bool IsPeerClosed(int fd);
+
+// review #2 (ring-write-liveness): blocking-write helper mirroring the read
+// side's ReadBlocking. Polls TryWrite with sched_yield until space is free;
+// each pass probes `control_fd` for peer death (UnavailableError) and gives
+// up at `timeout` (DeadlineExceededError). Without this, Ring::Write's bare
+// sched_yield loop spins FOREVER at 100% CPU when the server's dispatch
+// thread is wedged (e.g. a slow checkpoint, review #3) or dead — hanging
+// TrajectoryWriter::Close()/GC with no error surfaced.
+//
+// `timeout` defaults to 60s, mirroring the read side's kReadBlockingHardCap:
+// a robustness ceiling, not a semantic deadline — callers treat it as a
+// transport error. control_fd < 0 disables the liveness probe (deadline
+// still applies).
+constexpr absl::Duration kWriteBlockingHardCap = absl::Seconds(60);
+absl::Status WriteBlocking(Ring* ring, MsgType msg_type,
+                           absl::Span<const char> payload, int control_fd,
+                           absl::Duration timeout = kWriteBlockingHardCap);
 
 // The SPSC rings wired between a server and one client, plus the shared
 // byte pool. Decision D (per-flow rings): there are TWO ring PAIRS, one for

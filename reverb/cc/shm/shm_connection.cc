@@ -15,12 +15,31 @@
 #include "reverb/cc/shm/shm_connection.h"
 
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>  // recv, MSG_PEEK
 #include <unistd.h>
 
 namespace deepmind {
 namespace reverb {
 namespace shm {
+
+absl::Status WriteBlocking(Ring* ring, MsgType msg_type,
+                           absl::Span<const char> payload, int control_fd,
+                           absl::Duration timeout) {
+  absl::Time deadline = absl::Now() + timeout;
+  while (true) {
+    absl::Status s = ring->TryWrite(msg_type, payload);
+    if (s.ok()) return absl::OkStatus();
+    if (!absl::IsResourceExhausted(s)) return s;  // permanent error, no retry
+    if (control_fd >= 0 && IsPeerClosed(control_fd)) {
+      return absl::UnavailableError("SHM peer closed connection");
+    }
+    if (absl::Now() >= deadline) {
+      return absl::DeadlineExceededError("SHM ring write timed out");
+    }
+    sched_yield();
+  }
+}
 
 bool IsPeerClosed(int fd) {
   if (fd < 0) return false;

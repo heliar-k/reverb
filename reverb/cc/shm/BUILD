@@ -40,9 +40,11 @@ reverb_cc_test(
     srcs = ["ring_test.cc"],
     deps = [
         ":ring",
+        ":shm_connection",
         ":shm_protocol_cc_proto",
         "//reverb/cc/platform/default:status_matchers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
@@ -185,6 +187,7 @@ reverb_cc_library(
         "//reverb/cc/platform/default:hash_set",
         "//reverb/cc/platform/default:logging",
         "//reverb/cc/platform/default:status_macros",
+        "//reverb/cc/support:task_executor",
         "//reverb/cc/support:tensor_proxy",
         "//reverb/cc/support:trajectory_util",
         "//third_party/reverb_tensor:reverb_tensor_cc_proto",
@@ -330,6 +333,28 @@ reverb_cc_test(
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# ---- Checkpoint offload test (review #3: dispatch HOL) ----
+
+reverb_cc_test(
+    name = "shm_checkpoint_test",
+    srcs = ["shm_checkpoint_test.cc"],
+    deps = [
+        ":shm_client",
+        ":shm_server",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc/checkpointing:interface",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
+        "//reverb/cc/selectors:fifo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",

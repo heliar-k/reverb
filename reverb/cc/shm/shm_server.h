@@ -35,6 +35,7 @@
 #include "reverb/cc/shm/ring.h"
 #include "reverb/cc/shm/shm_connection.h"
 #include "reverb/cc/shm/shm_protocol.pb.h"
+#include "reverb/cc/support/task_executor.h"
 #include "reverb/cc/table.h"
 
 namespace deepmind {
@@ -224,7 +225,13 @@ class ShmServer {
   // the path in CheckpointResponse (CHECKPOINT_RESP on the insert s2c flow).
   // No checkpointer -> FailedPreconditionError as ShmError::INTERNAL (mirrors
   // InProcessClient). Checkpoint is cross-table, so no FindTable routing.
-  absl::Status HandleCheckpoint(ClientState& state);
+  // review #3 (dispatch-thread-hol): Save is UNBOUNDED disk I/O and must not
+  // run on the single dispatch thread — it is scheduled on
+  // checkpoint_executor_ and the response rides back via the client's
+  // insert_outbox (the callback→dispatch-drain pattern, same as async
+  // inserts). shared_ptr param keeps the ClientState alive through the
+  // out-of-band response (review #1 pattern).
+  absl::Status HandleCheckpoint(std::shared_ptr<ClientState> state);
 
   // ticket ⑧ step 2: on-demand server_info round-trip. Gathers each table's
   // live TableInfo (current_size, signature, etc.) into a ServerInfoResponse
@@ -285,6 +292,13 @@ class ShmServer {
 
   std::thread dispatch_thread_;
   std::atomic<bool> running_{false};
+
+  // review #3: single-thread executor for checkpoint Saves — keeps unbounded
+  // disk I/O off the dispatch thread. Declared after tables_/clients_ so it
+  // is destroyed BEFORE them (its queued tasks reference both). Closed
+  // (drained + joined) in Stop() before tables stop; ~TaskExecutor re-enters
+  // Close() safely.
+  TaskExecutor checkpoint_executor_{1, "ShmCheckpointExecutor"};
 };
 
 }  // namespace shm

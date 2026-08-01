@@ -145,6 +145,12 @@ void ShmServer::Stop() {
   if (!running_.exchange(false)) return;
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
 
+  // review #3: drain + join the checkpoint executor before stopping tables —
+  // a Save still in flight reads tables_ and stashes its response into a
+  // (still-alive) ClientState's outbox. TaskExecutor::Close runs pending
+  // tasks on this thread and joins the executor.
+  checkpoint_executor_.Close();
+
   // review #1 (shm-clientstate-lifetime): stop tables BEFORE touching
   // clients_. Table workers + callback executors fire insert/sample
   // completion callbacks that dereference ClientState; Table::Stop() (Close
@@ -470,7 +476,10 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
         // ticket ⑪: checkpoint rides the insert flow like ⑩'s control-plane
         // ops. CheckpointRequest is empty; HandleCheckpoint returns the path
         // in CHECKPOINT_RESP (or ShmError on failure).
-        auto st = HandleCheckpoint(state);
+        // review #3: HandleCheckpoint only SCHEDULES the Save (on
+        // checkpoint_executor_) and returns immediately — the response comes
+        // back out-of-band via the client's insert_outbox.
+        auto st = HandleCheckpoint(clients_[client_id]);
         if (!st.ok()) {
           REVERB_LOG(REVERB_WARNING)
               << "ShmServer: HandleCheckpoint failed for client " << client_id
@@ -1022,7 +1031,7 @@ absl::Status ShmServer::HandleReset(ClientState& state,
   return EnqueueInsertS2C(state, RESET_ACK, "");  // empty ack
 }
 
-absl::Status ShmServer::HandleCheckpoint(ClientState& state) {
+absl::Status ShmServer::HandleCheckpoint(std::shared_ptr<ClientState> state) {
   // ticket ⑪: cross-table checkpoint, mirroring InProcessClient::Checkpoint /
   // ReverbServiceImpl::Checkpoint. No checkpointer -> FailedPreconditionError
   // surfaced as ShmError::INTERNAL (the ShmError::Code enum has no
@@ -1035,28 +1044,39 @@ absl::Status ShmServer::HandleCheckpoint(ClientState& state) {
     err.set_message("ShmServer: no checkpointer provided");
     std::string body;
     err.SerializeToString(&body);
-    return EnqueueInsertS2C(state, ERROR, body);
+    return EnqueueInsertS2C(*state, ERROR, body);
   }
-  std::vector<Table*> raw_tables;
-  raw_tables.reserve(tables_.size());
-  for (auto& [_, table] : tables_) {
-    raw_tables.push_back(table.get());
-  }
-  CheckpointResponse resp;
-  absl::Status s =
-      checkpointer_->Save(std::move(raw_tables), /*keep_latest=*/1,
-                           resp.mutable_checkpoint_path());
-  if (!s.ok()) {
-    ShmError err;
-    err.set_code(ShmError::INTERNAL);
-    err.set_message(std::string(s.message()));
+  // review #3: Save is unbounded disk I/O — schedule it on the checkpoint
+  // executor and return immediately so a slow checkpoint never
+  // head-of-line-blocks the dispatch thread. The response is stashed in the
+  // client's insert_outbox (mutex-protected, off-dispatch-thread safe — the
+  // same callback→drain pattern as async insert ACKs) and flushed next pass.
+  checkpoint_executor_.Schedule([this, state] {
+    std::vector<Table*> raw_tables;
+    raw_tables.reserve(tables_.size());
+    for (auto& [_, table] : tables_) {
+      raw_tables.push_back(table.get());
+    }
+    CheckpointResponse resp;
+    absl::Status s =
+        checkpointer_->Save(std::move(raw_tables), /*keep_latest=*/1,
+                            resp.mutable_checkpoint_path());
+    uint16_t type;
     std::string body;
-    err.SerializeToString(&body);
-    return EnqueueInsertS2C(state, ERROR, body);
-  }
-  std::string body;
-  resp.SerializeToString(&body);
-  return EnqueueInsertS2C(state, CHECKPOINT_RESP, body);
+    if (s.ok()) {
+      type = static_cast<uint16_t>(CHECKPOINT_RESP);
+      resp.SerializeToString(&body);
+    } else {
+      type = static_cast<uint16_t>(ERROR);
+      ShmError err;
+      err.set_code(ShmError::INTERNAL);
+      err.set_message(std::string(s.message()));
+      err.SerializeToString(&body);
+    }
+    absl::MutexLock lock(&state->insert_outbox_mu);
+    state->insert_outbox.emplace_back(type, std::move(body));
+  });
+  return absl::OkStatus();
 }
 
 absl::Status ShmServer::HandleServerInfo(ClientState& state) {

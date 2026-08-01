@@ -1009,8 +1009,9 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       areq.set_num_bytes(num_bytes);
       std::string areq_body;
       areq.SerializeToString(&areq_body);
-      absl::Status ws = shm_conn_->insert_c2s.Write(ALLOCATE,
-                                             absl::MakeSpan(areq_body));
+      absl::Status ws = WriteBlocking(&shm_conn_->insert_c2s, ALLOCATE,
+                                      absl::MakeSpan(areq_body),
+                                      shm_conn_->control_fd);
       if (!ws.ok()) {
         fail_alloc(ws);
         break;
@@ -1089,7 +1090,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
         for (uint64_t off : chunk_offsets) rel.add_offsets(off);
         std::string rel_body;
         rel.SerializeToString(&rel_body);
-        (void)shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+        (void)WriteBlocking(&shm_conn_->insert_c2s, RELEASE, absl::MakeSpan(rel_body), shm_conn_->control_fd);
       }
       return unrecoverable_status_;
     }
@@ -1112,7 +1113,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     // Send INSERT (blocks if the C→S ring is full — natural backpressure).
     std::string req_body;
     req.SerializeToString(&req_body);
-    absl::Status is = shm_conn_->insert_c2s.Write(INSERT, absl::MakeSpan(req_body));
+    absl::Status is = WriteBlocking(&shm_conn_->insert_c2s, INSERT, absl::MakeSpan(req_body), shm_conn_->control_fd);
     if (!is.ok()) {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);
@@ -1125,7 +1126,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       for (uint64_t off : chunk_offsets) rel.add_offsets(off);
       std::string rel_body;
       rel.SerializeToString(&rel_body);
-      (void)shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      (void)WriteBlocking(&shm_conn_->insert_c2s, RELEASE, absl::MakeSpan(rel_body), shm_conn_->control_fd);
       return is;
     }
 
@@ -1152,7 +1153,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       for (uint64_t off : chunk_offsets) rel.add_offsets(off);
       std::string rel_body;
       rel.SerializeToString(&rel_body);
-      (void)shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      (void)WriteBlocking(&shm_conn_->insert_c2s, RELEASE, absl::MakeSpan(rel_body), shm_conn_->control_fd);
       // ticket ⑨: map ShmError codes to the same absl statuses as FetchOne so
       // an unknown-table insert surfaces as NotFoundError (not a generic
       // InternalError). Falls back to InternalError for unknown codes.
@@ -1221,7 +1222,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       for (uint64_t off : chunk_offsets) rel.add_offsets(off);
       std::string rel_body;
       rel.SerializeToString(&rel_body);
-      (void)shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+      (void)WriteBlocking(&shm_conn_->insert_c2s, RELEASE, absl::MakeSpan(rel_body), shm_conn_->control_fd);
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);
       stream_status_ = absl::NotFoundError(absl::StrCat(
@@ -1254,7 +1255,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     for (uint64_t off : chunk_offsets) rel.add_offsets(off);
     std::string rel_body;
     rel.SerializeToString(&rel_body);
-    absl::Status rs = shm_conn_->insert_c2s.Write(RELEASE, absl::MakeSpan(rel_body));
+    absl::Status rs = WriteBlocking(&shm_conn_->insert_c2s, RELEASE, absl::MakeSpan(rel_body), shm_conn_->control_fd);
     if (!rs.ok()) {
       // Non-fatal for data integrity (the server tracks outstanding offsets
       // and reclaims on disconnect, ⑥); but log via unrecoverable_status_ so
