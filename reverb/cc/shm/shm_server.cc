@@ -124,7 +124,7 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
   // The pool name is derived from the socket path (unique per server
   // instance) — NOT the PID alone, which made a second in-process ShmServer
   // unlink the first's live pool (scan #12). ticket #7: plus a per-server
-  // epoch (PID + boot nanos), so a crash-restarted server on the same socket
+  // epoch (PID + wall-clock nanos), so a crash-restarted server on the same socket
   // path never names a segment a live client still has mapped (Create's
   // EEXIST unlink-and-retry would orphan the client's writes). The client
   // learns every name from Welcome, so only the server needs the formula.

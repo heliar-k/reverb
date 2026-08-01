@@ -420,8 +420,9 @@ TEST(RingTest, OpenRejectsBadVersion) {
 }
 
 TEST(RingTest, OpenRejectsBadGeometry) {
-  // Capacity not a power of two (Create's own checks are :90-94; Open must
-  // not trust in-segment geometry from a stale/corrupt segment either).
+  // Capacity not a power of two (Ring::Create rejects the same geometry;
+  // Open must not trust in-segment geometry from a stale/corrupt segment
+  // either).
   auto n1 = UniqueName("badgeo_cap");
   auto s1 = Ring::Create(n1, 16, 256);
   REVERB_ASSERT_OK(s1.status());

@@ -44,12 +44,16 @@
    <= sizeof(SlotHeader)` 报错。注：`RingHeader.version` 字段早已存在（Create 侧已写入），
    本票只补 Open 侧校验，无 header 布局变更。
 2. **EEXIST 根治 = 段名加 server epoch**：`ShmServer::Create` 生成
-   `name_token = <socket_path>_<pid>_<boot_nanos>`，pool 与四条 ring 名全部折进该 token
+   `name_token = <socket_path>_<pid>_<墙上时钟纳秒>`，pool 与四条 ring 名全部折进该 token
    （`MakeShmNames`/`MakePoolShmName` 签名不变）。客户端段名本就从 Welcome 下发
    （shm_client.cc 不自己算名），故**协议无破坏**——只有服务端命名变化。碰撞消失后
    `Ring::Create`/`ShmBytePool::Create` 里的 unlink-and-retry 实际成为死代码（保留作防御）。
    权衡：崩溃残留段不再被重启清理（tmpfs 少量泄漏，重启自清）；刻意不加启动扫描清理——
    两活 server 同 socket 的误配置场景下扫描会误删对方活段，违背本票初衷。
+   **残余窗口（显式接受）**：同一 epoch 内，崩溃客户端的 PID 被 OS 回收给新客户端、而
+   server 尚未察觉旧客户端 EOF 时，新客户端段名与旧客户端相同 → EEXIST unlink-and-retry
+   仍会 unlink 旧客户端仍在映射的 ring（同类孤儿写丢失，窗口远小于重启场景）。`Ring::Create`
+   的 unlink-and-retry 因此保留不删。OS PID 复用需绕完整个 PID 空间才撞得上，接受此窗口。
 3. **Read 校验 `body_len > SlotBodyCap()`**（覆盖首槽与 continuation 槽，一处 guard）。
 
 **复现教训**：

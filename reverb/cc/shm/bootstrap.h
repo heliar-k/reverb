@@ -62,8 +62,9 @@ class ShmBootstrapServer {
 
 // A3/D-format SHM segment names for one (server, client) pair. The server owns
 // generation (spec A3). `server_token` is the server's udsocket path PLUS a
-// per-server epoch (ticket #7: PID + boot nanos), sanitized (non-alnum -> '_')
-// so the names are valid POSIX shm names. Keying by socket path — NOT by
+// per-server epoch (ticket #7: PID + wall-clock nanos); the token is
+// sanitized (non-alnum -> '_') so the names are valid POSIX shm names.
+// Keying by socket path — NOT by
 // server PID alone — is what lets two ShmServers coexist in one process
 // (scan #12); the epoch keeps a crash-RESTARTED server on the same socket
 // path from colliding with a live client's segments. Clients learn the names
