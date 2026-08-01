@@ -1217,22 +1217,29 @@ PYBIND11_MODULE(libpybind, m) {
       // Static-style factory alias: pybind `__init__` already calls Connect;
       // this static method is kept for callers who prefer `ShmClient.Connect`.
       .def_static("Connect", shm_connect_fn, py::arg("socket_path"))
+      // keep_alive<0, 1>: the returned sampler/writers borrow the client's
+      // connection (ShmSampler uses it for SAMPLE round-trips; the writers'
+      // worker threads flush through it), so the ShmClient must outlive them.
+      // Without this, e.g. `ShmClient(sock).trajectory_writer(...)` leaves a
+      // writer with a dangling connection once the temporary client dies.
       .def("new_sampler", shm_new_sampler_fn,
            py::arg("table"), py::arg("max_samples") = 1,
            py::arg("buffer_size") = 1,
-           py::arg("rate_limiter_timeout_ms") = -1)
+           py::arg("rate_limiter_timeout_ms") = -1,
+           py::keep_alive<0, 1>())
       .def("NewSampler", shm_new_sampler_fn,
            py::arg("table"), py::arg("max_samples") = 1,
            py::arg("buffer_size") = 1,
-           py::arg("rate_limiter_timeout_ms") = -1)
+           py::arg("rate_limiter_timeout_ms") = -1,
+           py::keep_alive<0, 1>())
       .def("new_trajectory_writer", shm_new_trajectory_writer_fn,
-           py::arg("chunker_options"))
+           py::arg("chunker_options"), py::keep_alive<0, 1>())
       .def("NewTrajectoryWriter", shm_new_trajectory_writer_fn,
-           py::arg("chunker_options"))
+           py::arg("chunker_options"), py::keep_alive<0, 1>())
       .def("new_structured_writer", shm_new_structured_writer_fn,
-           py::arg("configs"))
+           py::arg("configs"), py::keep_alive<0, 1>())
       .def("NewStructuredWriter", shm_new_structured_writer_fn,
-           py::arg("configs"))
+           py::arg("configs"), py::keep_alive<0, 1>())
       .def("server_info", shm_server_info_fn)
       .def("ServerInfo", shm_server_info_fn)
       .def("mutate_priorities", shm_mutate_priorities_fn,

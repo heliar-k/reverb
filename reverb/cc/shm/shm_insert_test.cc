@@ -25,6 +25,7 @@
 // this binary (see shm_sample_test.cc header comment on the libpython/openssl
 // clash via :sampler -> grpc).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -546,6 +547,192 @@ TEST(ShmInsertTest, StalledHelloDoesNotWedgeDispatch) {
                                  /*timeout=*/absl::Milliseconds(3000)));
   EXPECT_EQ(table->size(), 1);
   close(fd);
+}
+
+// --- P1: insert-callback keepalive clear must be selective per request ------
+//
+// HandleInsert stashes a keepalive shared_ptr per item callback
+// (InsertOrAssignAsync holds only a weak_ptr); both the last-completion
+// callback and the mid-insert fail path used to clear() the WHOLE vector.
+// With two INSERT requests in flight on one connection, that dropped the
+// other request's keepalives: its callbacks expired unfired, so no
+// INSERT_ACK ever came back (a client would hang to its 60s cap with the
+// data actually inserted). Latent today — the client's insert_flow_mu holds
+// in_flight <= 1 — so these tests drive the ring RAW, writing two INSERTs
+// back-to-back without waiting for the first ACK (the overlap the
+// documented async-inserts upgrade will produce).
+//
+// Determinism note: post-fix both tests are deterministic (every request's
+// callbacks are independent, so every ACK/ERROR always arrives). Pre-fix
+// detection relies on the table worker not having completed req1's items
+// before the dispatch thread processes req2 — a worker wake + insert +
+// callback-executor schedule takes orders of magnitude longer than one ring
+// read, and req1's 8 items widen the gap further.
+
+// ALLOCATEs one pool block and writes a minimal ChunkData carrying only
+// `chunk_key` into it (the insert path parses the proto but never inspects
+// tensor payload). Outputs the pool offset and the serialized ChunkData
+// length (needed for the ShmChunkRef).
+void AllocateAndWriteChunk(ShmFixture* fx, uint64_t chunk_key, uint64_t* out_off,
+                           size_t* out_len) {
+  Ring* c2s = &fx->client->connection()->insert_c2s;
+  Ring* s2c = &fx->client->connection()->insert_s2c;
+  ShmAllocateRequest areq;
+  areq.set_num_bytes(256);
+  std::string abody;
+  areq.SerializeToString(&abody);
+  REVERB_ASSERT_OK(c2s->Write(ALLOCATE, abody));
+  MsgType atype;
+  std::string apayload;
+  REVERB_ASSERT_OK(ReadWithDeadline(s2c, &atype, &apayload, absl::Seconds(5)));
+  ASSERT_EQ(atype, ALLOCATE_RESP);
+  ShmAllocateResponse aresp;
+  ASSERT_TRUE(aresp.ParseFromString(apayload));
+  *out_off = aresp.shm_offset();
+
+  ChunkData cd;
+  cd.set_chunk_key(chunk_key);
+  std::string cd_bytes;
+  cd.SerializeToString(&cd_bytes);
+  std::memcpy(fx->client->connection()->pool.At(*out_off), cd_bytes.data(),
+              cd_bytes.size());
+  *out_len = cd_bytes.size();
+}
+
+// Builds a serialized INSERT with one chunk ref (`chunk_key` at `shm_offset`,
+// `chunk_len` bytes) and `num_items` items (keys first_key..first_key+n-1 on
+// table "t") each referencing `chunk_key` via one column/one slice — the
+// minimal shape that passes Table::CheckItemValidity.
+std::string MakeRawInsertBody(uint64_t chunk_key, uint64_t shm_offset,
+                              size_t chunk_len, int num_items,
+                              uint64_t first_key) {
+  ShmInsertRequest req;
+  auto* chunk = req.add_chunks();
+  chunk->set_chunk_key(chunk_key);
+  chunk->set_shm_offset(shm_offset);
+  chunk->set_total_length(chunk_len);
+  for (int i = 0; i < num_items; ++i) {
+    auto* item = req.add_items();
+    item->set_key(first_key + i);
+    item->set_table("t");
+    item->set_priority(1.0);
+    auto* slice = item->mutable_flat_trajectory()
+                      ->add_columns()
+                      ->add_chunk_slices();
+    slice->set_chunk_key(chunk_key);
+    slice->set_offset(0);
+    slice->set_length(1);
+  }
+  std::string body;
+  req.SerializeToString(&body);
+  return body;
+}
+
+// Two VALID overlapping INSERTs: the first request's completion must not
+// drop the second request's keepalive. Both must receive exactly one
+// INSERT_ACK. (Pre-fix the first request's last callback clear()ed the whole
+// vector; the second request then never ACKed and this test timed out.)
+TEST(ShmInsertTest, OverlappingInsertsBothAck) {
+  auto table = MakePermissiveTable("t");
+  auto fx = ShmFixture::Make(table, "ovlap");
+  ASSERT_NE(fx, nullptr);
+  Ring* c2s = &fx->client->connection()->insert_c2s;
+  Ring* s2c = &fx->client->connection()->insert_s2c;
+
+  uint64_t off1 = 0, off2 = 0;
+  size_t len1 = 0, len2 = 0;
+  AllocateAndWriteChunk(fx.get(), /*chunk_key=*/1, &off1, &len1);
+  AllocateAndWriteChunk(fx.get(), /*chunk_key=*/2, &off2, &len2);
+
+  // req1: 8 items (keys 1..8); req2: 1 item (key 9). Written back-to-back,
+  // no ACK wait in between — two requests in flight on one connection.
+  REVERB_ASSERT_OK(c2s->Write(INSERT, MakeRawInsertBody(1, off1, len1,
+                                                        /*num_items=*/8,
+                                                        /*first_key=*/1)));
+  REVERB_ASSERT_OK(c2s->Write(INSERT, MakeRawInsertBody(2, off2, len2,
+                                                        /*num_items=*/1,
+                                                        /*first_key=*/9)));
+
+  std::vector<uint64_t> acked_keys;
+  for (int i = 0; i < 2; ++i) {
+    MsgType type;
+    std::string payload;
+    REVERB_ASSERT_OK(ReadWithDeadline(s2c, &type, &payload, absl::Seconds(5)));
+    ASSERT_EQ(type, INSERT_ACK);
+    InsertAck ack;
+    ASSERT_TRUE(ack.ParseFromString(payload));
+    acked_keys.insert(acked_keys.end(), ack.keys().begin(), ack.keys().end());
+  }
+  std::sort(acked_keys.begin(), acked_keys.end());
+  EXPECT_EQ(acked_keys,
+            std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8, 9}));
+}
+
+// A synchronously FAILING insert (unknown chunk_key) must not drop an
+// earlier in-flight request's keepalive: req1 still receives exactly one
+// INSERT_ACK alongside req2's ERROR. (Pre-fix fail_insert clear()ed the
+// whole vector; req1 then never ACKed and this test timed out.)
+TEST(ShmInsertTest, FailedInsertDoesNotDropInFlightRequestAck) {
+  auto table = MakePermissiveTable("t");
+  auto fx = ShmFixture::Make(table, "failclr");
+  ASSERT_NE(fx, nullptr);
+  Ring* c2s = &fx->client->connection()->insert_c2s;
+  Ring* s2c = &fx->client->connection()->insert_s2c;
+
+  uint64_t off1 = 0, off2 = 0;
+  size_t len1 = 0, len2 = 0;
+  AllocateAndWriteChunk(fx.get(), /*chunk_key=*/1, &off1, &len1);
+  AllocateAndWriteChunk(fx.get(), /*chunk_key=*/2, &off2, &len2);
+
+  // req1: valid, 8 items (keys 1..8) — still in flight when req2 fails.
+  REVERB_ASSERT_OK(c2s->Write(INSERT, MakeRawInsertBody(1, off1, len1,
+                                                        /*num_items=*/8,
+                                                        /*first_key=*/1)));
+  // req2: its item references chunk_key 99, absent from its chunks —
+  // HandleInsert fails it synchronously via fail_insert (same shape as
+  // ItemReferencingUnknownChunkReturnsError).
+  ShmInsertRequest bad;
+  auto* chunk = bad.add_chunks();
+  chunk->set_chunk_key(2);
+  chunk->set_shm_offset(off2);
+  chunk->set_total_length(len2);
+  auto* item = bad.add_items();
+  item->set_key(9);
+  item->set_table("t");
+  item->set_priority(1.0);
+  auto* slice =
+      item->mutable_flat_trajectory()->add_columns()->add_chunk_slices();
+  slice->set_chunk_key(99);
+  slice->set_offset(0);
+  slice->set_length(1);
+  std::string bad_body;
+  bad.SerializeToString(&bad_body);
+  REVERB_ASSERT_OK(c2s->Write(INSERT, bad_body));
+
+  // Exactly one ERROR (req2) and exactly one INSERT_ACK (req1's 8 keys), in
+  // either order.
+  bool got_error = false;
+  std::vector<uint64_t> acked_keys;
+  for (int i = 0; i < 2; ++i) {
+    MsgType type;
+    std::string payload;
+    REVERB_ASSERT_OK(ReadWithDeadline(s2c, &type, &payload, absl::Seconds(5)));
+    if (type == ERROR) {
+      ShmError err;
+      ASSERT_TRUE(err.ParseFromString(payload));
+      EXPECT_THAT(err.message(), ::testing::HasSubstr("unknown chunk"));
+      got_error = true;
+    } else {
+      ASSERT_EQ(type, INSERT_ACK);
+      InsertAck ack;
+      ASSERT_TRUE(ack.ParseFromString(payload));
+      acked_keys.insert(acked_keys.end(), ack.keys().begin(),
+                        ack.keys().end());
+    }
+  }
+  EXPECT_TRUE(got_error);
+  std::sort(acked_keys.begin(), acked_keys.end());
+  EXPECT_EQ(acked_keys, std::vector<uint64_t>({1, 2, 3, 4, 5, 6, 7, 8}));
 }
 
 }  // namespace

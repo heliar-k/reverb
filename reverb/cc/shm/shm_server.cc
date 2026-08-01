@@ -14,6 +14,7 @@
 
 #include "reverb/cc/shm/shm_server.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstring>
 #include <mutex>
@@ -182,16 +183,15 @@ void ShmServer::Stop() {
 }
 
 void ShmServer::CloseClientFdForTest() {
-  // ticket ⑥ test-only (see header). Close client 0's accepted fd from the
-  // caller thread, NOT the dispatch thread. The dispatch thread keeps running
-  // (it does not own this fd-close); the client's control_fd peer is now gone
-  // -> the client's ReadBlocking sees EOF via IsPeerClosed. The dispatch
-  // thread's own IsClientDead will also see EOF next pass and run
-  // HandleDisconnect, but that races harmlessly with the test's assertions.
-  if (!clients_.empty() && clients_[0]->fd >= 0) {
-    close(clients_[0]->fd);
-    clients_[0]->fd = -1;
-  }
+  // ticket ⑥ test-only (see header). Requests client 0's disconnect; the
+  // dispatch thread performs the real close + HandleDisconnect on its next
+  // pass (identical end state to the old direct close, minus the race).
+  // Only the atomic flag store crosses threads. The shared_ptr copy keeps
+  // the ClientState alive even if HandleDisconnect erases clients_[0]
+  // concurrently (e.g. the client's own fd EOF'd just before this call).
+  if (clients_.empty()) return;
+  std::shared_ptr<ClientState> client = clients_[0];
+  client->close_requested.store(true);
 }
 
 void ShmServer::CleanupClient(ClientState& state, bool unlink_rings) {
@@ -1232,14 +1232,26 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
   // client hangs until its timeout cap; and with `remaining` initialized to
   // num_items but fewer callbacks registered, no INSERT_ACK ever fires and
   // pending_insert_callbacks leaks. The table holds the callbacks as
-  // weak_ptr, so clear() safely expires them (later completions are dropped
-  // by design). The client kills the stream on ERROR; the request's pool
-  // offsets are reclaimed at disconnect like any abandoned outstanding.
-  auto fail_insert = [&state, this](ShmError::Code code,
-                                    const std::string& msg) {
+  // weak_ptr, so erasing the keepalive safely expires them (later
+  // completions are dropped by design). The client kills the stream on
+  // ERROR; the request's pool offsets are reclaimed at disconnect like any
+  // abandoned outstanding.
+  //
+  // The erase is SELECTIVE (this request's id only): a full-vector clear
+  // would also drop another in-flight request's keepalives, expiring its
+  // callbacks so it never ACKs. Latent today (in_flight <= 1) but required
+  // for the async-inserts upgrade documented below.
+  const uint64_t request_id = state.next_insert_request_id++;
+  auto fail_insert = [&state, this, request_id](ShmError::Code code,
+                                                const std::string& msg) {
     {
       absl::MutexLock lock(&state.insert_outbox_mu);
-      state.pending_insert_callbacks.clear();
+      auto& pending = state.pending_insert_callbacks;
+      pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                   [request_id](const auto& e) {
+                                     return e.request_id == request_id;
+                                   }),
+                    pending.end());
     }
     ShmError err;
     err.set_code(code);
@@ -1275,7 +1287,8 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
     // touch the S→C ring directly; it pushes the completed key, and when the
     // last item completes it enqueues the aggregate ACK into the outbox.
     auto cb = std::make_shared<Table::InsertCallback>(
-        [remaining, ack_keys, offsets, state_sp](uint64_t completed_key) {
+        [remaining, ack_keys, offsets, state_sp,
+         request_id](uint64_t completed_key) {
           ack_keys->push_back(completed_key);
           if (remaining->fetch_sub(1) == 1) {
             InsertAck ack;
@@ -1291,18 +1304,26 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
             absl::MutexLock lock(&state_sp->insert_outbox_mu);
             state_sp->insert_outbox.emplace_back(
                 static_cast<uint16_t>(INSERT_ACK), std::move(body));
-            // All inserts confirmed: drop the keepalive so the callbacks (and
-            // what they capture) are reclaimed. This breaks the would-be
-            // cycle (cb -> lambda -> ... ; the lambda does NOT capture cb).
-            state_sp->pending_insert_callbacks.clear();
+            // All inserts confirmed: drop THIS REQUEST's keepalives so the
+            // callbacks (and what they capture) are reclaimed. This breaks
+            // the would-be cycle (cb -> lambda -> ... ; the lambda does NOT
+            // capture cb). Selective by request_id — a full clear could drop
+            // another in-flight request's keepalives (see fail_insert).
+            auto& pending = state_sp->pending_insert_callbacks;
+            pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                         [request_id](const auto& e) {
+                                           return e.request_id == request_id;
+                                         }),
+                          pending.end());
           }
         });
     // Keepalive: InsertOrAssignAsync stores a weak_ptr; the table worker fires
     // the callback AFTER HandleInsert returns, so the shared_ptr must outlive
-    // this function. Stash it on the client; cleared by the last callback.
+    // this function. Stash it on the client (tagged with this request's id);
+    // cleared by the last callback or by fail_insert, both selective by id.
     {
       absl::MutexLock lock(&state.insert_outbox_mu);
-      state.pending_insert_callbacks.push_back(cb);
+      state.pending_insert_callbacks.push_back({request_id, cb});
     }
 
     bool can_insert_more = false;

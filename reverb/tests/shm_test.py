@@ -26,11 +26,13 @@ SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops mutate_priorities/
 reset/checkpoint (all riding the insert flow under a client mutex).
 """
 
+import gc
 import os
 import pickle
 import tempfile
 import threading
 import time
+import weakref
 
 import numpy as np
 from absl.testing import absltest
@@ -374,6 +376,108 @@ class ShmClientReprTest(absltest.TestCase):
         server, client = _make_shm_server()
         # repr mirrors Client/LocalClient: f"ShmClient(socket_path={path})".
         self.assertEqual(repr(client), f"ShmClient(socket_path={client._socket_path})")
+
+
+class ShmClientLifetimeTest(absltest.TestCase):
+    """Regression for the client-lifetime UAF (concurrency audit finding P0).
+
+    The pybind ShmSampler/TrajectoryWriter/StructuredWriter borrow the
+    ShmClient's connection (conn_) but previously nothing kept the client
+    alive: the six factory defs had no py::keep_alive, and client.py adds no
+    back-ref. A temporary client (`ShmClient(sock).trajectory_writer(...)`) or
+    `del client` left the writer/sampler with a dangling connection — the
+    ~ShmClient unmaps the rings/pool, so the next use is a genuine UAF. Fixed
+    via py::keep_alive<0, 1> on all six factory defs in pybind.cc; these tests
+    pin the behavior (pre-fix they UAF/segfault, e.g. under ASAN).
+    """
+
+    def test_keep_alive_pins_pybind_client(self):
+        # Deterministic pin of the fix itself (not just its symptom): the
+        # pybind ShmClient object must survive `del client` while a writer
+        # born from it lives. Pre-fix the weakref dies immediately — no
+        # reliance on the UAF actually crashing.
+        server, client = _make_shm_server()
+        client_ref = weakref.ref(client._client)
+        writer = client.trajectory_writer(num_keep_alive_refs=1)
+        del client
+        gc.collect()
+        self.assertIsNotNone(
+            client_ref(),
+            "pybind ShmClient died while a writer still borrows its connection",
+        )
+        del writer
+        gc.collect()
+        # Once the writer is gone the keep-alive lapses and the client (and
+        # its connection) is reclaimed — no leak in the other direction.
+        self.assertIsNone(client_ref(), "pybind ShmClient leaked past its writer")
+        server.stop()
+
+    def test_writer_outlives_temporary_client(self):
+        # The temporary ShmClient wrapper dies at the end of the expression;
+        # the writer born from it must still flush through a live connection.
+        server = reverb.Server(tables=[_make_table("t")], in_process=True, shm=True)
+        writer = reverb.ShmClient(server.shm_socket_path).trajectory_writer(
+            num_keep_alive_refs=1
+        )
+        gc.collect()  # ensure the temporary wrapper is really gone
+        with writer as w:
+            w.append({"v": np.asarray(1.0)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
+        # The item really landed in the table (readable via a fresh client).
+        client = reverb.ShmClient(server.shm_socket_path)
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_array_equal(np.asarray(samples[0].data[0]).reshape(-1), [1.0])
+        server.stop()
+
+    def test_writer_outlives_deleted_client(self):
+        server, client = _make_shm_server()
+        writer = client.trajectory_writer(num_keep_alive_refs=1)
+        del client
+        gc.collect()
+        with writer as w:
+            w.append({"v": np.asarray(2.0)})
+            w.create_item(table="t", priority=1.0, trajectory={"v": w.history["v"][:]})
+            w.flush()
+        client2 = reverb.ShmClient(server.shm_socket_path)
+        samples = list(client2.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_array_equal(np.asarray(samples[0].data[0]).reshape(-1), [2.0])
+        server.stop()
+
+    def test_sampler_outlives_deleted_client(self):
+        server, client = _make_shm_server()
+        _insert_one(client, "t", np.array([3.0], dtype=np.float32))
+        # Grab the pybind sampler directly (bypassing the `sample` generator,
+        # whose frame would itself hold the client alive) so keep_alive is the
+        # ONLY thing keeping the connection alive.
+        sampler = client._new_sampler("t", 1, 1, -1)
+        del client
+        gc.collect()
+        sample = sampler.GetNextTrajectory()
+        # Tuple layout: (key, probability, table_size, priority, times_sampled,
+        # *data columns) — see _BaseClient.sample.
+        np.testing.assert_array_equal(np.asarray(sample[5]).reshape(-1), [3.0])
+        server.stop()
+
+    def test_structured_writer_outlives_deleted_client(self):
+        server, client = _make_shm_server(table_name="sw", max_size=50, min_size=1)
+        step_spec = {"a": np.zeros([], np.float32)}
+        ref_step = structured_writer.create_reference_step(step_spec)
+        pattern = {"x": ref_step["a"][-3:]}
+        config = structured_writer.create_config(pattern=pattern, table="sw")
+        writer = client.structured_writer(configs=[config])
+        del client
+        gc.collect()
+        for i in range(3):
+            writer.append(np.asarray(float(i), dtype=np.float32))
+        writer.end_episode()
+        client2 = reverb.ShmClient(server.shm_socket_path)
+        samples = list(client2.sample("sw", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_array_equal(np.asarray(samples[0].data[0]), [0.0, 1.0, 2.0])
+        server.stop()
 
 
 class ShmClientServerInfoTest(absltest.TestCase):

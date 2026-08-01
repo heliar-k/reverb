@@ -19,12 +19,14 @@
 // ShmBytePool.
 
 #include <sched.h>
+#include <unistd.h>
 #include <cstring>
 #include <string>
 #include <thread>
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -147,16 +149,21 @@ TEST(ShmBytePoolEchoTest, ClientAllocatesViaRingThenReleases) {
   });
 
   // Client side: bootstrap, open pool + rings, run the C4 round-trip. The
-  // server thread may not have bound the socket yet, so retry connect for a
-  // short window (a real client does the same).
+  // server thread binds the socket concurrently, so retry connect until a
+  // deadline (a real client does the same). The old 200-iteration
+  // sched_yield loop flaked ~20% under parallel bazel runs: 200 yields
+  // elapse in microseconds on a contended machine, while thread start +
+  // bind can take milliseconds (connect failed ENOENT). Sleep-based retry
+  // also frees the core for the starved server thread.
   WelcomeResponse welcome;
   {
     absl::StatusOr<WelcomeResponse> r;
-    for (int i = 0; i < 200; i++) {
+    const absl::Time deadline = absl::Now() + absl::Seconds(5);
+    do {
       r = ClientBootstrap(sock, /*client_pid=*/getpid());
       if (r.ok()) break;
-      sched_yield();
-    }
+      usleep(1000);  // 1ms
+    } while (absl::Now() < deadline);
     REVERB_ASSERT_OK(r.status()) << r.status();
     welcome = std::move(r).value();
   }

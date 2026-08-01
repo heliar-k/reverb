@@ -16,5 +16,7 @@
 | 2026-07-31 | 关闭时 insert 假 ACK 语义（并发评审 #5，文档化结案） | [table-close-insert-ack.md](table-close-insert-ack.md) | 拍板文档化不改协议;语义写入 [`concepts.md`](../guide/concepts.md) §3.5「写入耐久性」:#1 修复后 SHM 假成功窗口实质关闭，唯一假成功场景是 gRPC server 主动 Close/重启 |
 | 2026-07-31 | DeleteItem 错误路径部分修改（并发评审 #6） | [table-deleteitem-partial-mutation.md](table-deleteitem-partial-mutation.md) | `DeleteItem` 改两阶段（先全量校验 `episode_id` 再递减），失败不再留下部分修改的 `episode_refs_`;`TableTestPeer` 注入不一致状态做红绿验证（公开 API 不可达） |
 | 2026-07-31 | Ring Open/Read 防御性校验缺口（并发评审 #7） | [ring-open-defensive-gaps.md](ring-open-defensive-gaps.md) | Open 补 version/几何校验（`RingHeader.version` 早已存在，只补校验）;Read 校验 `body_len`（旧代码红测直接 SIGSEGV）;EEXIST 根治 = 段名折入 server epoch（socket+pid+墙上时钟纳秒），同 socket 重启不再 unlink 活段，协议无破坏（段名本就走 Welcome 下发） |
+| 2026-07-31 | SHM 全局 signal-stop 波及进程内所有实例（并发审计 finding 4，文档化结案） | [shm-global-signal-stop.md](shm-global-signal-stop.md) | 拍板不改代码：`g_signal_stop` 文件级原子 + `call_once` 的上限与 self-pipe 升级路径早已写在代码注释；多 server 同进程仅测试使用且无实际危害；重开条件 = 多实例同进程成为受支持用法。附 finding 5（回调 `shared_ptr<ClientState>` 捕获）良性评估，亦不动代码 |
+| 2026-08-01 | `TrajectoryWriter::RunShmWorker` 竞态 SIGSEGV（压测发现） | [shm-writer-worker-race-sigsegv.md](shm-writer-worker-race-sigsegv.md) | 构造顺序竞态：ctor 成员初始化列表启动 worker 线程，但 `stream_worker_` 声明在 `stream_ok_`/`stream_status_` 之前，竞争下 worker 读未构造成员、拷贝未构造 Status 解引用野指针；修复 = `stream_worker_` 声明挪到最后（三构造器同受益）；`WriterCtorDoesNotRaceMemberInit` 回归；压测修复前 8/300 → 修复后 0/300 |
 
 新增 ticket 时直接在本目录开新文件，结案后把一行总结追加到上表。

@@ -76,8 +76,26 @@ struct ClientState {
   // (the callback fires on the table callback-executor thread, not the
   // dispatch thread). Mirrors Writer::WritePendingDataLocal's
   // local_pending_callbacks_.
-  std::vector<std::shared_ptr<Table::InsertCallback>> pending_insert_callbacks
+  //
+  // Each entry is tagged with the id of the INSERT request that created it,
+  // so a completing/failing request drops ONLY its own keepalives (selective
+  // erase) — never a full-vector clear while another request is in flight.
+  // A dropped keepalive expires the table's weak_ptr, so the callback never
+  // fires and the request never ACKs (client-side false failure after the
+  // 60s cap). Latent today (in_flight <= 1: the client sends the next INSERT
+  // only after the previous ACK) but required for the documented
+  // async-inserts upgrade ("honor can_insert_more by deferring the read of
+  // the next INSERT").
+  struct PendingInsertCallback {
+    uint64_t request_id;
+    std::shared_ptr<Table::InsertCallback> callback;
+  };
+  std::vector<PendingInsertCallback> pending_insert_callbacks
       ABSL_GUARDED_BY(insert_outbox_mu);
+  // Monotonic id stamped on each INSERT request's keepalive entries.
+  // Touched only by HandleInsert on the single dispatch thread, so it needs
+  // no lock (same rationale as outstanding_offsets_ above).
+  uint64_t next_insert_request_id = 0;
 
   // ticket ⑩ 死锁修复（方向 A）：异步 sample 的完成回调在 table worker 线程
   // 触发，不能直接碰 pool_/outstanding_offsets_（单线程 dispatch 不变式）。
@@ -101,7 +119,8 @@ struct ClientState {
 
   // ticket ⑥: set when the client sends an explicit CLOSE. The dispatch loop's
   // IsClientDead check then routes it through HandleDisconnect next pass.
-  bool close_requested = false;
+  // std::atomic: also stored by CloseClientFdForTest off the dispatch thread.
+  std::atomic<bool> close_requested{false};
 };
 
 // ShmServer owns ALL tables (ticket ⑨: routed by table name) keyed by name,
@@ -142,13 +161,20 @@ class ShmServer {
 
   const std::string& socket_path() const { return socket_path_; }
 
-  // ticket ⑥ test-only: close the accepted udsocket fd of client 0 WITHOUT
-  // running HandleDisconnect on the dispatch thread. This simulates the server
-  // side of the connection dropping (server crash / fd close) so the CLIENT's
-  // liveness control_fd sees EOF — the path ReadBlocking must detect to fail
-  // fast. Stop() can't be used for this because it joins the dispatch thread,
-  // which may be blocked in Table::Sample; closing the fd here lets the test
-  // observe the client's EOF reaction deterministically. No-op if no client.
+  // ticket ⑥ test-only: simulate the server side of client 0's connection
+  // dropping (server crash / fd close) so the CLIENT's liveness control_fd
+  // sees EOF — the path ReadBlocking must detect to fail fast. Stop() can't
+  // be used for this because it joins the dispatch thread, which may be
+  // blocked in Table::Sample.
+  //
+  // Implementation: sets the client's close_requested flag; the dispatch
+  // thread observes it next pass (IsClientDead) and runs the normal
+  // HandleDisconnect, which closes the accepted fd. The close itself stays
+  // on the dispatch thread — closing the fd from the caller thread raced
+  // the dispatch loop (double-close if the fd number got reused between the
+  // close and the fd=-1 store; clients_[0] could also be erased by
+  // HandleDisconnect mid-deref). Only the atomic flag store crosses
+  // threads. No-op if no client.
   void CloseClientFdForTest();
 
  private:
