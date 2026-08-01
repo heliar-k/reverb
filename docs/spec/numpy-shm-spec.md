@@ -427,7 +427,7 @@ inline constexpr size_t kDefaultBlocksPerSlab = 256;
 class ShmBytePool {
  public:
   // 创建并 mmap 一个新的 SHM 段
-  // `shm_name` 如 "/reverb_shm_pool_<pid>"
+  // `shm_name` 如 "/reverb_shm_pool_<token>"（token 定义见 A3）
   static absl::StatusOr<ShmBytePool> Create(
       const std::string& shm_name,
       absl::Span<const size_t> slab_sizes = {},
@@ -554,7 +554,7 @@ class ShmBootstrapServer {
 };
 
 // Server 侧：单次握手
-// 接收 HelloRequest → 发 WelcomeResponse (含三段 shm 段名)
+// 接收 HelloRequest → 发 WelcomeResponse (含 pool + 四条 ring 段名与 server_info)
 absl::Status SendWelcome(
     int client_fd,
     const std::string& pool_shm_name,
@@ -1276,11 +1276,15 @@ client 以 `PROT_READ|PROT_WRITE` mmap pool，但**不自行分配**——分配
 
 原"client 只读"的表述仅对 sample 响应字节成立，已由 C4 修正。
 
-### A3. 为什么 SHM 段名含 PID
+### A3. SHM 段名如何生成
 
-`/reverb_shm_pool_<server_pid>`、`/reverb_shm_c2s_<server_pid>_<client_pid>`、
-`/reverb_shm_s2c_<server_pid>_<client_pid>`。PID 后缀避免同机多个 server 实例冲突。
-即使一个 server 异常退出重启后 PID 不同，新段名与旧段不冲突（旧段需 `shm_unlink`）。
+权威定义在 `reverb/cc/shm/bootstrap.h`（`MakeShmNames`）。server 为每个连接生成
+`/reverb_shm_pool_<token>` 与四条 ring（决策 D 每流一对）：
+`/reverb_shm_{insert,sample}_{c2s,s2c}_<token>_<client_pid>`，全部经 Welcome 下发，
+client 不自算。`<token>` = 消毒后的 server socket 路径 + server epoch（PID + 墙上时钟
+纳秒）：socket 路径使同机/同进程多 server 实例不互删段（scan #12），epoch 使同 socket
+路径崩溃重启的 server 不与旧客户端的活段碰撞（ticket #7——旧段不再被
+unlink-and-retry 误删，仅 tmpfs 少量残留，重启自清）。
 
 ### A4. `ShmClient.NewTrajectoryWriter` 为什么走 SHM 路径而不是直接持 Table
 

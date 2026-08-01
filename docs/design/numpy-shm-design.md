@@ -207,10 +207,12 @@ sequenceDiagram
 ### 4.3 Bootstrap 与连接 `ShmBootstrap`
 
 - **server 侧**：启动时创建主 SHM 字节池段（POSIX shm，生成唯一路径名如
-  `/reverb_shm_pool_<pid>`），并在一个 Unix domain socket 路径上 listen。
+  `/reverb_shm_pool_<token>`），并在一个 Unix domain socket 路径上 listen。
+  （`<token>` = 消毒后的 socket 路径 + server epoch（PID + 墙上时钟纳秒）；
+  段名权威定义见 `reverb/cc/shm/bootstrap.h`，下同。）
 - **client 侧**：连 udsocket，发送 `Hello{client_pid, protocol_version}`。
   server `accept` 时用 `SO_PEERCRED` 核验 client pid，为该 client 创建**两对**
-  ring 段（`/reverb_shm_insert_c2s_<spid>_<cpid>` 等 4 条），回
+  ring 段（`/reverb_shm_insert_c2s_<token>_<cpid>` 等 4 条），回
   `Welcome{pool_shm_name, insert_c2s/s2c_shm_name, sample_c2s/s2c_shm_name,
   server_info}`。client `mmap` 五段（pool + 4 条 ring）。
   （旧 `c2s_shm_name`/`s2c_shm_name` 字段保留但 `deprecated`。）
@@ -660,7 +662,7 @@ udsocket 字节流，不走 ring：
 
 ```
 1. server 启动:
-   - shm_open 创建 pool 段 /reverb_shm_pool_<server_pid>, ftruncate 设容量, mmap
+   - shm_open 创建 pool 段 /reverb_shm_pool_<token>, ftruncate 设容量, mmap
    - unix socket bind+listen 在 /tmp/reverb_shm_<pid>.sock (路径传给 client)
 
 2. client 连接:
@@ -669,10 +671,10 @@ udsocket 字节流，不走 ring：
 
 3. server 收 Hello (accept 时 SO_PEERCRED 核验 client pid):
    - 为该 client 创建**四条** ring 段（决策 D，每流一对）:
-     /reverb_shm_insert_c2s_<server_pid>_<client_pid>,
-     /reverb_shm_insert_s2c_<server_pid>_<client_pid>,
-     /reverb_shm_sample_c2s_<server_pid>_<client_pid>,
-     /reverb_shm_sample_s2c_<server_pid>_<client_pid>
+     /reverb_shm_insert_c2s_<token>_<client_pid>,
+     /reverb_shm_insert_s2c_<token>_<client_pid>,
+     /reverb_shm_sample_c2s_<token>_<client_pid>,
+     /reverb_shm_sample_s2c_<token>_<client_pid>
    - ftruncate 各 ring 段(RingHeader + capacity*slot_size)
    - mmap, 初始化 RingHeader
    - 回 WelcomeResponse{pool_shm_name, insert_c2s/s2c_shm_name,
@@ -684,7 +686,7 @@ udsocket 字节流，不走 ring：
    - 之后所有控制消息走对应流的 ring, udsocket fd 保留用于断连检测(§8.8)
 ```
 
-> `ponytail:` ring 段名含 server_pid + client_pid，避免多 server/多 client 冲突。
+> `ponytail:` ring 段名含 server token（socket 路径 + epoch）+ client_pid，避免多 server/多 client 冲突。
 > 断连检测靠 udsocket，不靠 ring（ring 无法感知对端进程消失）。
 
 ### 8.7 backpressure 与阻塞语义
