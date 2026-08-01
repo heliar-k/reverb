@@ -27,6 +27,16 @@
 
 **Blocked by**：None。
 
-- [ ] `DeleteItem` 先校验全部 episode_id 再修改
-- [ ] 单元测试：构造引用不一致的 item（绕过正常 insert），DeleteItem 返回错误且
+- [x] `DeleteItem` 先校验全部 episode_id 再修改
+- [x] 单元测试：构造引用不一致的 item（绕过正常 insert），DeleteItem 返回错误且
       `episode_refs_` 与 `data_` 完全未变
+
+## 修复记录（2026-07-31，已完成，选方案 1 两阶段）
+
+`DeleteItem` 第一遍只校验全部 `episode_id` 存在（`contains`，不变异），第二遍才递减。
+测试用 `TableTestPeer`（table.h 一行 friend）把不一致状态直接注入 `data_`——公开 API
+不可达该状态（审票已证），peer 是唯一 seam。
+
+测试坑：peer 注入时 `data_[item.key()] = make_shared<TableItem>(std::move(item))`
+踩了 C++17 求值序（RHS 先于 LHS 下标求值），读到 moved-from key——与
+shm_server.cc `try_emplace` 注释里记录的是同一个陷阱，先取 key 再 move。

@@ -838,14 +838,20 @@ absl::Status Table::DeleteItem(Table::Key key,
   auto it = data_.find(key);
   if (it == data_.end()) return absl::OkStatus();
 
-  // Decrement counts to the episodes the item is referencing.
+  // review #6: two-phase — validate ALL episode refs exist BEFORE
+  // decrementing any, so a missing episode_id cannot leave episode_refs_
+  // partially mutated (the refs/data_ invariant is currently upheld only by
+  // the insert path's construction, not enforced here).
   for (const auto& chunk : it->second->chunks()) {
-    auto ep_it = episode_refs_.find(chunk->episode_id());
-    if (ep_it == episode_refs_.end()) {
+    if (!episode_refs_.contains(chunk->episode_id())) {
       return absl::FailedPreconditionError(
           absl::StrCat("Unable to find chunk episode_id ", chunk->episode_id(),
                        " in refs table."));
     }
+  }
+  // Decrement counts to the episodes the item is referencing.
+  for (const auto& chunk : it->second->chunks()) {
+    auto ep_it = episode_refs_.find(chunk->episode_id());
     if (--(ep_it->second) == 0) {
       episode_refs_.erase(ep_it);
       num_deleted_episodes_++;

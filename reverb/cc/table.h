@@ -517,6 +517,11 @@ class Table {
                           std::shared_ptr<Item>* deleted_item = nullptr)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  // review #6: test peer plants episode_refs_-inconsistent states that the
+  // public API cannot reach (see
+  // DeleteItemWithInconsistentRefsLeavesTableUntouched).
+  friend struct TableTestPeer;
+
   // Executes a given extension operation for all extensions registered with the
   // table. If extension worker is enabled, operation is executed asynchronously
   // for all extensions that support asynchronous execution. For synchronous

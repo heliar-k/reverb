@@ -48,6 +48,33 @@
 
 namespace deepmind {
 namespace reverb {
+
+// review #6: DeleteItem must validate ALL episode refs before mutating any
+// (two-phase). The peer bypasses the insert path to plant an item whose
+// chunk references an episode unknown to episode_refs_ — a state the public
+// API cannot reach (inserts always increment refs first) — so the test can
+// assert the failure leaves the table COMPLETELY untouched. Declared outside
+// the anonymous namespace to match the friend declaration in table.h.
+struct TableTestPeer {
+  // Inserts into data_ WITHOUT incrementing episode_refs_ (the bypass).
+  static void InsertPhantomItem(Table* table, TableItem item) {
+    absl::MutexLock lock(&table->mu_);
+    // NB: read key() BEFORE std::move — C++17 sequences the assignment RHS
+    // before the LHS subscript, so inline `data_[item.key()] = ...move(item)`
+    // would read a moved-from key (same trap as shm_server.cc's try_emplace).
+    uint64_t key = item.key();
+    table->data_[key] = std::make_shared<TableItem>(std::move(item));
+  }
+  static absl::Status DeleteItem(Table* table, Table::Key key) {
+    absl::MutexLock lock(&table->mu_);
+    return table->DeleteItem(key);
+  }
+  static int64_t NumEpisodeRefs(Table* table, uint64_t episode_id) {
+    auto it = table->episode_refs_.find(episode_id);
+    return it == table->episode_refs_.end() ? 0 : it->second;
+  }
+};
+
 namespace {
 
 const absl::Duration kTimeout = absl::Milliseconds(250);
@@ -274,6 +301,30 @@ TEST(TableTest, DeletesAreAppliedPartially) {
   WaitForTableSize(table.get(), 2);
   REVERB_EXPECT_OK(table->MutateItems({}, {5, 3}));
   EXPECT_THAT(table->Copy(), ElementsAre(HasItemKey(7)));
+}
+
+TEST(TableTest, DeleteItemWithInconsistentRefsLeavesTableUntouched) {
+  auto table = MakeUniformTable("dist");
+  // Real insert: episode_refs_{101: 1}.
+  REVERB_EXPECT_OK(
+      table->InsertOrAssign(MakeItem(1, 1.0, {MakeSequenceRange(101, 0, 1)})));
+  ASSERT_EQ(table->size(), 1);
+  // Phantom item: data_ gains key 2 referencing episodes {101, 202}, but
+  // episode_refs_ never sees 202 (the bypass).
+  TableTestPeer::InsertPhantomItem(
+      table.get(), MakeItem(2, 1.0,
+                            {MakeSequenceRange(101, 0, 1),
+                             MakeSequenceRange(202, 0, 1)}));
+  ASSERT_EQ(table->size(), 2);
+
+  // Deleting the phantom fails on missing episode 202 — and must leave the
+  // table completely unchanged (pre-fix: episode 101's ref was already
+  // decremented and erased before the error).
+  absl::Status s = TableTestPeer::DeleteItem(table.get(), 2);
+  EXPECT_TRUE(absl::IsFailedPrecondition(s)) << s;
+  EXPECT_EQ(TableTestPeer::NumEpisodeRefs(table.get(), 101), 1);
+  EXPECT_EQ(TableTestPeer::NumEpisodeRefs(table.get(), 202), 0);
+  EXPECT_EQ(table->size(), 2);
 }
 
 TEST(TableTest, SampleBlocksWhenNotEnoughItems) {
