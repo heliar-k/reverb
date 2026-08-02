@@ -30,7 +30,7 @@
 | 维度 | `Client`（gRPC） | `LocalClient`（in_process） | `ShmClient`（shm） |
 | --- | --- | --- | --- |
 | 传输 / 拓扑 | 跨进程 / 跨机器，gRPC stream，序列化 numpy bytes | **同进程**，直接持 `shared_ptr<Table>`，无序列化 | **同一台机器跨进程**，POSIX shm + Unix Domain Socket，mmap 零拷贝 |
-| 性能 | 基线 | 最快（无网络 / 无序列化） | ~9–11× gRPC 回环（见 [shm-benchmark.md](../benchmark/shm-benchmark.md)） |
+| 性能 | 基线 | 最快（无网络 / 无序列化） | ~9–11× gRPC 回环（见 [client-benchmark.md](../benchmark/client-benchmark.md)） |
 | 构造 | `Client('localhost:port')` | `server.in_process_client` | `reverb.ShmClient(server.shm_socket_path)` |
 | 内部持有资源 | gRPC channel | 进程内 Table 指针 | SHM mmap + ring 状态 |
 | `pickle` | ✅ 支持（存 `server_address`） | ❌ 不可（持进程内指针） | ✅ 支持（存 `socket_path`，反序列化重连） |

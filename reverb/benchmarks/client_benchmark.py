@@ -123,7 +123,7 @@ def _seed(client, n, payloads):
     """Insert `n` single-step items into TABLE via trajectory_writer."""
     for i in range(n):
         with client.trajectory_writer(num_keep_alive_refs=1) as w:
-            w.append(payloads[i])
+            w.append(payloads[i % len(payloads)])
             w.create_item(
                 table=TABLE,
                 priority=1.0,
@@ -188,7 +188,7 @@ def _setup_grpc(table_size, payloads):
         raise
     client = reverb.Client(f"localhost:{port}")
     _seed(client, table_size, payloads)
-    return (p, done), client, server_pid
+    return (p, done), client, server_pid, port
 
 
 SETUP_FNS = {
@@ -232,26 +232,32 @@ def _bench_sample(client, num_samples, warmup):
 # ── benchmark: insert ────────────────────────────────────────────────────────
 
 
-def _bench_insert(client, num_inserts, payloads, warmup):
-    """Time `num_inserts` single-item inserts. Returns (tput, sorted_latencies)."""
-    for i in range(warmup):
+def _bench_insert(client, num_inserts, payloads, warmup, batch=1):
+    """Time `num_inserts` item inserts, `batch` items per flush.
+
+    Returns (items/s, sorted per-flush latencies). With batch>1 the latency
+    is per flush (batch items), not per item.
+    """
+
+    def write_batch(start):
         with client.trajectory_writer(num_keep_alive_refs=1) as w:
-            w.append(payloads[i % len(payloads)])
-            w.create_item(
-                table=TABLE, priority=1.0, trajectory={"v": w.history["v"][:]}
-            )
+            for j in range(batch):
+                w.append(payloads[(start + j) % len(payloads)])
+                # [-1:] not [:]: keep_alive=1 expires older refs to None as the
+                # batch grows, and TrajectoryColumn rejects None refs.
+                w.create_item(
+                    table=TABLE, priority=1.0, trajectory={"v": w.history["v"][-1:]}
+                )
             w.flush()
+
+    for i in range(0, warmup * batch, batch):
+        write_batch(i)
 
     latencies = []
     start = time.perf_counter()
-    for i in range(num_inserts):
+    for i in range(0, num_inserts, batch):
         t0 = time.perf_counter()
-        with client.trajectory_writer(num_keep_alive_refs=1) as w:
-            w.append(payloads[i % len(payloads)])
-            w.create_item(
-                table=TABLE, priority=1.0, trajectory={"v": w.history["v"][:]}
-            )
-            w.flush()
+        write_batch(i)
         latencies.append(time.perf_counter() - t0)
     elapsed = time.perf_counter() - start
 
@@ -261,10 +267,26 @@ def _bench_insert(client, num_inserts, payloads, warmup):
 # ── benchmark: pipeline ──────────────────────────────────────────────────────
 
 
-def _bench_pipeline(client, duration_s, payloads, server_pid):
-    """Concurrent insert + sample for `duration_s`. Returns dict of metrics."""
+def _bench_pipeline(
+    client, duration_s, payloads, server_pid, writers=1, readers=1, client_factory=None
+):
+    """Concurrent insert + sample for `duration_s`. Returns dict of metrics.
+
+    `client` serves the first writer/reader thread. Extra writers/readers get
+    their own connection from `client_factory` (None -> all threads share
+    `client`). Thread-safe without extra locking: list.append is atomic under
+    the GIL, and each transport client releases the GIL in pybind calls.
+    """
     payloads = list(payloads)
     n_payloads = len(payloads)
+
+    def extra_clients(n):
+        if n <= 1 or client_factory is None:
+            return [client] * n
+        return [client] + [client_factory() for _ in range(n - 1)]
+
+    w_clients = extra_clients(writers)
+    r_clients = extra_clients(readers)
 
     insert_latencies = []
     sample_latencies = []
@@ -274,11 +296,11 @@ def _bench_pipeline(client, duration_s, payloads, server_pid):
 
     _seed(client, 20, payloads)
 
-    def writer():
+    def writer(cli):
         i = 0
         while not stop.is_set():
             t0 = time.perf_counter()
-            with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            with cli.trajectory_writer(num_keep_alive_refs=1) as w:
                 w.append(payloads[i % n_payloads])
                 w.create_item(
                     table=TABLE, priority=1.0, trajectory={"v": w.history["v"][:]}
@@ -288,10 +310,10 @@ def _bench_pipeline(client, duration_s, payloads, server_pid):
             insert_count[0] += 1
             i += 1
 
-    def reader():
+    def reader(cli):
         while not stop.is_set():
             t0 = time.perf_counter()
-            list(client.sample(TABLE, num_samples=1, emit_timesteps=False))
+            list(cli.sample(TABLE, num_samples=1, emit_timesteps=False))
             sample_latencies.append(time.perf_counter() - t0)
             sample_count[0] += 1
 
@@ -299,15 +321,16 @@ def _bench_pipeline(client, duration_s, payloads, server_pid):
     if monitor:
         monitor.start()
 
-    w_th = threading.Thread(target=writer, daemon=True)
-    r_th = threading.Thread(target=reader, daemon=True)
-    w_th.start()
-    r_th.start()
+    threads = [
+        threading.Thread(target=writer, args=(c,), daemon=True) for c in w_clients
+    ] + [threading.Thread(target=reader, args=(c,), daemon=True) for c in r_clients]
+    for t in threads:
+        t.start()
 
     time.sleep(duration_s)
     stop.set()
-    w_th.join(timeout=5)
-    r_th.join(timeout=5)
+    for t in threads:
+        t.join(timeout=5)
 
     resource = monitor.stop_and_report() if monitor else {}
 
@@ -387,6 +410,21 @@ def main():
         help="warmup ops for sample/insert modes",
     )
     p.add_argument(
+        "--writers",
+        default="1",
+        help="comma-separated writer-thread counts for pipeline (zipped with --readers)",
+    )
+    p.add_argument(
+        "--readers",
+        default="1",
+        help="comma-separated reader-thread counts for pipeline (zipped with --writers)",
+    )
+    p.add_argument(
+        "--batch",
+        default="1",
+        help="comma-separated items-per-flush counts for insert mode",
+    )
+    p.add_argument(
         "--num-ops",
         type=int,
         default=500,
@@ -413,6 +451,14 @@ def main():
         )
         table_sizes = [int(x.strip()) for x in args.table_size.split(",")]
 
+    writer_counts = [int(x.strip()) for x in args.writers.split(",")]
+    reader_counts = [int(x.strip()) for x in args.readers.split(",")]
+    if len(writer_counts) != len(reader_counts):
+        _die(
+            "--writers and --readers must have the same number of entries (zipped pairs)"
+        )
+    batches = [int(x.strip()) for x in args.batch.split(",")]
+
     for t in transports:
         if t not in SETUP_FNS:
             _die(f"unknown transport: {t}")
@@ -426,16 +472,24 @@ def main():
 
     for table_size in table_sizes:
         for pl_spec in payloads:
-            pl_buf = _payload_pool(pl_spec, max(table_size, args.num_ops) + args.warmup)
+            # ponytail: cap the pool for big payloads — items may repeat buffers,
+            # table content is what matters; this box is a 16GiB k8s pod
+            # (cgroup v1), 10k x 770KB (~8GB) would OOM-kill the run.
+            pool_n = max(table_size, args.num_ops) + args.warmup
+            pool_cap = {"med": 2000, "large": 500, "mixed": 1500}.get(pl_spec)
+            if pool_cap is not None:
+                pool_n = min(pool_n, pool_cap)
+            pl_buf = _payload_pool(pl_spec, pool_n)
 
             for transport in transports:
-                server, client, server_pid, cleanup_handle = _do_setup(
+                server, client, server_pid, cleanup_handle, factory = _do_setup(
                     transport, table_size, pl_buf
                 )
 
                 try:
                     for mode in modes:
-                        key = f"{transport}|{pl_spec}|{table_size}|{mode}"
+                        base = f"{transport}|{pl_spec}|{table_size}"
+                        key = f"{base}|{mode}"
 
                         if mode == "sample":
                             tput, lats = _bench_sample(
@@ -452,24 +506,42 @@ def main():
                             )
 
                         elif mode == "insert":
-                            tput, lats = _bench_insert(
-                                client, args.num_ops, pl_buf, args.warmup
-                            )
-                            results.append(
-                                {
-                                    "key": key,
-                                    "tput_ips": tput,
-                                    "p50_s": _percentile(lats, 50),
-                                    "p90_s": _percentile(lats, 90),
-                                    "p99_s": _percentile(lats, 99),
-                                }
-                            )
+                            for batch in batches:
+                                tput, lats = _bench_insert(
+                                    client, args.num_ops, pl_buf, args.warmup, batch
+                                )
+                                results.append(
+                                    {
+                                        "key": f"{base}|b{batch}|insert",
+                                        "tput_ips": tput,
+                                        "p50_s": _percentile(lats, 50),
+                                        "p90_s": _percentile(lats, 90),
+                                        "p99_s": _percentile(lats, 99),
+                                    }
+                                )
 
                         elif mode == "pipeline":
-                            res = _bench_pipeline(
-                                client, args.duration, pl_buf, server_pid
-                            )
-                            results.append({"key": key, **res})
+                            for nw, nr in zip(writer_counts, reader_counts):
+                                res = _bench_pipeline(
+                                    client,
+                                    args.duration,
+                                    pl_buf,
+                                    server_pid,
+                                    writers=nw,
+                                    readers=nr,
+                                    client_factory=factory,
+                                )
+                                results.append(
+                                    {"key": f"{base}|w{nw}r{nr}|pipeline", **res}
+                                )
+
+                except Exception as e:  # keep the matrix going; report the hole
+                    results.append(
+                        {
+                            "key": f"{transport}|{pl_spec}|{table_size}|ERROR",
+                            "error": repr(e),
+                        }
+                    )
 
                 finally:
                     TEARDOWN_FNS[transport](server, client, server_pid, cleanup_handle)
@@ -478,7 +550,7 @@ def main():
         print(json.dumps(results, indent=2))
     else:
         _print_report(results)
-        # Machine-readable raw lines (compat with old shm_benchmark)
+        # Machine-readable raw lines
         print("\n# RAW")
         for r in results:
             parts = [f"{k}={v}" for k, v in r.items()]
@@ -486,19 +558,30 @@ def main():
 
 
 def _do_setup(transport, table_size, pl_buf):
-    """Returns (server, client, server_pid, cleanup_handle)."""
+    """Returns (server, client, server_pid, cleanup_handle, client_factory).
+
+    client_factory() opens a NEW connection to the same server (None for
+    in-process, where threads share the single LocalClient safely).
+    """
     if transport == "grpc":
-        (proc, done_q), client, server_pid = _setup_grpc(table_size, pl_buf)
-        return None, client, server_pid, (proc, done_q)
+        (proc, done_q), client, server_pid, port = _setup_grpc(table_size, pl_buf)
+        factory = lambda: reverb.Client(f"localhost:{port}")  # noqa: E731
+        return None, client, server_pid, (proc, done_q), factory
+    server, client, server_pid = SETUP_FNS[transport](table_size, pl_buf)
+    if transport == "shm":
+        path = server.shm_socket_path
+        factory = lambda: reverb.ShmClient(path)  # noqa: E731
     else:
-        server, client, server_pid = SETUP_FNS[transport](table_size, pl_buf)
-        return server, client, server_pid, None
+        factory = None
+    return server, client, server_pid, None, factory
 
 
 # ── output formatting ─────────────────────────────────────────────────────────
 
 
 def _print_report(results):
+    errors = [r for r in results if "error" in r]
+    results = [r for r in results if "error" not in r]
     for mode_label in ["sample", "insert", "pipeline"]:
         group = [r for r in results if r["key"].endswith("|" + mode_label)]
         if not group:
@@ -564,6 +647,11 @@ def _print_report(results):
                     cpu = r.get("avg_cpu_pct", float("nan"))
                     line += f" | {rss:>7.1f} {cpu:>5.1f}"
                 print(line)
+
+    if errors:
+        print(f"\n{'=' * 90}\n  ERRORS ({len(errors)} configs skipped)")
+        for r in errors:
+            print(f"  {r['key']}: {r['error']}")
 
 
 if __name__ == "__main__":
