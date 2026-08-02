@@ -15,6 +15,7 @@
 #ifndef REVERB_CC_SHM_SHM_CONNECTION_H_
 #define REVERB_CC_SHM_SHM_CONNECTION_H_
 
+#include <atomic>
 #include <string>
 #include <utility>
 
@@ -87,6 +88,20 @@ struct ShmConnection {
   ShmBytePool pool;  // client-side RW mapping (C4); server keeps its own
   std::string pool_shm_name;
   int control_fd = -1;  // client liveness fd (ticket ⑥); -1 = none
+
+  // ticket「shm-close-while-in-flight」: set by Close()/destructor BEFORE
+  // control_fd is closed. In-flight read loops (ReadBlocking in shm_client.cc,
+  // read_blocking in trajectory_writer.cc) poll this flag so a connection
+  // closed underneath them errors out (UnavailableError) instead of spinning
+  // forever on rings nobody serves. The fd probe alone is insufficient:
+  // after close the fd is -1 (or recycled), and the probe is skipped for
+  // fd < 0 — that hole hung DisconnectWithInFlightCallbacksDoesNotUaf.
+  std::atomic<bool> closed{false};
+
+  // Idempotent. Sets `closed` first (release), then closes control_fd.
+  // In-flight workers observe `closed` and fail fast; the server observes
+  // the fd EOF and reclaims the client (spec §8.8).
+  void Close();
 
   ShmConnection() = default;
   ~ShmConnection();

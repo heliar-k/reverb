@@ -374,10 +374,10 @@ TEST(ShmCrashTest, ClientFdCloseReclaimsOffsetsAndUnlinksRings) {
   ASSERT_TRUE(ShmSegmentExists(names.sample_c2s));
   ASSERT_TRUE(ShmSegmentExists(names.sample_s2c));
 
-  // Simulate crash: close the control fd. The server's dispatch loop poll()s
-  // it next pass, sees EOF, and calls HandleDisconnect.
-  close(conn->control_fd);
-  conn->control_fd = -1;  // prevent ~ShmConnection double-close
+  // Simulate crash: close the connection. Close() sets the `closed` flag (so
+  // in-flight client workers fail fast) and closes the control fd, which the
+  // server's dispatch loop poll()s next pass -> HandleDisconnect.
+  conn->Close();
 
   // Wait for the server to unlink all four rings (HandleDisconnect ran).
   ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
@@ -441,10 +441,9 @@ TEST(ShmCrashTest, RepeatedCrashDoesNotExhaustPool) {
     std::vector<TensorBuffer> data;
     REVERB_EXPECT_OK(sampler->GetNextTrajectory(&data)) << "round " << i;
 
-    // Crash: close the control fd, wait for the server to reclaim.
+    // Crash: close the connection, wait for the server to reclaim.
     ShmConnection* conn = (*client)->connection();
-    close(conn->control_fd);
-    conn->control_fd = -1;
+    conn->Close();
     // Wait for the server to detect the disconnect. We can't observe
     // outstanding_offsets_ directly (private), but the next round's Connect
     // would fail/block if the server were wedged. Poll the ring unlink as the
@@ -826,10 +825,12 @@ TEST(ShmCrashTest, DisconnectWithInFlightCallbacksDoesNotUaf) {
     absl::SleepFor(absl::Milliseconds(100));  // let dispatch enqueue both
 
     // Crash: the server's HandleDisconnect erases this ClientState while its
-    // insert/sample callbacks are still pending on the blocking table.
+    // insert/sample callbacks are still pending on the blocking table. Close()
+    // also flips the `closed` flag so this client's own insert/sample workers
+    // fail fast (ticket「shm-close-while-in-flight」) and the joins below
+    // cannot hang.
     ASSERT_GE(conn->control_fd, 0);
-    close(conn->control_fd);
-    conn->control_fd = -1;  // prevent ~ShmConnection double-close
+    conn->Close();
 
     ASSERT_TRUE(WaitFor([&] { return !ShmSegmentExists(names.insert_c2s); },
                         absl::Seconds(5)))

@@ -51,11 +51,11 @@ namespace {
 // ready (spec §3.1 / R5: the blocking policy is the caller's job, not Ring's).
 // Mirrors the helper used in echo_test / byte_pool_echo_test.
 //
-// ticket ⑥ (spec §8.8): if `control_fd` >= 0, ALSO probe it each pass for
-// server death. The liveness udsocket fd is kept open for the connection
-// lifetime; when the server dies/closes it becomes EOF/HUP. Without this the
-// poll below would spin forever on a dead server, leaving in-flight sample /
-// insert requests hanging. On server death return UnavailableError so the
+// ticket ⑥ (spec §8.8): probe the connection each pass for server death —
+// the `closed` flag covers a Close() racing an in-flight read (fd already -1
+// or recycled); the control_fd EOF/HUP probe covers server-side death. Without
+// this the poll below would spin forever on a dead server, leaving in-flight
+// sample / insert requests hanging. On death return UnavailableError so the
 // caller surfaces a Python-raisable status instead of hanging.
 //
 // ticket ⑩ 死锁修复（方向 C）：`timeout` 是健壮性兜底上限，独立于请求自身的
@@ -66,14 +66,17 @@ namespace {
 constexpr absl::Duration kReadBlockingHardCap = absl::Seconds(60);
 
 absl::Status ReadBlocking(Ring* ring, MsgType* msg_type, std::string* payload,
-                          int control_fd = -1,
+                          const ShmConnection* conn,
                           absl::Duration timeout = absl::InfiniteDuration()) {
   absl::Time deadline = absl::Now() + timeout;
   while (true) {
     absl::Status s = ring->Read(msg_type, payload);
     if (s.ok()) return absl::OkStatus();
     if (!absl::IsNotFound(s)) return s;  // real error
-    if (control_fd >= 0 && IsPeerClosed(control_fd)) {
+    // ticket「shm-close-while-in-flight」: the closed flag covers Close()
+    // racing an in-flight read (fd already -1/recycled -> fd probe skipped).
+    if (conn->closed.load(std::memory_order_acquire) ||
+        (conn->control_fd >= 0 && IsPeerClosed(conn->control_fd))) {
       return absl::UnavailableError("SHM server closed connection");
     }
     if (absl::Now() >= deadline) {
@@ -117,7 +120,7 @@ absl::Status SendInsertFlowRequest(ShmConnection* conn, const Req& request,
   MsgType resp_type;
   std::string resp_body;
   REVERB_RETURN_IF_ERROR(ReadBlocking(&conn->insert_s2c, &resp_type, &resp_body,
-                                      conn->control_fd, kReadBlockingHardCap));
+                                      conn, kReadBlockingHardCap));
 
   if (resp_type == ERROR) {
     ShmError err;
@@ -288,7 +291,7 @@ absl::StatusOr<std::unique_ptr<Sample>> ShmSampler::FetchOne() {
                                    ? kReadBlockingHardCap
                                    : rate_limiter_timeout_ + kReadBlockingHardCap;
   REVERB_RETURN_IF_ERROR(
-      ReadBlocking(&conn_->sample_s2c, &resp_type, &resp_body, conn_->control_fd,
+      ReadBlocking(&conn_->sample_s2c, &resp_type, &resp_body, conn_,
                    smp_timeout));
 
   if (resp_type == ERROR) {

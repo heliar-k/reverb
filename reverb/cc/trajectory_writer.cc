@@ -872,19 +872,23 @@ absl::Status TrajectoryWriter::RunShmWorker() {
 
   auto read_blocking = [](Ring* ring, MsgType* type,
                           std::string* payload,
-                          int control_fd,
+                          const ShmConnection* conn,
                           absl::Duration timeout) -> absl::Status {
     // poll non-blocking Read + sched_yield (spec R5: blocking policy is the
     // caller's job, not Ring's). Same helper as ShmSampler/ShmClient.
     // ticket ⑥ (spec §8.8): if the liveness fd (control_fd) shows EOF/HUP the
     // server is gone — return UnavailableError so in-flight inserts fail fast
     // instead of spinning forever on a dead server.
+    // ticket「shm-close-while-in-flight」: also bail on the connection's
+    // closed flag — after a racing Close() the fd is -1/recycled and the fd
+    // probe is skipped, which used to hang this loop indefinitely.
     absl::Time deadline = absl::Now() + timeout;
     while (true) {
       absl::Status s = ring->Read(type, payload);
       if (s.ok()) return absl::OkStatus();
       if (!absl::IsNotFound(s)) return s;
-      if (control_fd >= 0 && IsPeerClosed(control_fd)) {
+      if (conn->closed.load(std::memory_order_acquire) ||
+          (conn->control_fd >= 0 && IsPeerClosed(conn->control_fd))) {
         return absl::UnavailableError("SHM server closed connection");
       }
       if (absl::Now() >= deadline) {
@@ -1019,7 +1023,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
       MsgType atype;
       std::string aresp_body;
       absl::Status rs = read_blocking(&shm_conn_->insert_s2c, &atype, &aresp_body,
-                                       shm_conn_->control_fd, kInsertAckTimeout);
+                                       shm_conn_, kInsertAckTimeout);
       if (!rs.ok()) {
         fail_alloc(rs);
         break;
@@ -1135,7 +1139,7 @@ absl::Status TrajectoryWriter::RunShmWorker() {
     MsgType ack_type;
     std::string ack_body;
     absl::Status as = read_blocking(&shm_conn_->insert_s2c, &ack_type, &ack_body,
-                                     shm_conn_->control_fd, kInsertAckTimeout);
+                                     shm_conn_, kInsertAckTimeout);
     if (!as.ok()) {
       absl::MutexLock l(&mu_);
       in_flight_items_.erase(key);

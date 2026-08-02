@@ -64,12 +64,16 @@ bool IsPeerClosed(int fd) {
   return false;
 }
 
-ShmConnection::~ShmConnection() {
+void ShmConnection::Close() {
+  closed.store(true, std::memory_order_release);
   // ticket ⑥: closing the client's liveness fd is the crash/close signal the
   // server poll()s (spec §8.8). -1 means the server side (which stores its fd
   // in ClientState.fd) or a moved-from object.
   if (control_fd >= 0) close(control_fd);
+  control_fd = -1;
 }
+
+ShmConnection::~ShmConnection() { Close(); }
 
 ShmConnection::ShmConnection(ShmConnection&& other) noexcept
     : insert_c2s(std::move(other.insert_c2s)),
@@ -78,7 +82,8 @@ ShmConnection::ShmConnection(ShmConnection&& other) noexcept
       sample_s2c(std::move(other.sample_s2c)),
       pool(std::move(other.pool)),
       pool_shm_name(std::move(other.pool_shm_name)),
-      control_fd(other.control_fd) {
+      control_fd(other.control_fd),
+      closed(other.closed.load(std::memory_order_acquire)) {
   // insert_flow_mu is non-movable (absl::Mutex); leave this instance's mutex
   // default-constructed (unlocked). A ShmConnection is moved exactly once
   // before any worker thread starts, so the destination's mutex is the one
@@ -97,6 +102,8 @@ ShmConnection& ShmConnection::operator=(ShmConnection&& other) noexcept {
     if (control_fd >= 0) close(control_fd);
     control_fd = other.control_fd;
     other.control_fd = -1;
+    closed.store(other.closed.load(std::memory_order_acquire),
+                 std::memory_order_release);
     // insert_flow_mu intentionally NOT moved (non-movable; see move ctor).
   }
   return *this;

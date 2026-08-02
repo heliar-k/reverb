@@ -18,5 +18,6 @@
 | 2026-07-31 | Ring Open/Read 防御性校验缺口（并发评审 #7） | [ring-open-defensive-gaps.md](ring-open-defensive-gaps.md) | Open 补 version/几何校验（`RingHeader.version` 早已存在，只补校验）;Read 校验 `body_len`（旧代码红测直接 SIGSEGV）;EEXIST 根治 = 段名折入 server epoch（socket+pid+墙上时钟纳秒），同 socket 重启不再 unlink 活段，协议无破坏（段名本就走 Welcome 下发） |
 | 2026-07-31 | SHM 全局 signal-stop 波及进程内所有实例（并发审计 finding 4，文档化结案） | [shm-global-signal-stop.md](shm-global-signal-stop.md) | 拍板不改代码：`g_signal_stop` 文件级原子 + `call_once` 的上限与 self-pipe 升级路径早已写在代码注释；多 server 同进程仅测试使用且无实际危害；重开条件 = 多实例同进程成为受支持用法。附 finding 5（回调 `shared_ptr<ClientState>` 捕获）良性评估，亦不动代码 |
 | 2026-08-01 | `TrajectoryWriter::RunShmWorker` 竞态 SIGSEGV（压测发现） | [shm-writer-worker-race-sigsegv.md](shm-writer-worker-race-sigsegv.md) | 构造顺序竞态：ctor 成员初始化列表启动 worker 线程，但 `stream_worker_` 声明在 `stream_ok_`/`stream_status_` 之前，竞争下 worker 读未构造成员、拷贝未构造 Status 解引用野指针；修复 = `stream_worker_` 声明挪到最后（三构造器同受益）；`WriterCtorDoesNotRaceMemberInit` 回归；压测修复前 8/300 → 修复后 0/300 |
+| 2026-08-02 | SHM 客户端 close-while-in-flight 挂起（压测 hunt 发现） | [shm-close-while-in-flight.md](shm-close-while-in-flight.md) | `ReadBlocking`/writer 读循环的存活探测只看 `control_fd>=0`，fd=-1/被复用时无限自旋（挂起进程忙等 14h，加压 ~47/50 命中）；修复 = `ShmConnection` 加 `closed` 原子标志 + 幂等 `Close()`，两处读循环检查置位即 `UnavailableError`；800 次加压迭代绿 + 全量 65/65；段错误模式结案为前序 WriterCtor 竞态 |
 
 新增 ticket 时直接在本目录开新文件，结案后把一行总结追加到上表。
