@@ -53,10 +53,13 @@ check fails and the real gRPC `SampleStream` path is exercised.
 (`/sys/fs/cgroup/memory/memory.limit_in_bytes`), CPU quota **8 cores**
 (`cfs_quota 800000/100000`, cpuset 3,5,7,9,43,45,47,49), Linux x86_64,
 loopback only. ⚠️ `free`/`/proc/meminfo` in a container show **node** memory
-(251GB), not the pod limit — two benchmark runs were OOM-killed (cgroup
-`oom_kill` counter) before the matrix was sized to the pod. Numbers are
-single-run snapshots; relative ordering is robust across runs, absolute values
-vary ±10% with system load. SHM pool segments are tmpfs and **count toward the
+(251GB), not the pod limit — benchmark runs were OOM-killed (cgroup
+`oom_kill` counter) before the matrix was sized to the pod, and again on
+2026-08-03 when a full matrix mistakenly included `large × --table-size
+10000` (seed alone is 7.7GB/transport; see §5.3). Numbers are single-run
+snapshots; relative ordering is robust across runs, absolute values vary
+±10% with system load (wider, ±15–50%, for CPU-bound insert paths on a busy
+shared node — see §3). SHM pool segments are tmpfs and **count toward the
 pod's 16 GiB** (see §5.3).
 
 **Repro.**
@@ -84,21 +87,22 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 
 | transport | small/1k | small/10k | med/1k | med/10k |
 | --- | --- | --- | --- | --- |
-| in-process | 11967 (82us) | 7942 (105us) | 11706 (84us) | 1821 (98us) |
-| SHM（ticket 03 后） | 7989 (115us) | 8271 (117us) | 6418 (151us) | 6587 (151us) |
-| gRPC | 1465 (657us) | 1506 (655us) | 1282 (770us) | 1191 (802us) |
+| in-process | 11880 (82us) | 11238 (88us) | 11582 (85us) | 11068 (88us) |
+| SHM | 8888 (113us) | 8454 (116us) | 6360 (156us) | 5783 (163us) |
+| gRPC | 1383 (691us) | 1530 (651us) | 1284 (768us) | 1275 (768us) |
 
-（SHM 行为 2026-08-03 ticket
+（全矩阵 2026-08-03 同 session 重跑，含 ticket
 [shm-dispatch-eventfd-wakeup](../ticket/shm-dispatch-eventfd-wakeup.md)
-落地后同 session A/B 复测；另一次高负载抽查确认 p50 减半属实。）
+落地后的 SHM 新口径；small/10k 为三连均值。负载窗口造成的绝对值波动
+见 §1 Environment。）
 
-- **gRPC** 全程 ~1.2–1.5k sps，被 per-call RPC 开销钉死，payload/表大小不敏感。
-- **SHM** ticket 03 后 ~6.4–8.3k sps（旧批次 ~4k）：dispatch 有工作轮次的
-  50us 地板删除，单 client p50 从 ~240us 降到 ~120us；成本仍是 per-call
-  ring 往返，但不再叠加固定轮询延迟。
-- **in-process** 小表最快（~12k），但 **med/10k 塌到 1821**——1.1GB 表上
-  直接访问散布在 chunkstore 里的压缩 chunk，cache/TLB 压力主导；同配置
-  SHM（4005）反而快 2.2 倍，因为结果字节是拷贝进紧凑 pool 区域的。
+- **gRPC** 全程 ~1.3–1.5k sps，被 per-call RPC 开销钉死，payload/表大小不敏感。
+- **SHM** ~5.8–8.9k sps（ticket 03 前 ~4k）：dispatch 有工作轮次的 50us
+  地板删除，单 client p50 从 ~240us 降到 ~120us；成本仍是 per-call ring
+  往返，但不再叠加固定轮询延迟。
+- **in-process** ~11k sps，四格平（82–88us）——旧批次 med/10k 的
+  「塌到 1821」是异常批次（p50 98us 与吞吐自相矛盾），本轮 11068 (88us)
+  自洽：1.1GB 表的 chunkstore 直访问压力被 ~11k sps 吸收，无塌陷。
 - 与旧版文档（shm-benchmark 时代）数字不可直接比：旧数据在另一台机器
   （无 cgroup CPU 配额），SHM 相对 gRPC 的倍数从 ~9–11× 变为 ~3×，主要
   是 gRPC 在本环境变快（1.5k vs 806 sps）。**排序结论不变**：
@@ -110,13 +114,13 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 
 | transport | small b1 | small b8 | small b64 | med b1 | med b8 | med b64 |
 | --- | --- | --- | --- | --- | --- | --- |
-| in-process | 6036 | 21284 | 25083 | 3294 | 7263 | 14275 |
-| SHM（ticket 01 后） | 1685 | 8141 | 20545 | 1543 | 3774 | 8593 |
-| gRPC | 1722 | 5740 | 17471 | 1397 | 4110 | 6542 |
+| in-process | 6419 | 22686 | 25668 | 3785 | 9726 | 11911 |
+| SHM | 3999 | 14960 | 26551 | 2468 | 6252 | 9386 |
+| gRPC | 1910 | 8714 | 18516 | 1442 | 4596 | 7228 |
 
-（表 1k；10k 趋势相同，见 `# RAW`。SHM 行为 2026-08-03 ticket
-[shm-batch-insert](../ticket/shm-batch-insert.md) 落地后复测，
-其余两行是原批次数字。）
+（表 1k；10k 趋势相同，见 `# RAW`。全矩阵 2026-08-03 同 session 重跑：
+ticket 01 批量 INSERT + ticket 03 dispatch 唤醒均已含在 SHM 行；
+in-process/gRPC 行同步刷新以对齐负载窗口。）
 
 - **in-process** 批量摊薄明显（b1→b64 ≈ 4×）。
 - **gRPC** 批量收益大（b1→b64 ≈ 10×）：streaming 天然流水，批量把
@@ -124,10 +128,11 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 - **SHM 批量已生效**（ticket 01 前 b64 仅 ~2.4–2.9k ips）：`RunShmWorker`
   现在把至多 64 个 ready item 合并成**一条** `ShmInsertRequest`——
   流水化 ALLOCATE burst（N 发 N 收按序配对）+ 单条 INSERT + 聚合 ACK，
-  一批 ~2 次 ring 往返（旧实现每 item 2 次）。b64 提速 **small 7.1× /
-  med 3.6×**，超过 gRPC b64（17471/6542）；b1 不变（单 item 仍是 2 次
-  往返）。b64 的残余成本是服务端 per-item 工作（parse/压缩/表插入）——
-  约 45us/item，不再是传输往返。
+  一批 ~2 次 ring 往返（旧实现每 item 2 次）。b64 提速 **small 13× /
+  med 3.4×**，**small b64 反超 in-process**（26551 vs 25668，批量把
+  服务端 per-item 工作摊到 ~45us/item 后，剩余成本低于本地直插的
+  chunker 开销）；b1 也受益于 ticket 03（3999 vs 旧 1685——50us 地板
+  删除 + 负载窗口，见 §1）。
 
 ## 4. 并发读写混合（pipeline，5s 稳态）
 
@@ -135,22 +140,22 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 
 | transport | ins/s w1→w8 | sam/s w1→w8 | 饱和点 |
 | --- | --- | --- | --- |
-| in-process (small) | 4007 → 3411 | 7457 → 6913 | **w1 已饱和**：加线程只增争抢 |
-| SHM (small)（ticket 01+03 后） | 2871 → 2631 | 6259 → 8190 | w4 附近平台（dispatch 单线程 + 表 worker） |
-| gRPC (small) | 1441 → 1900 | 1112 → 2260 | w4 后微增，p99 劣化到 ~15ms |
-| in-process (med) | 2867 → 2826 | 5654 → 5829 | w1 饱和 |
-| SHM (med)（ticket 01+03 后） | 2049 → 2137 | 4070 → 6433 | 同 small |
-| gRPC (med) | 1091 → 1719 | 960 → 1932 | 同 small |
+| in-process (small) | 4472 → 3828 | 8613 → 7800 | **w1 已饱和**：加线程只增争抢 |
+| SHM (small) | 3191 → 2759 | 6806 → 8539 | w4 附近平台（dispatch 单线程 + 表 worker） |
+| gRPC (small) | 1647 → 2212 | 1226 → 2746 | w4 后微增，p99 劣化到 ~15ms |
+| in-process (med) | 3099 → 3062 | 6177 → 6359 | w1 饱和 |
+| SHM (med) | 2331 → 2215 | 4649 → 6883 | 同 small |
+| gRPC (med) | 1174 → 1874 | 1001 → 2201 | 同 small |
 
-（SHM 两行为 2026-08-03 ticket 01+03 落地后同 session A/B 复测；
-其余行为原批次。）
+（全矩阵 2026-08-03 同 session 重跑，ticket 01+03 均已含在 SHM 行。
+in-process/gRPC 温度计与上批次 +4~14%，一致。）
 
 - **单表并发天花板 = 单 table worker 线程**：in-process 下 w1r1 即满，
   w8r8 反而略降（锁争抢）。要更高单表吞吐只能靠**加表分片**（多 worker
   线程），不是加 client 线程。
 - **SHM 采样随连接数扩展良好**：ticket 03（dispatch 去 50us 地板）后
-  w1r1 即 ~6.3k sam/s（旧 ~3.8k），w8r8 ~8.2k；写入侧叠加 ticket 01
-  批量 INSERT，w1r1 ~2.9k ins/s（旧 ~1.5k），w4 后平台不变。
+  w1r1 即 ~6.8k sam/s（旧 ~3.8k），w8r8 ~8.5k；写入侧叠加 ticket 01
+  批量 INSERT，w1r1 ~3.2k ins/s（旧 ~1.5k），w4 后平台不变。
 - **w8r8 全配置存活**——修复 ticket「shm-close-while-in-flight」前，
   此场景会让客户端进程无声死亡（连接被服务端回收后客户端读循环无限
   自旋，见 `docs/ticket/shm-close-while-in-flight.md`）。
@@ -165,31 +170,32 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 
 ### 5.1 结果
 
-（⚠️ 本节全部为 ticket 01+03 落地前批次，large payload 未复测；SHM 的
-small/med 新口径见 §2/§3/§4。）
+（2026-08-03 全矩阵重跑批次：sample/insert 为按传输拆进程复测值，
+pipeline 为按传输拆进程跑——见 §5.3 内存约束。）
 
 sample / insert 吞吐（表 500，单 client）：
 
 | transport | sample sps (p50) | insert b1 ips | insert b8 ips |
 | --- | --- | --- | --- |
-| in-process | 7427 (129us) | 827 | 1191 |
-| SHM | 2201 (449us) | 568 | 938 |
-| gRPC | 667 (1370us) | 595 | 1109 |
+| in-process | 7602 (131us) | 1091 | 1693 |
+| SHM | 2589 (377us) | 682 | 1143 |
+| gRPC | 754 (1293us) | 620 | 1253 |
 
 pipeline（5s，聚合）：
 
 | transport | w1r1 ins/sam | w2r2 ins/sam |
 | --- | --- | --- |
-| in-process | 1147 / 3185 | 1289 / 2810 |
-| SHM | 661 / 1326 | 857 / 1436 |
-| gRPC | 498 / 563 | 717 / 708 |
+| in-process | 1132 / 3173 | 1510 / 3280 |
+| SHM | 822 / 1248 | 1108 / 1738 |
+| gRPC | 510 / 583 | 809 / 803 |
 
-- 大 payload 下三者的 **insert 趋同**（b1 ~570–830 ips）：770KB 的序列化/
-  压缩主导，传输差异被摊平。SHM b1→b8 有 ~1.7×（本行为 ticket 01 前批
-  次；ticket 01 后批量效应见 §3）。
-- **sample 差距拉开**：in-process 7427（无序列化直切）≫ SHM 2201 ≈ 3.3×
-  gRPC 667。SHM sample 的 p50 从 small ~250us 涨到 449us，**payload 相关
-  成本 ≈ 200us/770KB-sample**（服务端解压 + memcpy 进 pool + 客户端读出）。
+- 大 payload 下三者的 **insert 趋同**（b1 ~620–1090 ips）：770KB 的序列化/
+  压缩主导，传输差异被摊平；b8 批量收益收窄（~1.2–1.6×，同 session 内
+  in-process 略优）。
+- **sample 差距拉开**：in-process 7602（无序列化直切）≫ SHM 2589 ≈ 3×
+  gRPC 754。SHM sample 的 p50 从 small ~120us 涨到 ~380us（旧批次 449us，
+  ticket 03 收益在 large 上同样体现），**payload 相关成本 ≈ 260us/
+  770KB-sample**（服务端解压 + memcpy 进 pool + 客户端读出）。
 - 内存：in-process w2r2 峰值 RSS ~10.3GB、SHM w2r2 ~6.8GB（`# RAW`）。
 
 ### 5.2 v2（insert 字节复用为 sample 切片源）重启裁决
@@ -198,8 +204,10 @@ pipeline（5s，聚合）：
 路径，且 in-process 天花板不再是约束」。用本节数据复核：
 
 - v2 能消除的是服务端 **解压→memcpy 进 pool** 那一段，量级 ≈
-  100–200us/770KB-sample，占 SHM large sample 耗时的 **~20–45%**——
-  有真实收益，但有上界：客户端从 pool 读出的那份拷贝 v2 消不掉。
+  260us/770KB-sample（large 相对 small 的 p50 增量），占 SHM large
+  sample 耗时（~380us）的 **~68%**——ticket 03 砍掉固定往返成本后
+  payload 相关成本占比反而更突出。有真实收益，但有上界：客户端从
+  pool 读出的那份拷贝 v2 消不掉。
 - 新出现的数据点**对 v2 不利**：v2 要在 pool 里长期保留 insert 原始
   （未压缩）字节，而 §5.3 刚证明 pool 触及页就是内存高水位——v2 会把
   高水位从「流量工作集」抬到「全量未压缩表内容」，在 16GiB pod 里这是
@@ -210,11 +218,16 @@ pipeline（5s，聚合）：
 
 ### 5.3 SHM 内存成本：每连接 pool 高水位
 
-大 payload 批次两次被 cgroup OOM 杀死（`oom_kill` 97→100），定位结论：
+大 payload 批次先后多次被 cgroup OOM 杀死（`oom_kill` 97→100），定位结论：
 
 - **每个 SHM 连接的 pool 段默认 ~1.4GB**（9 档 slab × 256 blocks，
   `byte_pool.h: kDefaultSlabSizes` 最大 4MB×256）。ftruncate 稀疏分配，
   **按触及页计费**（tmpfs 计入 cgroup 内存配额），高水位后不回落。
+- **`--table-size` 是第二颗炸弹**：`_seed` 按表容量全量写入，
+  large（770KB）× 表 10k = **seed 7.7GB/transport**，insert 累积后表
+  容量 20000 条 ≈ 15.4GB 上界——2026-08-03 全矩阵误用 `--table-size
+  10000` 连续两次 OOM 的根因。大 payload 必须 `--table-size 500`
+  （seed 385MB），文档 Repro 命令已是正确口径。
 - w4r4 一轮 pipeline 会建 7 条 factory 连接 + 1 基础连接 + server 侧
   pool ≈ 9 个 pool 映射，大 payload 流量几分钟内把触及页推向 ~12GB。
 - 单进程跨传输阶段（in-process→SHM→gRPC）内存**只增不减**（表、pool、
