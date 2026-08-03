@@ -19,7 +19,7 @@ structured_writer -> sample round trip over POSIX shared memory, mirroring
 `in_process_test.py` for the third transport. No TensorFlow; numpy only.
 
 Coverage spans v1 (tickets ①-⑦: ring/bootstrap/pool/sample/insert/crash)
-and v2 (⑧ server_info bootstrap snapshot, ⑨ multi-table, ⑩ mutate/reset +
+and v2 (⑧ server_info on-demand round-trip, ⑨ multi-table, ⑩ mutate/reset +
 deadlock regression, ⑫ pickle, ⑬ legacy writer/insert NotImplementedError,
 ⑧-2b validate_items, ⑪ checkpoint). The C++ ShmServer dispatch handles
 SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops mutate_priorities/
@@ -569,25 +569,25 @@ class ShmClientServerInfoTest(absltest.TestCase):
         self.assertIsNotNone(info["t"].remover_options)
         # No signature declared on this table -> None.
         self.assertIsNone(info["t"].signature)
-        # The snapshot is taken at Connect time, before any insert -> empty.
+        # No inserts yet -> current_size 0 (live round-trip at call time).
         self.assertEqual(info["t"].current_size, 0)
 
     def test_server_info_reflects_size_at_connect_time(self):
-        # Insert items via the in-process path BEFORE the ShmClient connects,
-        # so the bootstrap snapshot sees a non-empty table.
+        # Insert items via the in-process path BEFORE the ShmClient connects;
+        # the first server_info() call sees them (live round-trip).
         server, _ = _make_shm_server(table_name="t", max_size=10, min_size=1)
         local = server.in_process_client
         for i in range(3):
             _insert_one(local, "t", np.array([float(i)], dtype=np.float32))
 
-        # Now connect an ShmClient; its snapshot captures the 3 items.
+        # Now connect an ShmClient; server_info() reflects the 3 items.
         client = reverb.ShmClient(server.shm_socket_path)
         info = client.server_info()
         self.assertEqual(info["t"].current_size, 3)
 
     def test_server_info_carries_table_signature(self):
-        # A table built with a signature propagates it through the bootstrap
-        # snapshot so _get_signature_for_table (and thus
+        # A table built with a signature propagates it through server_info()
+        # so _get_signature_for_table (and thus
         # sample(unpack_as_table_signature=True)) can find the table.
         sig = {"v": signature_codec.TensorSpec((None, 1), np.float32, "v")}
         server = reverb.Server(
@@ -616,8 +616,8 @@ class ShmClientServerInfoTest(absltest.TestCase):
         # The regression that motivated ticket ⑧: before the fix,
         # sample(unpack_as_table_signature=True) threw
         # `ValueError: Could not find table` because server_info() returned {}
-        # and the signature cache was empty. Now the bootstrap snapshot feeds
-        # the cache, so unpacking against the table signature works.
+        # and the signature cache was empty. Now server_info() feeds the cache,
+        # so unpacking against the table signature works.
         sig = {
             "obs": signature_codec.TensorSpec((None, 1), np.float32, "obs"),
         }
@@ -696,7 +696,7 @@ class ShmClientServerInfoTest(absltest.TestCase):
 
 class ShmClientValidateItemsTest(absltest.TestCase):
     """ticket ⑧ step 2b: trajectory_writer populates flat_signature_map from
-    the cached bootstrap server_info so CreateItem's ItemAndRefs::Validate runs
+    the live server_info round-trip so CreateItem's ItemAndRefs::Validate runs
     the same signature check as gRPC/LocalClient. Previously the map was left
     empty and validate_items was a no-op."""
 
@@ -931,7 +931,7 @@ class ShmMultiTableTest(absltest.TestCase):
     def test_unknown_table_insert_returns_error(self):
         # ticket ⑧-2b: an unknown table name is now rejected at CreateItem
         # time by ItemAndRefs::Validate (the flat_signature_map built from the
-        # bootstrap snapshot doesn't contain it), surfacing as ValueError
+        # live server_info round-trip doesn't contain it), surfacing as ValueError
         # (C++ InvalidArgumentError) — mirroring InProcessClient/gRPC
         # validate_items=True. Previously (v1, empty map) it reached the server
         # and surfaced as FileNotFoundError on flush().
@@ -973,9 +973,8 @@ class ShmMutateResetTest(absltest.TestCase):
         server.stop()
 
     def test_mutate_priorities_deletes_item(self):
-        # server_info() is a bootstrap snapshot (won't reflect the delete), so
-        # verify via the live in-process client's server_info, which sees the
-        # real table state.
+        # ticket ⑧ step 2: server_info() is a live round-trip on both
+        # transports, so verify via the in-process client here.
         server, client = self._make_server(max_size=10)
         for i in range(3):
             _insert_one(client, "t", np.array([float(i)], dtype=np.float32))

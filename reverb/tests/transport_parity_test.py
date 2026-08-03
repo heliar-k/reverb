@@ -23,9 +23,9 @@ write/read semantics surfaces as a cross-transport mismatch.
 SHM supports all tables (routed by table name, ticket ⑨); each test builds a
 single-table server per transport. `mutate_priorities`/`reset` (ticket ⑩)
 and `checkpoint` (ticket ⑪) are SHM-supported (riding the insert flow under
-a client mutex); `server_info` is a bootstrap-time snapshot on SHM (does not
-reflect mid-session `Table.replace`), so live-`server_info` parity is
-asserted only between gRPC and LocalClient. The shared write→sample round
+a client mutex); `server_info` is a live `SERVER_INFO` round-trip per call
+on SHM (ticket ⑧ step 2, mirrors gRPC's refresh-on-every-call semantics;
+server_info coverage lives in shm_test.py's server_info tests). The shared write→sample round
 trip remains the primary parity guard.
 """
 

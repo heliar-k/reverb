@@ -1,12 +1,13 @@
 # SHM 传输层实现规格说明书
 
-> 本文档由 [numpy-shm-design.md](../design/numpy-shm-design.md) 转化而来，补充了文件结构、
-> BUILD 规则、类声明、测试策略和集成细节，供直接开发使用。面向已阅读设计文档
-> 的开发者。
+> 本文档由 [numpy-shm-design.md](../design/numpy-shm-design.md) 转化而来，是 SHM
+> 传输层的**实现现状规格**：文件结构、BUILD 规则、类声明、proto、pybind、测试策略
+> 与边界情况，均以 `reverb/cc/shm/` 当前代码为准。文档经历了 plan → 实现两个阶段：
+> 早期"规划"表述（未实现的功能、预留字段、设想架构）已随实现同步删除或改写，若发现
+> 与代码不符，以代码为准并修本文档。面向已阅读设计文档的开发者。
 
 ## 目录
 
-- [0. 审阅意见摘要](#0-审阅意见摘要)
 - [1. 文件布局](#1-文件布局)
 - [2. 构建规则（BUILD）](#2-构建规则build)
 - [3. C++ 接口与类](#3-c-接口与类)
@@ -17,825 +18,757 @@
   - [3.5 Client 侧](#35-client-侧)
 - [4. Proto 定义](#4-proto-定义)
 - [5. pybind 绑定](#5-pybind-绑定)
-- [6. Python 层变更](#6-python-层变更)
-- [7. 实现顺序](#7-实现顺序)
-  - [Phase 1：基础设施](#phase-1基础设施)
-  - [Phase 2：控制面](#phase-2控制面)
-  - [Phase 3：数据面](#phase-3数据面)
-  - [Phase 4：Python 集成](#phase-4python-集成)
-  - [Phase 5：端到端验证](#phase-5端到端验证)
+- [6. Python 层](#6-python-层)
+- [7. 线程模型与数据流](#7-线程模型与数据流)
 - [8. 测试策略](#8-测试策略)
 - [9. 边界情况与错误处理](#9-边界情况与错误处理)
 - [附录：关键实现决策说明](#附录关键实现决策说明)
 
 ---
 
-## 0. 审阅意见摘要
-
-设计文档质量较高，§8 的 ring 协议提供了可直接编码的伪代码。
-以下为开发前需注意的遗漏/不明确之处：
-
-| # | 问题 | 说明 |
-| --- | ------ | ------ |
-| R1 | **C++ 类声明缺失** | 无完整头文件，仅见伪代码。需补全 `ShmBytePool`、`ShmCtrlRing`、`ShmConnection`、`ShmServer`、`ShmClient` 的类声明。 |
-| R2 | **BUILD 规则未定义** | 未提供 Bazel 构建目标。需为 `reverb/cc/shm/` 子目录新建 BUILD，并在 `reverb/cc/BUILD` 更新相关依赖。 |
-| R3 | **线程模型细节不足** | §4.4 说 dispatch 单线程 + 表 worker 池，但未说明 dispatch 线程与 `Table` worker 线程池如何交互（dispatch 直接调 `Table::InsertOrAssignAsync` / `Table::Sample`？dispatch 调完后 callback 写回 S→C ring？）。需明确 callback 分发路径。 |
-| R4 | **ShmServer 的生命周期管理** | 谁持有 `ShmServer`？`Server` Python 对象创建时启动，`Server.stop()` 时停止。需在 pybind `Server` 类中加 `shm` 参数，创建 `ShmServer` 线程。 |
-| R5 | **client 侧 `ShmConnection` 线程模型** | client 读 S→C ring 是轮询还是阻塞？设计文档说 client 异步（等待 confirm），但未说明轮询在哪条线程（调用者线程？后台线程？）。建议统一：**写（C→S）+ 读（S→C）都在调用者线程同步完成**，读不到时忙等/有限退避。避免引入后台线程。 |
-| R6 | **shm_unlink 与进程崩溃** | POSIX `shm_open` 创建的段在**最后一个 `munmap` + `shm_unlink`** 时销毁。server 进程异常退出时不自动清理 SHM 段，重启时 `/dev/shm/` 残留旧段。需 server 启动时尝试 `shm_unlink` 旧段（同名 PID 不同则跳过），或使用 `O_EXCL` 创建避免冲突。 |
-| R7 | **udsocket 路径冲突** | `/tmp/reverb_shm_<pid>.sock` 在 server 崩溃重启后 PID 可能不变（若 fork 或 container restart），导致 `bind` 失败。需 `unlink` 旧 socket + 重新 bind。 |
-| R8 | **缺失 slab 大小配置** | §4.1 说档位"可配"但未给出默认值。建议默认：`{64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304}`（即 64B–4MB，约 5.5MB/档位的元数据开销）。 |
-| R9 | **release 时序问题** | §4.1 说 client 读完发 release 请求。但 insert 的 chunk 字节何时 release？设计文档说 insert 完成后 server 回 `INSERT_ACK` 带 `offsets_to_release`。但 insert 路径下，client 发完数据后需要等 server 确认两件事：① chunk 已被 server 读入 SHM（即压缩到 ChunkStore 完成）；② 偏移可以释放。这个时序需明确：`INSERT` 请求的 SHM 偏移在收到 `INSERT_ACK` 的 `offsets_to_release` 前，client 必须保持数据有效。**实际上 client 发完 INSERT 后不应立即重用该偏移**——需等 server 确认 server 侧已完成压缩。 |
-| R10 | **sample 路径下 SHM 偏移的引用计数起点** | §4.1 说 sample 发 N 列则各偏移 +1，但 SHM 偏移是在 server 侧分配（memcpy 进池）时就设 refcount=1，还是发 S→C 响应时才设？建议：server `sample` 分配池空间 + memcpy 时设 refcount=1，响应发出后 client 读到再做 release。client 崩溃时 server 集中释放所有 outstanding 偏移（refcount 递减到 0 即回收）。 |
-| R11 | **多线程安全：ShmBytePool 分配** | §4.1 说 server 单线程分配/回收。但 §4.4 说 dispatch 单线程 + 表 worker 池。如果 sample 的 `UnpackChunkColumnAndSlice` 在 worker 池执行，而该操作需分配 SHM 字节，则存在竞争。建议：SHM 分配只在 dispatch 线程进行。worker 解压后传回 `TensorBuffer`，由 dispatch 线程 memcpy 进池。这样可以保持分配单线程化。 |
-| R12 | **信号与清理** | server 收到 SIGTERM/SIGINT 时需清理 SHM 段和 udsocket。当前 Server 的 `__del__`/`stop()` 路径需扩展到 ShmServer。 |
-| R13 | **init 中 `_import_array()` 的依赖** | pybind.cc 的 `PYBIND11_MODULE` 入口调用了 `_import_array()`。在新增的 shm/ 模块中如果使用 `py::array_t` 需确保 numpy C-API 已初始化。建议统一在 pybind.cc 中注册所有 shm 绑定，复用已存在的 `_import_array()` 调用。 |
-
----
-
 ## 1. 文件布局
 
-新增 `reverb/cc/shm/` 目录，所有 SHM 传输层代码集中于此：
+SHM 传输层代码集中在 `reverb/cc/shm/`：
 
 ```
 reverb/cc/shm/
-├── BUILD                       # Bazel 构建规则
-├── ring.h                      # ShmCtrlRing (SPSC ring buffer)
-├── ring.cc
-├── ring_test.cc
-├── byte_pool.h                 # ShmBytePool (slab-based POSIX shm allocator)
-├── byte_pool.cc
-├── byte_pool_test.cc
-├── bootstrap.h                 # ShmBootstrap (udsocket bootstrap + health)
-├── bootstrap.cc
-├── bootstrap_test.cc
-├── shm_server.h                # ShmServer (dispatch thread + per-client state)
-├── shm_server.cc
-├── shm_server_test.cc
-├── shm_client.h                # ShmClient (C++ side, pybind ready)
-├── shm_client.cc
-├── shm_client_test.cc
-├── shm_protocol.proto           # SHM 专有 proto 消息
-└── shm_connection.h            # ShmConnection (持有三组 mmap 指针)
+├── BUILD                       # Bazel 构建规则（10 个测试目标）
+├── ring.h / ring.cc            # ShmCtrlRing：SPSC ring buffer（POSIX shm 段）
+├── ring_test.cc                # ring 单元测试
+├── byte_pool.h / byte_pool.cc  # ShmBytePool：slab 档位 POSIX shm 分配器
+├── byte_pool_test.cc           # 字节池单元测试
+├── byte_pool_echo_test.cc      # pool+ring 双进程回声（跨进程读写校验）
+├── bootstrap.h / bootstrap.cc  # ShmBootstrapServer：udsocket 握手 + 段名生成
+├── bootstrap_test.cc           # 握手单测
+├── echo_test.cc                # 最简握手 + 回声端到端
+├── shm_connection.h / shm_connection.cc  # ShmConnection：五段 mmap 的 RAII 聚合
+├── shm_server.h / shm_server.cc          # ShmServer：dispatch 线程 + per-client 状态
+├── shm_client.h / shm_client.cc          # ShmClient + ShmSampler（pybind 就绪）
+├── shm_sample_test.cc          # sample 路径集成测试
+├── shm_insert_test.cc          # insert 路径集成测试
+├── shm_crash_test.cc           # 崩溃恢复测试
+├── shm_checkpoint_test.cc      # checkpoint 集成测试
+├── shm_wakeup_test.cc          # eventfd 唤醒（ticket 03）测试
+└── shm_protocol.proto          # SHM 专有 proto 消息
 ```
 
----
+> 注意：不存在独立的 `shm_server_test.cc` / `shm_client_test.cc`（plan 时代设想），
+> 端到端覆盖由上面 7 个 SHM 集成测试分担（见 §8）。
 
 ## 2. 构建规则（BUILD）
 
-```python
-# reverb/cc/shm/BUILD
+`reverb/cc/shm/BUILD` 内的目标（用 `reverb_cc_library` / `reverb_cc_test` /
+`reverb_cc_proto_library` 封装）：
 
-load(
-    "//reverb/cc/platform:build_rules.bzl",
-    "reverb_cc_library",
-    "reverb_cc_test",
-    "reverb_cc_proto_library",
-)
+| 目标 | 类型 | 说明 |
+| --- | --- | --- |
+| `shm_protocol_cc_proto` | proto | deps：`//reverb/cc:schema_cc_proto`、`patterns_cc_proto`、`reverb_service_cc_proto`、`//third_party/reverb_tensor:reverb_tensor_cc_proto` |
+| `ring` | library | deps：`:shm_protocol_cc_proto` + absl（status/strings/span） |
+| `byte_pool` | library | `alwayslink = 1`（libpybind.so 静态链接需要间接符号）；deps：absl flat_hash_map/status/synchronization/span |
+| `bootstrap` | library | deps：`:shm_protocol_cc_proto` + absl |
+| `shm_connection` | library | 聚合 ring + byte_pool |
+| `shm_server` | library | deps：bootstrap/byte_pool/ring/shm_connection/proto + `//reverb/cc:table`、`sampler`、`chunk_store`、`tensor_compression`、`support:task_executor`、`checkpointing` 等 |
+| `shm_client` | library | deps：bootstrap/byte_pool/ring/shm_connection/proto + `//reverb/cc:chunker`、`sampler`、`trajectory_writer`、`structured_writer`、`writer` 等 |
+| `ring_test` / `byte_pool_test` / `byte_pool_echo_test` / `bootstrap_test` / `echo_test` / `shm_sample_test` / `shm_insert_test` / `shm_crash_test` / `shm_checkpoint_test` / `shm_wakeup_test` | test | 10 个测试目标（见 §8） |
 
-package(default_visibility = ["//reverb:__subpackages__"])
-
-# ---- Proto ----
-
-reverb_cc_proto_library(
-    name = "shm_protocol_cc_proto",
-    srcs = ["shm_protocol.proto"],
-    deps = [
-        "//reverb/cc:schema_cc_proto",
-        "//reverb/cc:patterns_cc_proto",
-        "//third_party/reverb_tensor:reverb_tensor_cc_proto",
-    ],
-)
-
-# ---- Ring ----
-
-reverb_cc_library(
-    name = "ring",
-    srcs = ["ring.cc"],
-    hdrs = ["ring.h"],
-    deps = [
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
-    ],
-)
-
-reverb_cc_test(
-    name = "ring_test",
-    srcs = ["ring_test.cc"],
-    deps = [
-        ":ring",
-        "//reverb/cc/platform:status_matchers",
-        "@com_google_absl//absl/status",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-# ---- Byte Pool ----
-
-reverb_cc_library(
-    name = "byte_pool",
-    srcs = ["byte_pool.cc"],
-    hdrs = ["byte_pool.h"],
-    deps = [
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-    ],
-)
-
-reverb_cc_test(
-    name = "byte_pool_test",
-    srcs = ["byte_pool_test.cc"],
-    deps = [
-        ":byte_pool",
-        "//reverb/cc/platform:status_matchers",
-        "@com_google_absl//absl/status",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-# ---- Bootstrap (udsocket) ----
-
-reverb_cc_library(
-    name = "bootstrap",
-    srcs = ["bootstrap.cc"],
-    hdrs = ["bootstrap.h"],
-    deps = [
-        ":ring",
-        "//reverb/cc:schema_cc_proto",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-    ],
-)
-
-reverb_cc_test(
-    name = "bootstrap_test",
-    srcs = ["bootstrap_test.cc"],
-    deps = [
-        ":bootstrap",
-        "//reverb/cc/platform:status_matchers",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-# ---- ShmConnection ----
-
-reverb_cc_library(
-    name = "shm_connection",
-    hdrs = ["shm_connection.h"],
-    deps = [
-        ":ring",
-        ":byte_pool",
-    ],
-)
-
-# ---- ShmServer ----
-
-reverb_cc_library(
-    name = "shm_server",
-    srcs = ["shm_server.cc"],
-    hdrs = ["shm_server.h"],
-    deps = [
-        ":bootstrap",
-        ":byte_pool",
-        ":ring",
-        ":shm_connection",
-        ":shm_protocol_cc_proto",
-        "//reverb/cc:table",
-        "//reverb/cc:sampler",
-        "//reverb/cc:chunk_store",
-        "//reverb/cc:tensor_compression",
-        "//reverb/cc/platform:hash_set",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ],
-)
-
-reverb_cc_test(
-    name = "shm_server_test",
-    srcs = ["shm_server_test.cc"],
-    deps = [
-        ":shm_server",
-        ":shm_client",
-        "//reverb/cc/chunker",
-        "//reverb/cc:rate_limiter",
-        "//reverb/cc/selectors:fifo",
-        "//reverb/cc/selectors:uniform",
-        "//reverb/cc/platform:status_matchers",
-        "//reverb/cc/support:tensor_proxy",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-# ---- ShmClient ----
-
-reverb_cc_library(
-    name = "shm_client",
-    srcs = ["shm_client.cc"],
-    hdrs = ["shm_client.h"],
-    deps = [
-        ":bootstrap",
-        ":byte_pool",
-        ":ring",
-        ":shm_connection",
-        ":shm_protocol_cc_proto",
-        "//reverb/cc:chunker",
-        "//reverb/cc:sampler",
-        "//reverb/cc:writer",
-        "//reverb/cc:schema_cc_proto",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/time",
-    ],
-)
-
-reverb_cc_test(
-    name = "shm_client_test",
-    srcs = ["shm_client_test.cc"],
-    deps = [
-        ":shm_client",
-        ":shm_server",
-        "//reverb/cc/platform:status_matchers",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-```
-
-并在 `reverb/cc/BUILD` 中将 `//reverb/cc/shm:shm_server` / `//reverb/cc/shm:shm_client`
-加入 pybind 目标依赖。
-
----
+`reverb/pybind.cc` 的 pybind 目标依赖 `//reverb/cc/shm:shm_server` 与
+`//reverb/cc/shm:shm_client`（§5）。
 
 ## 3. C++ 接口与类
 
-### 3.1 Ring 协议 `ShmCtrlRing`
+### 3.1 Ring 协议
 
 ```cpp
 // reverb/cc/shm/ring.h
-
-#ifndef REVERB_CC_SHM_RING_H_
-#define REVERB_CC_SHM_RING_H_
-
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <string>
-
-#include "absl/base/internal/endian.h"
-#include "absl/status/status.h"
-#include "absl/types/span.h"
 
 namespace deepmind {
 namespace reverb {
 namespace shm {
 
-// 常量
 inline constexpr uint64_t kRingMagic = 0x524556524253484DULL;  // "REVRBSHM"
 inline constexpr uint32_t kRingVersion = 1;
-inline constexpr size_t kDefaultSlotSize = 256;      // bytes
-inline constexpr size_t kDefaultCapacity = 1024;      // slots (256KB/ring)
+inline constexpr size_t kDefaultSlotSize = 256;   // bytes（含 SlotHeader）
+inline constexpr size_t kDefaultCapacity = 1024;  // slots（256KB/段）
 
-// 段头 (64字节, 单 cache line)
+// 段头，恰好 128 字节 = 2 条 cache line。
+// head（生产者）在 line 0，tail（消费者）在 line 1，防 false sharing。
+// 均从 1 开始；seq 0 表示槽从未写过。显式字段布局 + pad，不用 alignas(64)
+// 成员（那会撑大结构体）。
 struct RingHeader {
+  // Line 0 (offset 0..63)。
   uint64_t magic = kRingMagic;
   uint32_t version = kRingVersion;
-  uint32_t capacity = kDefaultCapacity;       // 槽位数 (2的幂)
-  uint32_t slot_size = kDefaultSlotSize;      // 每槽字节数 (含 SlotHeader)
-  uint32_t reserved = 0;
-  // 以下各占独立 cache line
-  alignas(64) std::atomic<uint64_t> producer_seq{1};   // 下一个要写的槽的 seq
-  alignas(64) std::atomic<uint64_t> consumer_seq{1};   // 下一个要读的槽的 seq
-  uint64_t capacity_mask = capacity - 1;      // capacity - 1
-  uint64_t padding[5];                        // 填满 cache line (64 字节对齐)
+  uint32_t capacity = kDefaultCapacity;   // 槽位数（2 的幂）
+  uint32_t slot_size = kDefaultSlotSize;  // 每槽字节数（含 SlotHeader）
+  // ticket 03（原 `reserved`）：server-asleep 标志，每个 C→S ring 一份。
+  // server dispatch 线程在进入 poll() 阻塞前对每条 c2s ring 置 1（seq_cst）；
+  // client 的 WriteBlocking 在成功写入后 load 该标志（seq_cst），仅当置位时
+  // 才向 control_fd 发 1 字节唤醒——server 醒着时热路径零新增 syscall。
+  // 双端都 seq_cst（非 release/acquire）：这是经典 flag-then-recheck 模式，
+  // 发布标志与重读 ring 之间发生 store→load 重排就是 missed-wakeup 漏洞。
+  // 混版本退化安全：旧 client 不读标志（server 50ms poll 兜底）、
+  // 旧 server 不置位（client 永不发字节）。
+  std::atomic<uint32_t> server_asleep{0};
+  uint64_t capacity_mask = kDefaultCapacity - 1;
+  std::atomic<uint64_t> head{1};  // 生产者：下一个要写的槽的 seq
+  uint64_t pad0[3];               // 填满 line 0
+  // Line 1 (offset 64..127)。
+  std::atomic<uint64_t> tail{1};  // 消费者：下一个要读的槽的 seq
+  uint64_t pad1[7];               // 填满 line 1
 };
-static_assert(sizeof(RingHeader) == 128,
-              "RingHeader must be exactly 128 bytes (2 cache lines)");
+static_assert(sizeof(RingHeader) == 128, "RingHeader 必须恰好 128 字节（2 cache lines）");
 
-// 槽头
+// 槽头，恰好 16 字节。seq 是写入时生产者的 head 值；消费者在
+// seq == 期望 tail 时判定槽有效。seq 0 = 从未写入。
 struct SlotHeader {
-  uint64_t seq;            // 写入方的 producer_seq (consumer 据此判有效)
-  uint16_t msg_type;       // 消息类型 (见 shm_protocol.proto 的 msg_type 枚举)
-  uint16_t flags;          // bit0: HAS_CONTINUATION; bit1: IS_CONTINUATION
-  uint32_t body_len;       // 本槽 body 字节数 (<= slot_size - sizeof(SlotHeader))
+  uint64_t seq = 0;      // 经 Ring::Write/Read 的 atomic 操作发布
+  uint16_t msg_type = 0; // MsgType 枚举值（线上为裸 uint16）
+  uint16_t flags = 0;    // bit0: HAS_CONTINUATION; bit1: IS_CONTINUATION
+  uint32_t body_len = 0; // 本槽 body 字节数（<= slot_size - 16）
 };
-static_assert(sizeof(SlotHeader) == 16, "SlotHeader must be exactly 16 bytes");
-
-// 消息类型枚举 (对应 §8.3 `numpy-shm-design.md`)
-enum class MsgType : uint16_t {
-  kHello = 1,
-  kInsert = 2,
-  kSample = 3,
-  kRelease = 4,
-  kMutatePriorities = 5,
-  kReset = 6,
-  kCheckpoint = 7,
-  kServerInfo = 8,
-  kClose = 9,
-  // S→C
-  kWelcome = 101,
-  kInsertAck = 102,
-  kSampleResp = 103,
-  kError = 104,
-  kMutateAck = 105,
-  kResetAck = 106,
-  kCheckpointResp = 107,
-  kServerInfoResp = 108,
-};
+static_assert(sizeof(SlotHeader) == 16, "SlotHeader 必须恰好 16 字节");
 
 inline constexpr uint16_t kFlagHasContinuation = 0x0001;
 inline constexpr uint16_t kFlagIsContinuation = 0x0002;
 
-// 一条 SPSC ring (POD, 可 mmap 共享)
-struct Ring {
-  RingHeader* header;                 // 指向 mmap 后的段头
-  SlotHeader* slots;                  // 指向槽数组 (紧跟 header 之后)
+// SPSC ring：一端 Create（server/owner），另一端 Open（client）。
+// Write 满时阻塞（忙等 sched_yield）；Read 非阻塞，无消息时返回
+// NotFoundError("NOT_READY")。需要阻塞语义的调用方策略在 ShmConnection（R5）。
+class Ring {
+ public:
+  // owner 侧：创建 + ftruncate 新 SHM 段，初始化 header。
+  static absl::StatusOr<Ring> Create(std::string shm_name,
+                                     uint32_t capacity = kDefaultCapacity,
+                                     uint32_t slot_size = kDefaultSlotSize);
+  // client 侧：打开已有 SHM 段（读写）。
+  static absl::StatusOr<Ring> Open(std::string shm_name);
 
-  // 写入一条消息 (blocking via spinlock/yield)
-  // `body` 为序列化后的 protobuf 字节
-  absl::Status Write(uint16_t msg_type, const std::string& body);
+  // 写一条消息（可能跨多槽）。阻塞（sched_yield）直到有足够连续空槽；
+  // 消息比整个 ring 大返回 RESOURCE_EXHAUSTED。
+  absl::Status Write(MsgType msg_type, absl::Span<const char> payload);
 
-  // 读取一条消息 (非阻塞)
-  // 返回 NOT_FOUND 表示无数据
-  absl::Status Read(uint16_t& msg_type, std::string& body);
+  // 非阻塞写（ticket ⑥ / design §8.7）：槽位不够时立即返回
+  // ResourceExhaustedError("RING_FULL")，不动 head——调用方
+  // （ShmServer::EnqueueS2C）把消息暂存 outbox 下轮重试，不阻塞 dispatch。
+  absl::Status TryWrite(MsgType msg_type, absl::Span<const char> payload);
 
-  // 可写的槽位数
-  size_t AvailableSlots() const;
+  // 读一条消息，重组跨槽片段。非阻塞：无消息时立即返回
+  // NotFoundError("NOT_READY")；首槽后缺 continuation 槽是损坏信号，
+  // 返回 InternalError。
+  absl::Status Read(MsgType* msg_type, std::string* payload);
 
-  // 计算槽数组的总字节数
-  static size_t SlotsBytes(size_t capacity, size_t slot_size);
+  // ticket 03：有消息可读（消费者视角：下一槽 seq 已发布）。与 Read 同一
+  // acquire 配对；供 ShmServer 进入 poll() 前的 quiescence 检查使用。
+  bool HasData() const;
 
-  // 计算整个段的总字节数 (header + slots)
-  static size_t TotalBytes(size_t capacity, size_t slot_size);
+  // ticket 03：共享内存中的 asleep 标志（见 RingHeader）。server 写、client 读，
+  // 双端 seq_cst。
+  std::atomic<uint32_t>* server_asleep() const;
+
+  uint32_t capacity() const;
+  uint32_t slot_size() const;
+  const std::string& shm_name() const;
+
+  // 给定几何的整段字节数（header + slots）。
+  static size_t TotalBytes(uint32_t capacity, uint32_t slot_size);
 };
 
 }  // namespace shm
 }  // namespace reverb
 }  // namespace deepmind
-
-#endif  // REVERB_CC_SHM_RING_H_
 ```
 
-**实现要点**（见设计文档 §8.4）：
+**实现要点**（design §8.4）：
 
-- `Write` 中等待可用空间用 `sched_yield()` 忙等；若 `/proc/sys/kernel/sched_yield` 不可用，可用 `std::this_thread::yield()`。
-- `Read` 非阻塞：检查 `slot.seq != consumer_seq` 时直接返回 `NotFoundError("NOT_READY")`。
-- 关键正确性：写方先填 body 最后 `release(seq)`，读方 `acquire(seq)` 确认就绪再读 body。
+- `Write`/`WriteSlots`：先填 body，最后以 release 语义发布槽 `seq`，再以 release
+  推进 `head`。消费者 acquire 读槽 `seq` 确认就绪后再读 body——标准 release/acquire
+  配对。`WriteSlots` 槽 0 最后发布（ticket「SHM 并发正确性」），消除多槽消息
+  "continuation slot missing" 致命错误。
+- `Read` 非阻塞：`slot.seq != tail` 即 `NOT_FOUND`。
+- 阻塞策略（轮询 + 存活探测 + 60s 硬上限）在 `ShmConnection::WriteBlocking` /
+  `ReadBlocking` 等调用点，Ring 本身不实现（R5）。
 
-### 3.2 字节池 `ShmBytePool`
+### 3.2 字节池
 
 ```cpp
 // reverb/cc/shm/byte_pool.h
-
-#ifndef REVERB_CC_SHM_BYTE_POOL_H_
-#define REVERB_CC_SHM_BYTE_POOL_H_
-
-#include <cstddef>
-#include <cstdint>
-#include <string>
-#include <vector>
-
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
 
 namespace deepmind {
 namespace reverb {
 namespace shm {
 
-// 默认 slab 档位 (bytes)
+// 默认 slab 档位（bytes）：64B..4MB，覆盖单列 tensor 至 ~1M float32。
 inline constexpr size_t kDefaultSlabSizes[] = {
-    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304
+    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
 };
-inline constexpr int kDefaultSlabCount =
-    sizeof(kDefaultSlabSizes) / sizeof(kDefaultSlabSizes[0]);
-
-// 默认池容量：每档位 256 块 (约 1.3GB 总容量)
 inline constexpr size_t kDefaultBlocksPerSlab = 256;
 
+inline constexpr uint64_t kPoolMagic = 0x52455652424F4F4CULL;  // "REVRBOOL"
+inline constexpr uint32_t kPoolVersion = 1;
+
+// 段布局（单一连续 mmap）：
+//   [PoolHeader]                     // 固定，offset 0
+//   [SlabMeta * slab_count]          // 每档一份，存于 SHM
+//   [slab 0 数据块 ...][slab 1 数据块 ...] ...
+// 每档 free list 是单链表：空闲块首 8 字节存下一空闲块偏移；
+// free_head_offset == kNullOffset 表示空表。
+struct PoolHeader {
+  uint64_t magic = kPoolMagic;
+  uint32_t version = kPoolVersion;
+  uint32_t slab_count = 0;
+  uint64_t total_size = 0;  // 段字节数
+  uint64_t reserved = 0;
+};
+static_assert(sizeof(PoolHeader) == 32);
+
+struct SlabMeta {
+  uint64_t block_size = 0;        // 档位字节数
+  uint64_t block_count = 0;       // 块数
+  uint64_t region_offset = 0;     // 数据区起点（相对段基址）
+  uint64_t free_head_offset = 0;  // 空闲链表头（kNullOffset = 空）
+};
+static_assert(sizeof(SlabMeta) == 32);
+
+inline constexpr uint64_t kNullOffset = UINT64_MAX;
+
+// slab 分配 POSIX shm 字节池。server Create（O_CREAT|O_EXCL）且是唯一分配者；
+// client Open 为 RW（决策 C4）但只用 At() 读写 server 授予的偏移。
+// Allocate 在档位耗尽时快速失败返回 RESOURCE_EXHAUSTED——阻塞会死锁 server
+// 的单 dispatch 线程（Allocate 与 Deallocate 的唯一调用方）。
+// Allocate/Deallocate/Ref/Unref/ReleaseAll 仅 server 可调。
 class ShmBytePool {
  public:
-  // 创建并 mmap 一个新的 SHM 段
-  // `shm_name` 如 "/reverb_shm_pool_<token>"（token 定义见 A3）
+  // server 侧：创建 + ftruncate + 初始化 slab 元数据与 free list。
+  // slab_sizes 空时用 kDefaultSlabSizes；自定义须严格升序且每档 >= 8 字节
+  // （空闲块首 8 字节存下一偏移）；blocks_per_slab 须 > 0。违规在创建任何
+  // 段之前返回 InvalidArgumentError（ticket 02）。
   static absl::StatusOr<ShmBytePool> Create(
       const std::string& shm_name,
       absl::Span<const size_t> slab_sizes = {},
       size_t blocks_per_slab = kDefaultBlocksPerSlab);
 
-  // 打开一个已有的 SHM 段 (client 侧只读)
-  static absl::StatusOr<ShmBytePool> Open(
-      const std::string& shm_name);
+  // client 侧：打开已有段（RW，C4），校验 magic/version。只可用 At()。
+  static absl::StatusOr<ShmBytePool> Open(const std::string& shm_name);
 
-  ~ShmBytePool();
-
-  // 不可拷贝，可移动
-  ShmBytePool(const ShmBytePool&) = delete;
-  ShmBytePool& operator=(const ShmBytePool&) = delete;
-  ShmBytePool(ShmBytePool&&) noexcept;
-  ShmBytePool& operator=(ShmBytePool&&) noexcept;
-
-  // 分配一块。返回偏移量。阻塞等待 (调用者负责：仅 server dispatch 线程调)
+  // 从最小够用档位分配 `bytes`。档位 free list 空则返回 RESOURCE_EXHAUSTED
+  // （从不阻塞，见类注释）。SERVER-ONLY。返回相对段基址的偏移。
   absl::StatusOr<uint64_t> Allocate(size_t bytes);
 
-  // 回收一块
+  // 归还偏移到所属档位 free list。SERVER-ONLY。
   void Deallocate(uint64_t offset);
 
-  // 获取某偏移处的指针 (client 只读 / server 读写)
+  // 偏移处的指针（client 读写 / server 读写）。
   void* At(uint64_t offset);
   const void* At(uint64_t offset) const;
 
-  // 段名
-  const std::string& name() const { return shm_name_; }
+  // 偏移所属档位的块大小（测试/诊断用）。
+  size_t block_size_at(uint64_t offset) const;
 
-  // 段大小
-  size_t size() const { return pool_size_; }
+  const std::string& name() const;
+  size_t size() const;
 
-  // 引用计数操作 (server 侧)
+  // 引用计数（server 进程内）。Ref 递增；Unref 返回是否归零（归零后调用方
+  // Deallocate）。决策 C3：server 为 sample 成品字节 memcpy 进池时设 refcount=1；
+  // client 读完发 RELEASE，server Unref，归零即回收。
   void Ref(uint64_t offset);
-  bool Unref(uint64_t offset);  // returns true if zero (ready for dealloc)
+  bool Unref(uint64_t offset);
 
-  // 释放该 client 所有 outstanding 偏移 (崩溃恢复)
+  // 崩溃恢复批量释放（ticket ⑥）：逐个递减 refcount，归零的 Deallocate。
   void ReleaseAll(const std::vector<uint64_t>& offsets);
 
  private:
-  struct Slab {
-    size_t block_size;           // 档位字节数
-    size_t block_count;          // 块数
-    uint64_t region_offset;      // 数据区起点 (相对 pool 基址)
-    uint64_t free_head_offset;   // free list 链表头偏移 (空闲链)
-  };
-
+  // PickSlab：最小够用档位（smallest-fit 扫描，要求档位严格升序）。
+  // PopFree/PushFree：free list 头弹出/压入。
   std::string shm_name_;
-  int fd_ = -1;                  // shm fd (server 创建用)
-  void* base_ = nullptr;         // mmap 基址
+  void* base_ = nullptr;        // mmap 基址
   size_t pool_size_ = 0;
-  Slab* slabs_ = nullptr;        // 指向 mmap 内 slab 元数据区
-  int slab_count_ = 0;
+  PoolHeader* header_ = nullptr;
+  SlabMeta* slabs_ = nullptr;   // slab_count 项，段内
+  size_t slab_count_ = 0;
+  bool owner_ = false;          // true => 析构时 shm_unlink
 
-  // 引用计数表 (server 侧独占, 非 SHM)
-  // ponytail: 用 absl::flat_hash_map, 后续可换为数组 + 位图
-  struct RefCountEntry {
-    uint64_t offset;
-    int count;
-  };
-  // 由于 map 需要大小可变, 存在进程内, 不在 SHM 中
-  //   -> 因此 refcount 是进程内独占, 不是跨进程共享的
-  internal::flat_hash_map<uint64_t, int> refcounts_;
+  // ponytail: refcount 用进程内 flat_hash_map（不在 SHM）——server 是唯一
+  // 分配者（C4），refcount 不跨进程。升级路径：第二个分配者出现时换
+  // 段内 per-block refcount 数组 + 位图（spec §3.2）。
+  absl::flat_hash_map<uint64_t, int> refcounts_;
 
-  // 池满时阻塞用的条件变量 (server 侧)
+  // 防 stray 跨线程 Deallocate 的 free list 守卫。SERVER-ONLY。
   absl::Mutex mu_;
-  absl::CondVar cv_;
-  bool pool_full_ = false;
 };
 
 }  // namespace shm
 }  // namespace reverb
 }  // namespace deepmind
-
-#endif  // REVERB_CC_SHM_BYTE_POOL_H_
 ```
 
 **实现要点**：
 
-- server 侧的 `Create`：`shm_open(name, O_CREAT|O_RDWR|O_EXCL, 0600)` → `ftruncate` → `mmap` → 初始化 slab 元数据 + free list。
-- client 侧的 `Open`：`shm_open(name, O_RDWR, 0)` → `mmap` → 读 header 校验 magic/version。
-- Slab 内部布局：`[SlabHeader x N][free list 元数据][数据块 0][数据块 1]...`。free list 是单链表（偏移量存储在 free 块的前 8 字节）。
-- `At(offset)`：`static_cast<char*>(base_) + offset`。
-- 引用计数只在 server 进程中维护，client 不持有 refcounts_ map。
+- server `Create`：`shm_open(O_CREAT|O_RDWR|O_EXCL)` → `ftruncate` → `mmap` →
+  初始化 `PoolHeader`/`SlabMeta`/free list。
+- client `Open`：`shm_open(O_RDWR)` → `mmap` → 校验 `kPoolMagic`/`kPoolVersion`。
+- `At(offset) = base_ + offset`，server/client 两进程映射同一段，偏移语义一致。
+- **池满语义**：v1 实现是**快速失败**（`RESOURCE_EXHAUSTED`），不是阻塞等待
+  （design §8.7 的阻塞设想未采用）——阻塞在单 dispatch 线程上会死锁。client
+  收到档位耗尽错误（瞬时 `ResourceExhausted`）；超档请求是永久
+  `InvalidArgument`（ticket 02，客户端可据此区分）。
 
 ### 3.3 Bootstrap
 
 ```cpp
 // reverb/cc/shm/bootstrap.h
 
-#ifndef REVERB_CC_SHM_BOOTSTRAP_H_
-#define REVERB_CC_SHM_BOOTSTRAP_H_
-
-#include <cstdint>
-#include <string>
-
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-
 namespace deepmind {
 namespace reverb {
 namespace shm {
 
-// Server 侧：创建 udsocket listener，接受 client 连接，分发 Welcome
+inline constexpr uint32_t kProtocolVersion = 1;  // Hello/Welcome 版本校验
+
+// server 侧：监听 udsocket。Create 先 unlink 残留 socket 文件（R7：PID 复用
+// 会留陈旧 .sock），再 bind + listen。
 class ShmBootstrapServer {
  public:
-  // bind + listen 在 `socket_path`
-  // cleanup: 先 unlink 旧 socket 再 bind (防 PID 复用冲突, R7)
-  static absl::StatusOr<ShmBootstrapServer> Create(
-      const std::string& socket_path);
+  static absl::StatusOr<ShmBootstrapServer> Create(const std::string& socket_path);
 
-  // 接受一个 client 连接
-  // 返回 (client_fd, client_pid)
-  // 阻塞直到有 client connect
+  // 阻塞至 client 连接。返回 (client_fd, client_pid)；client_pid 经 SO_PEERCRED
+  // 读取。调用方持有 fd 并负责 close。
   absl::StatusOr<std::pair<int, int>> Accept();
 
-  const std::string& socket_path() const { return socket_path_; }
-
- private:
-  ShmBootstrapServer(int listen_fd, std::string socket_path);
-  int listen_fd_;
-  std::string socket_path_;
+  // 监听 fd：供 dispatch 线程 poll 新连接（不阻塞 accept）。
+  int listen_fd() const;
+  const std::string& socket_path() const;
 };
 
-// Server 侧：单次握手
-// 接收 HelloRequest → 发 WelcomeResponse (含 pool + 四条 ring 段名与 server_info)
-absl::Status SendWelcome(
-    int client_fd,
-    const std::string& pool_shm_name,
-    const std::string& c2s_shm_name,
-    const std::string& s2c_shm_name,
-    const std::string& server_info_proto);
-
-absl::StatusOr<HelloRequest> RecvHello(int client_fd);
-
-// Client 侧：连接 server udsocket，执行握手
-// 接收返回的 pool / ring shm 段名
-struct BootstrapResult {
-  std::string pool_shm_name;
-  std::string c2s_shm_name;
-  std::string s2c_shm_name;
-  std::string server_info_proto;
+// A3/D-格式段名生成。server 独占生成权（spec A3）。`server_token` = udsocket
+// 路径 + per-server epoch（PID + 墙上时钟纳秒，ticket #7）；token 消毒
+// （非 alnum -> '_'）保证 POSIX shm 名合法。按 socket 路径（而非仅 PID）命名
+// 让同进程多 ShmServer 共存（scan #12）；epoch 让同路径崩溃重启的 server 不与
+// 旧客户端活段碰撞。client 从 Welcome 学段名，不自算。决策 D 每流一对：
+//   /reverb_shm_pool_<token>
+//   /reverb_shm_insert_c2s_<token>_<client_pid>
+//   /reverb_shm_insert_s2c_<token>_<client_pid>
+//   /reverb_shm_sample_c2s_<token>_<client_pid>
+//   /reverb_shm_sample_s2c_<token>_<client_pid>
+struct ShmSegmentNames {
+  std::string pool;
+  std::string insert_c2s;
+  std::string insert_s2c;
+  std::string sample_c2s;
+  std::string sample_s2c;
 };
-absl::StatusOr<BootstrapResult> ClientBootstrap(
+ShmSegmentNames MakeShmNames(absl::string_view server_token, int client_pid);
+std::string MakePoolShmName(absl::string_view server_token);
+
+// 经 client_fd 发 WelcomeResponse（length-delimited：4 字节大端长度前缀 + proto）。
+absl::Status SendWelcome(int client_fd, const WelcomeResponse& welcome);
+
+// 经 client_fd 收 HelloRequest（length-delimited）。`timeout` 约束整个握手
+// 等待（per-byte deadline，防 trickling sender）；TryAccept 传小上限——它跑在
+// 单 dispatch 线程上，无限读会被 connect-and-stall 客户端卡死全体服务。
+absl::StatusOr<HelloRequest> RecvHello(
+    int client_fd, absl::Duration timeout = absl::InfiniteDuration());
+
+// 校验客户端协议版本，不匹配返回 InvalidArgumentError。
+absl::Status CheckProtocolVersion(uint32_t client_version);
+
+// 握手结果：Welcome + 仍打开的 udsocket fd（调用方持有，连接期内保持打开，
+// ticket ⑥：server poll 该 fd 的 POLLHUP/EOF 检测 client 崩溃，§8.8）。
+struct ClientBootstrapResult {
+  WelcomeResponse welcome;
+  int fd = -1;
+};
+
+// 连接 + 发 Hello + 收 Welcome + 返回打开的 fd（不关闭）。
+// ShmClient::Connect 用（fd 存为 liveness 信号）。
+absl::StatusOr<ClientBootstrapResult> ClientBootstrapWithFd(
     const std::string& socket_path, int client_pid);
+
+// 一次性握手：连接、交换 Hello/Welcome、关闭 fd（无需持久 liveness fd 的
+// 调用方，如 echo 测试）。ponytail: 保留以不改既有测试/调用方。
+absl::StatusOr<WelcomeResponse> ClientBootstrap(const std::string& socket_path,
+                                                int client_pid);
 
 }  // namespace shm
 }  // namespace reverb
 }  // namespace deepmind
-
-#endif  // REVERB_CC_SHM_BOOTSTRAP_H_
 ```
 
-### 3.4 Server 侧 `ShmServer`
+### 3.4 Server 侧
 
 ```cpp
 // reverb/cc/shm/shm_server.h
 
-#ifndef REVERB_CC_SHM_SHM_SERVER_H_
-#define REVERB_CC_SHM_SHM_SERVER_H_
-
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <thread>
-#include <vector>
-
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/synchronization/mutex.h"
-#include "reverb/cc/chunk_store.h"
-#include "reverb/cc/platform/default/hash_map.h"
-#include "reverb/cc/shm/bootstrap.h"
-#include "reverb/cc/shm/byte_pool.h"
-#include "reverb/cc/shm/ring.h"
-#include "reverb/cc/shm/shm_connection.h"
-#include "reverb/cc/table.h"
-
 namespace deepmind {
 namespace reverb {
 namespace shm {
 
-// 每个已连接的 client 的状态
+// per-client 状态。dispatch 线程是 outstanding_offsets_ 与 outbox 的唯一变更者
+// （单线程 dispatch，决策 A1/R11），实际无需加锁；保留 mutex 与 spec §3.4
+// 声明一致并为未来 per-client dispatch 拆分留余地。决策 D：outbox 按流分开
+// （insert/sample），各自 s2c ring 的重试队列保持同质。
 struct ClientState {
-  int fd = -1;                    // udsocket
+  int fd = -1;                       // udsocket fd（断连时关闭）
   int client_pid = 0;
-  ShmConnection conn;             // 三段 mmap
-  // 该 client 所有 outstanding SHM 偏移 (用于崩溃集中释放)
-  internal::flat_hash_set<uint64_t> outstanding_offsets_;
+  ShmConnection conn;                // 4 条 ring（insert+sample 的 c2s/s2c）；
+                                     // pool 在 server 侧由 ShmServer 独占，不用此句柄
+  internal::flat_hash_set<uint64_t> outstanding_offsets_;  // C3：崩溃恢复（ticket ⑥）
 
-  // 暂存的非阻塞 S→C 写失败消息 (outbox)
-  // ponytail: vector+mutex, 升 ring-buffer 按需
-  absl::Mutex outbox_mu;
-  std::vector<std::pair<uint16_t, std::string>> outbox ABSL_GUARDED_BY(outbox_mu);
+  // S→C 暂存队列：ring 满时塞不下、由非阻塞 TryWrite 失败的消息。每轮 dispatch
+  // FlushOutbox 重试。决策 D：insert/sample 分开，一条满不挡另一条。
+  absl::Mutex insert_outbox_mu;
+  std::vector<std::pair<uint16_t, std::string>> insert_outbox;
+  absl::Mutex sample_outbox_mu;
+  std::vector<std::pair<uint16_t, std::string>> sample_outbox;
+
+  // insert 回调保活（ticket ④）：InsertOrAssignAsync 只存 callback 的 weak_ptr，
+  // 表 worker 异步触发（HandleInsert 返回之后）。shared_ptr 必须活到回调触发，
+  // 攒在这里、聚合 InsertAck 入队后清空。每项带所属 INSERT 请求 id，完成/失败
+  // 请求只清自己的保活项（绝不整向量清空——其他在飞请求会丢 ACK）。
+  struct PendingInsertCallback {
+    uint64_t request_id;
+    std::shared_ptr<Table::InsertCallback> callback;
+  };
+  std::vector<PendingInsertCallback> pending_insert_callbacks;
+  uint64_t next_insert_request_id = 0;  // 仅 dispatch 线程触碰，无需锁
+
+  // ticket ⑩ 死锁修复（方向 A）：异步 sample 完成回调在表 worker 线程触发，
+  // 不能碰 pool_/outstanding_offsets_（单线程 dispatch 不变式）。回调把
+  // SampledItem + 路由元数据攒进此队列，dispatch 线程每轮 DrainPendingSamples
+  // 取出做 unpack + pool + 写 SAMPLE_RESP。
+  struct PendingSample {
+    ShmSampleRequest req;
+    absl::Status status;       // 表 worker 结果（含 DeadlineExceeded）
+    Table::SampledItem item;   // 成功时的采样项
+  };
+  absl::Mutex pending_samples_mu;
+  std::vector<PendingSample> pending_samples;
+  std::vector<std::shared_ptr<Table::SamplingCallback>> pending_sample_callbacks;
+
+  // ticket ⑥：client 显式 CLOSE 时置位；dispatch 循环的 IsClientDead 检查
+  // 下一轮走 HandleDisconnect。atomic：CloseClientFdForTest 在 dispatch 线程外写。
+  std::atomic<bool> close_requested{false};
 };
 
+// ShmServer 拥有全部表（ticket ⑨：按表名路由）、一个 ShmBytePool（唯一分配者，
+// C4）和一个 bootstrap udsocket。单 dispatch 线程轮询 listen socket 收新 client，
+// 再非阻塞读每个 client 的 C→S ring：
+//   SAMPLE → FindTable(req.table) → Table::EnqueSampleRequest（异步，ticket ⑩：
+//     dispatch 不阻塞于 rate limiter）→ 完成回调攒进 pending_samples →
+//     DrainPendingSamples 在 dispatch 线程做 UnpackChunkColumnAndSlice →
+//     memcpy 成品字节进池（refcount=1, C3）→ S→C 写 SAMPLE_RESP（非阻塞，
+//     满则暂存 outbox，§8.7）；
+//   RELEASE → Unref 各偏移，归零 Deallocate；
+//   INSERT/ALLOCATE → §3.4 下方。
 class ShmServer {
  public:
-  // `socket_path`: udsocket 路径。空则自动生成 "/tmp/reverb_shm_<pid>.sock"
-  static absl::StatusOr<std::shared_ptr<ShmServer>> Create(
-      const std::vector<std::shared_ptr<Table>>& tables,
-      const std::string& socket_path = "",
-      size_t pool_bytes = 0);   // 0 = default (2x sum(max_size × avg_chunk))
+  // `tables` 非空且名字唯一（此处校验；Python `Server` 也校验，C++ 自卫）。
+  // `checkpointer` 可选（ticket ⑪）：提供时 HandleCheckpoint 保存全部表并
+  // 返回路径；为 null 时返回 FailedPreconditionError（镜像 InProcessClient）。
+  // ticket 02：`slab_sizes` / `pool_blocks_per_slab` 调池几何（单连接高水位 =
+  // sum(slab × blocks)）；空/0 用默认（与 ticket 02 前逐字节一致）。
+  static absl::StatusOr<std::unique_ptr<ShmServer>> Create(
+      std::vector<std::shared_ptr<Table>> tables,
+      const std::string& socket_path,
+      std::shared_ptr<Checkpointer> checkpointer = nullptr,
+      absl::Span<const size_t> slab_sizes = {},
+      size_t pool_blocks_per_slab = 0);
 
-  ~ShmServer();
-
-  // 不可拷贝/移动
-  ShmServer(const ShmServer&) = delete;
-  ShmServer& operator=(const ShmServer&) = delete;
-
-  // 启动 dispatch 线程 (在创建后调用)
+  // 启动 dispatch 线程。
   absl::Status Start();
 
-  // 停止 dispatch 线程，清理 client 连接，unlink SHM 段
+  // 停止 dispatch 线程，停全部表（Table::Stop = Close + join worker + drain
+  // callback executor——保证此后无表回调再触发，评审 #1），再清理客户端、
+  // unlink SHM 段。
   void Stop();
 
-  const std::string& socket_path() const { return socket_path_; }
+  const std::string& socket_path() const;
+
+  // ticket ⑥ 测试专用：模拟 client 连接消失（server 崩溃/fd 关闭），让
+  // CLIENT 的 liveness control_fd 看到 EOF。置 close_requested 标志，dispatch
+  // 线程下一轮观察后走正常 HandleDisconnect——关闭动作留在 dispatch 线程，
+  // 避免调用线程与 dispatch 循环竞争 double-close。
+  void CloseClientFdForTest();
+
+  // ticket 01 测试专用：自 Start() 起收到的 INSERT ring 消息总数。
+  int insert_requests_received_for_test() const;
+
+  // ticket 03 测试专用：dispatch 线程进入阻塞 poll() 的次数。空闲 server 约
+  // 每秒 20 次（50ms 兜底超时），而非空转 ~20k 轮/秒。
+  uint64_t poll_entries_for_test() const;
 
  private:
-  // dispatch 线程主循环
   void DispatchLoop();
+  bool Quiescent();       // ticket 03：无任何可做工作（c2s 空 + outbox 空 +
+                          //   无待 drain sample）时 true；在飞异步回调不算
+                          //   （它们 enqueue 后会写 wake_fd_）
+  void WakeDispatch();    // ticket 03：eventfd 写 1 字节把 dispatch 从 poll() 拉出。
+                          //   Stop() 与每个 off-dispatch 生产者（insert ACK 聚合/
+                          //   sample 完成/checkpoint executor）enqueue 之后调用。
+  bool TryAccept();       // 非阻塞 accept（poll listen fd）
+  void HandleInsertRequests(size_t client_id);   // 排空 insert C→S（ALLOCATE/INSERT/RELEASE）
+  void HandleSampleRequests(size_t client_id);   // 排空 sample C→S（SAMPLE/RELEASE）
+  void FlushOutbox(ClientState& state);          // 非阻塞写两个 outbox（§8.7）
+  absl::Status HandleSample(std::shared_ptr<ClientState> state,
+                            const ShmSampleRequest& req);   // 异步入队（评审 #1 持 shared_ptr）
+  void DrainPendingSamples(ClientState& state);             // dispatch 线程 unpack+pool+SAMPLE_RESP
+  absl::Status HandleRelease(ClientState& state,
+                             const ShmReleaseRequest& req); // Unref，归零 Deallocate（C3）
+  absl::Status HandleInsert(std::shared_ptr<ClientState> state,
+                            const ShmInsertRequest& req);   // ParseFromArray → InsertOrAssignAsync
+  absl::Status HandleAllocate(ClientState& state,
+                              const ShmAllocateRequest& req);  // C4：授予池偏移
+  absl::Status HandleMutatePriorities(ClientState& state,
+                                      const MutatePrioritiesRequest& req);
+  absl::Status HandleReset(ClientState& state, const ResetRequest& req);
+  absl::Status HandleCheckpoint(std::shared_ptr<ClientState> state);
+  absl::Status HandleServerInfo(ClientState& state);
+  absl::Status EnqueueInsertS2C(ClientState& state, MsgType type,
+                                absl::string_view body);  // TryWrite，满则入 insert_outbox
+  absl::Status EnqueueSampleS2C(ClientState& state, MsgType type,
+                                absl::string_view body);  // 同上，sample_outbox
+  bool IsClientDead(const ClientState& state);            // ticket ⑥：poll fd 查 EOF/HUP
+  void HandleDisconnect(size_t client_id);                // 集中释放 + unlink + 清 clients_
+  void CleanupClient(ClientState& state, bool unlink_rings);
+  absl::StatusOr<std::shared_ptr<Table>> FindTable(const std::string& name) const;
 
-  // 处理一个 client 的 C→S ring
-  void HandleClientRequests(int client_id, ClientState& state);
-
-  // 处理 S→C outbox (非阻塞写)
-  void FlushOutbox(int client_id, ClientState& state);
-
-  // insert 请求处理
-  absl::Status HandleInsert(int client_id, ClientState& state,
-                            const ShmInsertRequest& req);
-
-  // sample 请求处理
-  absl::Status HandleSample(int client_id, ClientState& state,
-                            const ShmSampleRequest& req);
-
-  // 断连处理
-  void HandleDisconnect(int client_id, ClientState& state);
-
-  std::vector<std::shared_ptr<Table>> tables_;
-  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_by_name_;
+  internal::flat_hash_map<std::string, std::shared_ptr<Table>> tables_;
   std::string socket_path_;
-  std::unique_ptr<ShmBytePool> pool_;
+  std::string name_token_;   // socket 路径 + per-server epoch（ticket #7）
+  ShmBytePool pool_;
+  ShmBootstrapServer bootstrap_;
+  std::shared_ptr<Checkpointer> checkpointer_;  // ticket ⑪，可选注入
+  std::vector<std::shared_ptr<ClientState>> clients_;  // 评审 #1：shared_ptr 所有权
 
-  std::unique_ptr<ShmBootstrapServer> bootstrap_;
-  std::vector<std::unique_ptr<ClientState>> clients_;  // index = client_id
-
-  // dispatch 线程控制
   std::thread dispatch_thread_;
   std::atomic<bool> running_{false};
-
-  // ChunkStore 引用 (用于 Load checkpoint 等)
-  // ponytail: v1 暂不维护 chunk_key→SHM_offset 索引
+  std::atomic<int> insert_requests_received_{0};      // ticket 01 测试计数
+  int wake_fd_ = -1;                                  // ticket 03：server-local eventfd
+  std::atomic<uint64_t> poll_entries_for_test_{0};    // ticket 03 测试计数
+  TaskExecutor checkpoint_executor_{1, "ShmCheckpointExecutor"};  // 评审 #3：checkpoint Save 专用
 };
 
 }  // namespace shm
 }  // namespace reverb
 }  // namespace deepmind
-
-#endif  // REVERB_CC_SHM_SHM_SERVER_H_
 ```
 
-**线程模型细化**（对应 R3）：
+**线程模型与关键语义**（对应原 R3/R4/R11）：
 
+- **单 dispatch 线程**：accept 新 client、排空所有 client 的两条 C→S ring、drain
+  pending samples、flush outbox、检测断连，全在一线程。`pool_` 分配/回收/refcount
+  因此无锁（R11）。
+- **异步化**：`Table::Sample` 经 `EnqueSampleRequest` 异步入队，dispatch 不阻塞于
+  rate limiter（ticket ⑩ 方向 A）；`InsertOrAssignAsync` 本就异步。两者完成回调
+  都在表 worker 线程触发，只攒队列/保活列表，dispatch 线程负责全部 SHM 侧动作。
+- **eventfd 事件驱动（ticket 03）**：dispatch 静止（Quiescent）时阻塞
+  `poll(listen_fd + 各 client control_fd + wake_fd_, 50ms 兜底)`，不再忙轮询。
+  所有 off-dispatch 生产者 enqueue 后调 `WakeDispatch()` 写 eventfd；
+  `RingHeader::server_asleep` 让 client 只在 server 睡着时发唤醒字节。
+- **批量 INSERT 聚合 ACK（ticket 01）**：`HandleInsert` 把一批（≤64 items /
+  ≤128KB）的每个 `ShmChunkRef` 从池中 `ParseFromArray` 还原 `ChunkData`，逐 item
+  `InsertOrAssignAsync`；表 worker 完成回调经 `AckAggregate` 聚合，最后一条完成时
+  组装**一条** `INSERT_ACK`（全部 keys + offsets_to_release）入 insert_outbox。
+  `EnqueueInsertS2C` 的 FIFO 护栏保证 RESP 定序（跨表回调并发下不乱序）。
+- **checkpoint 不在 dispatch 线程跑（评审 #3）**：`HandleCheckpoint` 把
+  `checkpointer_->Save`（无界磁盘 I/O）调度到 `checkpoint_executor_`（单线程
+  TaskExecutor），完成后经 outbox 回传 `CHECKPOINT_RESP`；`Stop()` 先 drain
+  executor 再停表。`~TaskExecutor` 可安全重入 `Close()`。
+- **ClientState 生命周期（评审 #1）**：`clients_` 存 `shared_ptr<ClientState>`，
+  insert/sample 完成回调按值捕获 shared_ptr——`clients_.erase()/clear()` 只丢
+  server 的引用，回调仍可安全访问。`Stop()` 先 `Table::Stop()`（保证回调不再
+  触发）再清客户端，确定性关闭窗口。
+- **断连**：`IsClientDead` 每轮 poll 各 client fd（`POLLHUP/POLLERR/EOF`）；
+  显式 `CLOSE` 消息置 `close_requested`，下一轮同路径处理。`HandleDisconnect` 集中
+  释放 `outstanding_offsets_`（C3）、unlink 该 client 的 4 条 ring、关 fd、从
+  `clients_` 移除。
+
+### 3.5 Client 侧
+
+```cpp
+// reverb/cc/shm/shm_connection.h
+
+namespace deepmind {
+namespace reverb {
+namespace shm {
+
+// ticket ⑥（design §8.8）：`fd` 对端已关闭（EOF/POLLHUP/POLLERR）？双端共用：
+//   - server：探测 ClientState.fd 检 client 崩溃；
+//   - client：探测 control_fd 检 server 消失，让等 S→C 响应的 ReadBlocking
+//     快速失败而非永久自旋。
+// fd < 0（无 fd，如 moved-from / server 侧）=> false。
+bool IsPeerClosed(int fd);
+
+// 评审 #2（ring 写侧 liveness）：镜像读侧 ReadBlocking 的阻塞写辅助。轮询
+// TryWrite + sched_yield，每轮探测 control_fd 对端死亡（UnavailableError），
+// 超时给 DeadlineExceededError。没有它，Ring::Write 的裸 sched_yield 循环在
+// server dispatch 被卡（如慢 checkpoint，评审 #3）或死亡时 100% CPU 永转，
+// 挂死 TrajectoryWriter::Close()/GC 且无错误浮现。
+constexpr absl::Duration kWriteBlockingHardCap = absl::Seconds(60);
+absl::Status WriteBlocking(Ring* ring, MsgType msg_type,
+                           absl::Span<const char> payload, int control_fd,
+                           absl::Duration timeout = kWriteBlockingHardCap);
+
+// 一个 server↔client 之间的 SPSC ring 组 + 共享字节池。决策 D（per-flow ring）：
+// 两对 ring——insert 流（TrajectoryWriter 的 RunShmWorker）一对 + sample 流
+// （ShmSampler worker）一对。每对严格 SPSC：该流唯一的 client worker 线程是
+// 其 c2s 唯一生产者、s2c 唯一消费者。拆对让两条 worker 线程无需 mutex 并发跑
+// ——单对设计在两条 writer 都起后台线程后违反 SPSC 不变式（一 c2s head 两生产者、
+// 无 CAS => 数据损坏）。
+//
+// `pool` 句柄仅 client 侧有意义（C4 下 ShmBytePool::Open 的 RW 映射）；server
+// 在自己的 ShmServer 里持有 owner/分配器 ShmBytePool，不经过此结构共享。
+// 两侧都经 pool.At(offset) 读 sample 字节。
+//
+// `control_fd`（ticket ⑥）：连接期内保持打开的 udsocket fd，作 liveness 信号。
+// server 侧把 accept 的 fd 存 ClientState.fd（这里保持 -1）；client 侧存
+// bootstrap fd，~ShmConnection 关闭它。client 进程崩溃或 ~ShmClient 时 fd 关 →
+// server poll 见 POLLHUP/EOF → HandleDisconnect（§8.8）。
+struct ShmConnection {
+  Ring insert_c2s;  // client insert worker -> server（ALLOCATE/INSERT/RELEASE）
+  Ring insert_s2c;  // server -> client insert worker（ALLOCATE_RESP/INSERT_ACK）
+  Ring sample_c2s;  // client sample worker -> server（SAMPLE/RELEASE）
+  Ring sample_s2c;  // server -> client sample worker（SAMPLE_RESP）
+  ShmBytePool pool; // client 侧 RW 映射（C4）；server 另有自己的
+  std::string pool_shm_name;
+  int control_fd = -1;  // client liveness fd（ticket ⑥）；-1 = 无
+
+  // ticket「shm-close-while-in-flight」：Close()/析构在 control_fd 关闭**之前**
+  // 置位。在飞读循环（shm_client.cc 的 ReadBlocking、trajectory_writer.cc 的
+  // read_blocking）轮询此标志，连接被从下方关闭时立即 UnavailableError，而不是
+  // 在无人服务的 ring 上永转。仅靠 fd 探测不够：close 后 fd = -1（或被复用），
+  // fd < 0 时探测被跳过——那个洞曾挂死 DisconnectWithInFlightCallbacksDoesNotUaf。
+  std::atomic<bool> closed{false};
+
+  void Close();  // 幂等。先置 closed（release），再关 control_fd。
+
+  // ticket ⑩：串行化 insert 流上的 send→read-ACK 往返，让两个生产者永不同时
+  // 碰 insert_c2s 的单一 head。RunShmWorker（insert worker 后台线程的
+  // ALLOCATE→ALLOCATE_RESP 与 INSERT→INSERT_ACK 往返）与调用线程的
+  // MutatePriorities/Reset/ServerInfo/Checkpoint 往返都为此 mutex 覆盖整个
+  // send→read 序列。sample 流不碰此锁，保持无锁。
+  // （死锁复盘 2026-07-17：此锁曾被怀疑为偶发死锁根因，gdb 抓栈证明无辜——
+  //   真根因是 dispatch 在 HandleSample 的 rate-limiter 无限阻塞，已由方向 A
+  //   异步化修复。此锁保持原样：串行化整个往返反而是对的。）
+  mutable absl::Mutex insert_flow_mu;
+};
+
+}  // namespace shm
+}  // namespace reverb
+}  // namespace deepmind
 ```
-DispatchLoop()
-  ├── 轮询 accept 是否有新 client → 创建 ClientState + 两条 ring
-  ├── 轮询每个 client 的 C→S ring → 解析请求类型
-  │   ├── INSERT → 读 SHM 字节 → CompressTensorAsProto → Table::InsertOrAssignAsync
-  │   │              → callback: 写 S→C INSERT_ACK (含 offsets_to_release)
-  │   ├── SAMPLE → Table::EnqueSampleRequest (异步入队，dispatch 不阻塞于 rate limiter)
-  │   │              → table worker 完成后回调攒进 ClientState::pending_samples
-  │   │   DrainPendingSamples (dispatch 线程): UnpackChunkColumnAndSlice →
-  │   │              memcpy 成品字节进 SHM pool → 写 S→C SAMPLE_RESP
-  │   │              → client 读完发 RELEASE → server 递减 refcount
-  │   ├── RELEASE → 遍历 offsets, Unref, 归零则 Deallocate
-  │   ├── MUTATE_PRIORITIES → Table::MutateItems → S→C MUTATE_ACK
-  │   ├── RESET → Table::Reset → S→C RESET_ACK
-  │   ├── CHECKPOINT → checkpointer_->Save → S→C CHECKPOINT_RESP  (已实现, ticket ⑪)
-  │   └── CLOSE → HandleDisconnect
-  ├── 对每个 client: DrainPendingSamples + 尝试 FlushOutbox (非阻塞写 S→C)
-  ├── 检查 udsocket EOF (断连检测)
-  └── sleep(0) or sched_yield()
-```
-
-> **注意 R11**：`UnpackChunkColumnAndSlice` + pool 分配在 dispatch 线程内同步完成
-> （`DrainPendingSamples`），不委派到 worker 池——sample 成品字节需立即进 SHM 池
-> （分配操作非线程安全）。ticket ⑩ 死锁修复（方向 A）后，rate-limiter 等待
-> 发生在 table worker 线程（`EnqueSampleRequest` 异步），不再阻塞 dispatch。
-> 若 dispatch 线程成为吞吐瓶颈，后续升级为 per-client dispatch 线程 + 带锁的
-> SHM 分配。client 侧 `ReadBlocking` 有 60s 硬上限兜底（方向 C），任何未来
-> 阻塞路径都不再卡死 `timeout` 命令。
-
-### 3.5 Client 侧 `ShmClient`
 
 ```cpp
 // reverb/cc/shm/shm_client.h
 
-#ifndef REVERB_CC_SHM_SHM_CLIENT_H_
-#define REVERB_CC_SHM_SHM_CLIENT_H_
-
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
-
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/time/time.h"
-#include "reverb/cc/chunker.h"
-#include "reverb/cc/platform/default/hash_map.h"
-#include "reverb/cc/sampler.h"
-#include "reverb/cc/shm/bootstrap.h"
-#include "reverb/cc/shm/byte_pool.h"
-#include "reverb/cc/shm/ring.h"
-#include "reverb/cc/shm/shm_connection.h"
-#include "reverb/cc/structured_writer.h"
-#include "reverb/cc/trajectory_writer.h"
-#include "reverb/cc/writer.h"
-
 namespace deepmind {
 namespace reverb {
 namespace shm {
 
-// 镜像 InProcessClient 的 API, 供 pybind 暴露为 ShmClient
+// ShmSampler 是 SHM 传输的 client 侧 sampler。决策 C5：复用现有 Sampler 架构
+// （worker 线程喂 samples_ 队列，GetNextTrajectory 弹出），只把每次取样的
+// gRPC/local Table::Sample 换成 SHM ring 往返。
+// GIL 纪律与现有 Sampler 一致：worker 线程从池字节构建 TensorBuffer（无 GIL）；
+// GetNextTrajectory 在调用线程跑，ToNdArray() 才可能拿 GIL。
+class ShmSampler {
+ public:
+  // `conn` 借用（ShmClient 所有），须活得比 sampler 久。`options` 镜像
+  // Sampler::Options（v1 只用 max_samples + rate_limiter_timeout）。
+  // `active_flag`（可选）：ShmClient 拥有的 single-sampler permit——NewSampler
+  // 先 claim，Close()/析构时释放。
+  static absl::StatusOr<std::unique_ptr<ShmSampler>> Create(
+      ShmConnection* conn, const std::string& table_name,
+      const Sampler::Options& options,
+      std::atomic<bool>* active_flag = nullptr);
+
+  // 阻塞至取到完整 sample。`data` 填充完整（展平）trajectory 的 TensorBuffer
+  // （每列一个）。调用方可在线程上 ToNdArray()（GIL）。
+  absl::Status GetNextTrajectory(std::vector<TensorBuffer>* data,
+                                 std::shared_ptr<const SampleInfo>* info = nullptr);
+
+  void Close();  // 取消 worker 并 join 线程
+ private:
+  void RunWorker();   // worker 主循环：取满 max_samples 或取消
+  absl::StatusOr<std::unique_ptr<Sample>> FetchOne();  // 一次 SHM 往返
+};
+
+// ShmClient：连 ShmServer 的 udsocket，握手，mmap 五个 SHM 段
+// （pool + 两对 ring）。NewSampler 返回 ShmSampler。
 class ShmClient {
  public:
-  // 连接 server udsocket + 握手 + mmap 三段 SHM
   static absl::StatusOr<std::unique_ptr<ShmClient>> Connect(
       const std::string& socket_path);
 
-  ~ShmClient();
+  absl::Status NewSampler(const std::string& table_name,
+                          const Sampler::Options& options,
+                          std::unique_ptr<ShmSampler>* sampler);
 
-  // ---- Writer Path (对齐 InProcessClient) ----
+  // ---- Writer path（ticket ④）----
 
-  absl::Status NewTrajectoryWriter(
-      const TrajectoryWriter::Options& options,
-      std::unique_ptr<TrajectoryWriter>* writer);
+  // SHM 模式 TrajectoryWriter：chunker/column/backpressure 在 client 侧，
+  // insert 经 SHM 到 server 的 Table（附录 A4）。ticket ⑧ step 2：
+  // flat_signature_map 由一次实时 SERVER_INFO 往返填充，ItemAndRefs::Validate
+  // 校验 trajectory 与表当前签名——每次调用都取新 TableInfo，会话中途
+  // Table.replace 改签名在下个 writer 生效。
+  absl::Status NewTrajectoryWriter(const TrajectoryWriter::Options& options,
+                                   std::unique_ptr<TrajectoryWriter>* writer);
 
+  // 镜像 InProcessClient::NewStructuredWriter：共享主体委托 MakeStructuredWriter，
+  // 经 NewTrajectoryWriter 钩子包装 SHM TrajectoryWriter。各 config 的 `table`
+  // 字段路由到 server 侧表。
   absl::Status NewStructuredWriter(
       std::vector<StructuredWriterConfig> configs,
       std::unique_ptr<StructuredWriter>* writer);
 
-  absl::Status NewWriter(
-      int chunk_length, int max_timesteps, bool delta_encoded,
-      int max_in_flight_items,
-      std::unique_ptr<Writer>* writer);
+  // ponytail: plain Writer（writer.h）无 SHM seam——本地构造要 tables map，
+  // SHM client 不持表（表在 server）。给 Writer 加 SHM 传输会为 legacy API
+  // 复制 RunShmWorker 逻辑。Won't fix：需要 SHM insert 用 NewTrajectoryWriter /
+  // NewStructuredWriter。Python 层（ShmClient）覆盖 `writer`/`insert` 在到达
+  // 此处前抛 NotImplementedError；此 C++ stub 留给直接 pybind 调用方作防御性
+  // UnimplementedError。
+  absl::Status NewWriter(int chunk_length, int max_timesteps,
+                         bool delta_encoded, int max_in_flight_items,
+                         std::unique_ptr<Writer>* writer);
 
-  // ---- Sampler Path ----
-
-  absl::Status NewSampler(
-      const std::string& table_name,
-      const Sampler::Options& options,
-      std::unique_ptr<Sampler>* sampler);
-
-  // ---- Direct operations (对齐 InProcessClient) ----
-
-  absl::Status MutatePriorities(
-      const std::string& table,
-      const std::vector<KeyWithPriority>& updates,
-      const std::vector<uint64_t>& deletes);
-
-  absl::Status Reset(const std::string& table);
-
-  absl::Status Checkpoint(std::string* path);
-
+  // 经按需 SERVER_INFO ring 往返返回各表实时 TableInfo。ticket ⑧ step 2：
+  // 取代 step-1 bootstrap 快照，server_info() 反映会话中途状态。走 insert 流
+  // （insert_flow_mu 下），同其他控制面 op（10/11）。
   absl::Status ServerInfo(std::vector<TableInfo>* table_info);
 
-  // ---- SHM 特有 ----
+  // ticket ⑩：控制面 op，镜像 InProcessClient::MutatePriorities / Reset。
+  // 走 insert 流（insert_c2s/s2c，insert_flow_mu 下）——与 RunShmWorker 不竞态
+  // 双生产者。未知表 -> NotFoundError（server 回 ShmError::NOT_FOUND），Python
+  // 层 FileNotFoundError。复用 reverb_service.proto 的请求类型。
+  absl::Status MutatePriorities(const std::string& table,
+                                const std::vector<KeyWithPriority>& updates,
+                                const std::vector<uint64_t>& deletes);
+  absl::Status Reset(const std::string& table);
 
-  // 获取底层 ShmConnection (供 Sampler/Writer 读取 SHM 字节用)
+  // ticket ⑪：触发 server 侧 checkpoint 并返回保存路径。走 insert 流
+  // （insert_flow_mu 下）。服务端错误（无 checkpointer、Save 失败）以
+  // ShmError::INTERNAL -> absl::InternalError 到达。
+  absl::Status Checkpoint(std::string* path);
+
   ShmConnection* connection() { return &conn_; }
 
  private:
-  ShmClient(std::string socket_path);
-
-  // 写入 C→S ring (阻塞)
-  absl::Status SendRequest(uint16_t msg_type, const std::string& body);
-
-  // 从 S→C ring 读取响应 (非阻塞 + 有限重试；ticket ⑩ 方向 C：默认 60s 硬上限，
-  // 避免服务端 dispatch 被卡时 client 无限忙等、timeout 杀不掉)
-  absl::StatusOr<std::pair<uint16_t, std::string>> RecvResponse(
-      absl::Duration timeout = absl::InfiniteDuration());
-
-  std::string socket_path_;
-  int uds_fd_ = -1;
+  explicit ShmClient(ShmConnection conn);
   ShmConnection conn_;
-
-  // ServerInfo 缓存
-  internal::flat_hash_map<std::string, TableInfo> table_info_cache_;
+  // 扫描 #1：本连接的 single-sampler permit。第二个活 sampler 会让两个生产者
+  // worker 共写 sample_c2s（SPSC 无 CAS => head 损坏），且无 request_seq 时可能
+  // 消费对方的 SAMPLE_RESP——静默错表数据。NewSampler claim（exchange），
+  // ShmSampler::Close 释放。
+  std::atomic<bool> sampler_active_{false};
 };
 
 }  // namespace shm
 }  // namespace reverb
 }  // namespace deepmind
-
-#endif  // REVERB_CC_SHM_SHM_CLIENT_H_
 ```
 
-**Client 侧线程模型澄清**（对应 R5）：
-
-所有 I/O 在调用者线程同步完成：`NewSampler` 发请求到 C→S ring，轮询 S→C 等响应。`Sampler::GetNextTrajectory` 同理——在 client 进程中，Sampler 的每次调用都会（通过 `ShmConnection`）发 SAMPLE 请求、等响应、读 SHM 字节、发 RELEASE。无后台线程。
-
-`TrajectoryWriter` 的 insert 路径：chunk 在 client 侧组装完毕 → memcpy 进 SHM 池 → SendRequest（INSERT）→ 等待 INSERT_ACK（backpressure）。这与设计文档 §D2 一致。
-
----
+> 注：原 spec §3.5 的 `SendRequest` / `RecvResponse` / `uds_fd_` /
+> `table_info_cache_` 成员与"无后台线程"表述均已过时：I/O 统一走
+> `ShmConnection` 的 insert/sample 两流（`insert_flow_mu` 串行化 insert 流），
+> `ShmSampler` 有独立 worker 线程（决策 C5），`server_info` 是每次实时往返而非
+> 缓存快照（ticket ⑧ step 2）。
 
 ## 4. Proto 定义
 
@@ -848,8 +781,48 @@ package deepmind.reverb.shm;
 
 import "reverb/cc/schema.proto";
 import "reverb/cc/patterns.proto";
+import "reverb/cc/reverb_service.proto";
+import "third_party/reverb_tensor/reverb_tensor.proto";
 
 option cc_enable_arenas = true;
+
+// 线上消息类型，存于 SlotHeader.msg_type（uint16）。C→S 用小值，S→C 用 100+。
+// 两个 ALLOCATE 类型实现决策 C4：client 写 insert 字节前先向 server（唯一
+// 分配者）申请池偏移。
+enum MsgType {
+  MSG_TYPE_UNSPECIFIED = 0;
+  // C→S
+  HELLO = 1;
+  INSERT = 2;
+  SAMPLE = 3;
+  RELEASE = 4;
+  ALLOCATE = 5;  // C4：client 向 server 申请池偏移
+  // ticket ⑩：控制面走 insert 流（insert_c2s/s2c）+ client 侧 mutex，不与
+  // RunShmWorker 竞态双生产者。design §8.3 原把 5 预留给 MUTATE_PRIORITIES，
+  // v1 把 5 给了 ALLOCATE（C4），故 6/7 是剩余空闲 C→S 值。
+  MUTATE_PRIORITIES = 6;
+  RESET = 7;
+  // ticket ⑪：checkpoint 走 insert 流。复用 reverb_service.proto 的
+  // CheckpointRequest/CheckpointResponse。
+  CHECKPOINT = 8;
+  CLOSE = 9;
+  // ticket ⑧ step 2：按需 server_info 往返（取代连接时 bootstrap 快照）。
+  // 复用 ServerInfoResponse（空请求，同 CheckpointRequest）。
+  SERVER_INFO = 10;
+  // S→C
+  WELCOME = 101;
+  INSERT_ACK = 102;
+  SAMPLE_RESP = 103;
+  ALLOCATE_RESP = 104;  // C4：server 返回授予的池偏移
+  // ticket ⑩：控制面空 ACK（复用 reverb_service.proto 的请求类型）。
+  MUTATE_ACK = 106;
+  RESET_ACK = 107;
+  // ticket ⑪：携带 CheckpointResponse.checkpoint_path 回 client。
+  CHECKPOINT_RESP = 108;
+  // ticket ⑧ step 2：携带 ServerInfoResponse（repeated TableInfo）。走 insert 流。
+  SERVER_INFO_RESP = 110;
+  ERROR = 105;
+}
 
 // ── C→S ──
 
@@ -860,23 +833,23 @@ message HelloRequest {
 
 message ShmInsertRequest {
   repeated ShmChunkRef chunks = 1;
-  repeated PrioritizedItem items = 2;
+  repeated .deepmind.reverb.PrioritizedItem items = 2;
   repeated uint64 keep_chunk_keys = 3;
 }
 
 message ShmChunkRef {
   uint64 chunk_key = 1;
-  uint64 shm_offset = 2;
-  uint64 total_length = 3;
-  repeated TensorSpecProto specs = 4;
-  SequenceRange sequence_range = 5;
-  bool delta_encoded = 6;
+  uint64 shm_offset = 2;      // ShmBytePool 偏移（client 已 ALLOCATE 获得）
+  uint64 total_length = 3;    // 序列化 ChunkData 字节数
+  repeated .reverb.tensor.SignatureProto.TensorSpec specs = 4;  // 不填充（见下）
+  .deepmind.reverb.SequenceRange sequence_range = 5;            // 不填充
+  bool delta_encoded = 6;                                       // 不填充
 }
 
 message ShmSampleRequest {
   string table = 1;
   int64 num_samples = 2;
-  int64 timeout_ms = 3;          // rate_limiter_timeout, -1 = InfiniteDuration
+  int64 timeout_ms = 3;  // rate_limiter_timeout，-1 = InfiniteDuration
   bool emit_timesteps = 4;
 }
 
@@ -884,18 +857,32 @@ message ShmReleaseRequest {
   repeated uint64 offsets = 1;
 }
 
+// C4：client 在 memcpy insert 字节前，向 server（唯一分配者）申请给定大小的池
+// 偏移。server 回 ALLOCATE_RESP。
+message ShmAllocateRequest {
+  uint64 num_bytes = 1;
+}
+
 // ── S→C ──
 
 message WelcomeResponse {
   string pool_shm_name = 1;
-  string c2s_shm_name = 2;
-  string s2c_shm_name = 3;
-  ServerInfoResponse server_info = 4;  // 复用现有的 server_info proto
+  // 已废弃的单对别名（留给外部读者）。v2 per-flow 传输（决策 D）拆成下方
+  // insert_* / sample_*；这两个现在镜像 SAMPLE 流 ring，legacy client 仍能找到。
+  string c2s_shm_name = 2 [deprecated = true];
+  string s2c_shm_name = 3 [deprecated = true];
+  .deepmind.reverb.ServerInfoResponse server_info = 4;
+  // Per-flow ring（决策 D）：insert 流（TrajectoryWriter）与 sample 流
+  // （ShmSampler）各一对 SPSC，worker 线程永不共享 ring 的生产者/消费者。
+  string insert_c2s_shm_name = 5;
+  string insert_s2c_shm_name = 6;
+  string sample_c2s_shm_name = 7;
+  string sample_s2c_shm_name = 8;
 }
 
 message InsertAck {
   repeated uint64 keys = 1;
-  repeated uint64 offsets_to_release = 2;   // insert 用完了, client 可释放
+  repeated uint64 offsets_to_release = 2;  // insert 已消费，client 可释放
 }
 
 message ShmSampleResponse {
@@ -903,15 +890,19 @@ message ShmSampleResponse {
 }
 
 message ShmSample {
-  SampleInfo info = 1;
+  .deepmind.reverb.SampleInfo info = 1;
   repeated ShmColumn columns = 2;
 }
 
 message ShmColumn {
-  uint64 shm_offset = 1;
+  uint64 shm_offset = 1;  // 成品字节偏移（server 预切片后）
   uint64 length = 2;
-  TensorSpecProto spec = 3;
-  bool squeeze = 4;
+  .reverb.tensor.SignatureProto.TensorSpec spec = 3;
+  bool squeeze = 4;       // 对齐 FlatTrajectory.Column.squeeze
+}
+
+message ShmAllocateResponse {
+  uint64 shm_offset = 1;  // 授予的偏移；client 可 memcpy 字节至此
 }
 
 message ShmError {
@@ -925,172 +916,165 @@ message ShmError {
   }
   Code code = 1;
   string message = 2;
-  uint64 request_seq = 3;
+  uint64 request_seq = 3;  // 失败请求的 producer_seq（design §8.9）
 }
 ```
 
----
+**实现说明**：
+
+- `ShmChunkRef` 的 `specs`/`sequence_range`/`delta_encoded` 字段**不填充**——
+  传输的是序列化的 `ChunkData` proto 本身（client chunker 压缩完毕），server 直接
+  `ParseFromArray` 还原，无需按 spec 拆列（`ponytail:` 冗余标注，proto 保留以对齐
+  design §8.5 的多列设想）。
+- `ShmError.request_seq` 保留但未填充——完全依赖 SPSC 保序隐式匹配（design §8.9
+  实现现状）。
+- `ERROR = 105`（早期设计表预留 104 给 ERROR、105 给 MUTATE_ACK；实现把 104 给了
+  `ALLOCATE_RESP`，ERROR 后移 105）；`SERVER_INFO_RESP = 110`（与 `SERVER_INFO =
+  10` 的 +100 对齐）。
 
 ## 5. pybind 绑定
 
-在 `reverb/pybind.cc` 的 `PYBIND11_MODULE` 中添加：
+`reverb/pybind.cc` 的 `PYBIND11_MODULE` 中**直接绑定 C++ 类**（无 Python 包装类），
+snake_case + PascalCase 双名对齐 `Client`/`InProcessClient` 的既有模式：
 
 ```cpp
 #include "reverb/cc/shm/shm_client.h"
-#include "reverb/cc/shm/shm_protocol.pb.h"
+#include "reverb/cc/shm/shm_server.h"
 
-// ── 在已有模块内 ──
-namespace {
+// ShmServer：由 Python `Server(shm=True)` 创建并持有（决策 C1）。
+// ctor 与静态 Create 双 lambda 保持同步（ticket 02 的 slab/blocks 透传）。
+py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
+    .def(py::init([](std::vector<std::shared_ptr<Table>> tables,
+                     const std::string& socket_path,
+                     std::shared_ptr<Checkpointer> checkpointer,
+                     std::vector<size_t> slab_sizes,
+                     size_t blocks_per_slab) { ... ShmServer::Create ... }),
+         py::arg("tables"), py::arg("socket_path") = "",
+         py::arg("checkpointer") = nullptr,
+         py::arg("slab_sizes") = std::vector<size_t>{},
+         py::arg("blocks_per_slab") = 0)
+    .def_static("Create", ...)
+    .def("Start", &ShmServer::Start, py::call_guard<py::gil_scoped_release>())
+    .def("Stop", &ShmServer::Stop, py::call_guard<py::gil_scoped_release>())
+    .def_property_readonly("socket_path", ...);
 
-// 在现有 `MaybeRaiseFromStatus` 之后新增 ShmClient 的包装类
-// 这样可利用已有的 numpy _import_array() 初始化
+// ShmClient：`py::init` 即 ShmClient::Connect（bootstrap + mmap）。
+py::class_<ShmClient, std::shared_ptr<ShmClient>>(m, "ShmClient")
+    .def(py::init(shm_connect_fn), py::arg("socket_path"))
+    .def_static("Connect", shm_connect_fn, py::arg("socket_path"))
+    // keep_alive<0, 1>：返回的 sampler/writers 借用 client 的连接
+    // （ShmSampler 用它做 SAMPLE 往返；writer 的 worker 线程经它 flush），
+    // ShmClient 必须活得比它们久。
+    .def("new_sampler", shm_new_sampler_fn,
+         py::arg("table"), py::arg("max_samples") = 1,
+         py::arg("buffer_size") = 1,
+         py::arg("rate_limiter_timeout_ms") = -1,
+         py::keep_alive<0, 1>())
+    .def("NewSampler", shm_new_sampler_fn, ...)
+    .def("new_trajectory_writer", shm_new_trajectory_writer_fn,
+         py::arg("chunker_options"), py::keep_alive<0, 1>())
+    .def("NewTrajectoryWriter", shm_new_trajectory_writer_fn, ...)
+    .def("new_structured_writer", shm_new_structured_writer_fn,
+         py::arg("configs"), py::keep_alive<0, 1>())
+    .def("NewStructuredWriter", shm_new_structured_writer_fn, ...)
+    .def("server_info", shm_server_info_fn)
+    .def("ServerInfo", shm_server_info_fn)
+    .def("mutate_priorities", shm_mutate_priorities_fn,
+         py::arg("table"), py::arg("updates"), py::arg("deletes"))
+    .def("MutatePriorities", shm_mutate_priorities_fn, ...)
+    .def("reset", shm_reset_fn, py::arg("table"))
+    .def("Reset", shm_reset_fn, py::arg("table"))
+    .def("checkpoint", shm_checkpoint_fn)
+    .def("Checkpoint", shm_checkpoint_fn);
 
-class PyShmClient {
- public:
-  explicit PyShmClient(const std::string& socket_path) {
-    auto result = deepmind::reverb::shm::ShmClient::Connect(socket_path);
-    MaybeRaiseFromStatus(result.status());
-    client_ = *std::move(result);
-  }
-
-  // 镜像 InProcessClient 的 pybind 方法
-  py::object NewSampler(const std::string& table, int num_samples,
-                        int buffer_size, int timeout_ms) { ... }
-
-  py::object NewWriter(int chunk_length, int max_timesteps,
-                       bool delta_encoded, int max_in_flight_items) { ... }
-
-  py::object NewTrajectoryWriter(py::handle chunker_options) { ... }
-
-  py::object NewStructuredWriter(const std::vector<std::string>& configs) { ... }
-
-  void MutatePriorities(const std::string& table,
-                        const std::vector<std::pair<uint64_t, double>>& updates,
-                        const std::vector<uint64_t>& deletes) { ... }
-
-  void Reset(const std::string& table) { ... }
-
-  std::string Checkpoint() { ... }
-
-  std::vector<std::string> ServerInfo() { ... }
-
- private:
-  std::unique_ptr<deepmind::reverb::shm::ShmClient> client_;
-};
-
-}  // namespace
-
-// 在 PYBIND11_MODULE 的现有类注册之后添加:
-py::class_<PyShmClient>(m, "ShmClient")
-    .def(py::init<const std::string&>(), py::arg("socket_path"))
-    .def("NewSampler", &PyShmClient::NewSampler,
-         py::arg("table"), py::arg("num_samples"),
-         py::arg("buffer_size"), py::arg("timeout_ms") = -1)
-    .def("NewWriter", &PyShmClient::NewWriter,
-         py::arg("chunk_length"), py::arg("max_timesteps"),
-         py::arg("delta_encoded"), py::arg("max_in_flight_items"))
-    .def("NewTrajectoryWriter", &PyShmClient::NewTrajectoryWriter,
-         py::arg("chunker_options"))
-    .def("NewStructuredWriter", &PyShmClient::NewStructuredWriter,
-         py::arg("configs"))
-    .def("MutatePriorities", &PyShmClient::MutatePriorities)
-    .def("Reset", &PyShmClient::Reset)
-    .def("Checkpoint", &PyShmClient::Checkpoint)
-    .def("ServerInfo", &PyShmClient::ServerInfo)
-    // snake_case 别名 (对齐 InProcessClient)
-    .def("new_sampler", &PyShmClient::NewSampler)
-    .def("new_writer", &PyShmClient::NewWriter)
-    .def("new_trajectory_writer", &PyShmClient::NewTrajectoryWriter)
-    .def("new_structured_writer", &PyShmClient::NewStructuredWriter);
+// ShmSampler：镜像 Sampler 的 GetNextTrajectory——C++ 调用释放 GIL，
+// 返回前重取 GIL 构建 info+data tensor 向量（numpy-backed TensorBuffer →
+// ndarray 需 GIL）。布局（kNumInfoTensors info 标量前置 + 列数据）与 Sampler
+// 一致，`reverb/client.py` 的 `_BaseClient.sample` 可两者通用。
+py::class_<ShmSampler>(m, "ShmSampler")
+    .def("GetNextTrajectory", ...);
 ```
 
-**PascalCase + snake_case 双名**策略——对齐 `InProcessClient` 的现有模式
-（`pybind.cc` 中对 `InProcessClient` 已有双名绑定）。
+> `pybind.cc` 没有 `PyShmClient` 包装类（plan 时代设想）；numpy `_import_array()`
+> 复用模块入口既有调用。
 
-> 注意：`ShmClient` 可 pickle（ticket ⑫），`__reduce__` 返回
-> `(ShmClient, (socket_path,))`，反序列化重连（不同于 `LocalClient` 持进程内
-> 指针不可序列化）。plain `Writer` 的 SHM 路径 won't fix（ticket ⑬）：legacy
-> `Writer` 无 SHM seam，Python 层覆盖 `writer`/`insert` 抛 `NotImplementedError`。
-> `trajectory_writer` 的 signature 校验已生效（ticket ⑧-2b → step 2）：`NewTrajectoryWriter`
-> 调 `ServerInfo()` 往返拿实时 `TableInfo` 填 `flat_signature_map`，`create_item` 校验 trajectory 与表签名，
-> 未知表拒为 `ValueError`（对齐 InProcessClient/gRPC validate_items=True）。
+## 6. Python 层
 
----
-
-## 6. Python 层变更
-
-### `reverb/client.py` — 新增 `ShmClient`
+### `reverb/client.py` — `ShmClient(_BaseClient)`
 
 ```python
 class ShmClient(_BaseClient):
-    """SHM-based client for same-machine cross-process access.
+    """SHM (POSIX shared memory) client for same-machine cross-process access.
 
-    Uses POSIX shared memory for zero-serialization data transfer.
-    API matches `Client` and `LocalClient` exactly.
+    Connects to a `Server(shm=True)` over a udsocket and mmaps the five SHM
+    segments (pool + two ring pairs: insert C→S/S→C + sample C→S/S→C, one
+    pair per flow so each flow keeps its own SPSC producer).
+    `sample`/`trajectory_writer`/`structured_writer` match `Client`/`LocalClient`
+    exactly, so user code is transport-agnostic.
     """
 
-    def __init__(self, socket_path: str):
-        super().__init__()
+    def __init__(self, socket_path: str, *, output_format: str = "numpy"):
+        super().__init__(output_format=output_format)
         self._socket_path = socket_path
+        # pybind.ShmClient.__init__ 调 ShmClient::Connect（bootstrap + mmap）；
+        # 连接/握手失败抛异常。
         self._client = pybind.ShmClient(socket_path)
 
     def __repr__(self):
         return f"ShmClient(socket_path={self._socket_path})"
 
     def __reduce__(self):
-        # ticket ⑫: pickle by socket_path, re-connect on unpickle.
+        # ticket ⑫: pickle 只存 socket_path；反序列化经 __init__ 重连
+        # （重新 bootstrap + mmap 五个 SHM 段）。原进程的 mmap/ring/fd 状态
+        # 留在原进程、随原 ShmClient 析构释放——pickle 边界无泄漏。
         return self.__class__, (self._socket_path,)
 
     def writer(self, *args, **kwargs):
-        # ticket ⑬: legacy Writer has no SHM seam.
+        # Legacy `Writer`（writer.h）无 SHM 传输 seam（ticket ⑬）：本地构造要
+        # tables map，SHM client 不持表；为废弃 API 复刻 RunShmWorker 不值。
+        # Python 侧抛清晰错误，不让它落到 C++ UnimplementedError。SHM insert
+        # 用 `trajectory_writer` / `structured_writer`。
         raise NotImplementedError(
             "ShmClient does not support the legacy writer/insert; use "
             "trajectory_writer or structured_writer instead."
         )
 
-    def insert(self, data, priorities):
-        raise NotImplementedError(
-            "ShmClient does not support the legacy writer/insert; use "
-            "trajectory_writer or structured_writer instead."
-        )
+    def insert(self, data, priorities: Dict[str, float]):
+        # `insert` 是 `writer` 的糖（见 _BaseClient.insert）；同上。
+        raise NotImplementedError(...)
 
     def _fetch_server_info_proto(self, timeout: Optional[int]):
+        # 每次调用实时往返（ticket ⑧ step 2）；timeout 为对齐 gRPC hook 而
+        # 接受但忽略（C++ 侧有 60s 硬上限）。
         return self._client.ServerInfo()
 
-    def _new_sampler(
-        self, table: str, num_samples: int, buffer_size: int,
-        timeout_ms: Optional[int],
-    ):
+    def _new_sampler(self, table, num_samples, buffer_size, timeout_ms):
         timeout_ms_arg = -1 if timeout_ms is None or timeout_ms < 0 else timeout_ms
         return self._client.NewSampler(table, num_samples, buffer_size, timeout_ms_arg)
 
-    def trajectory_writer(
-        self, num_keep_alive_refs: int, *,
-        max_chunk_length: Optional[int] = None,
-    ):
-        if num_keep_alive_refs < 1:
-            raise ValueError(...)
-        if max_chunk_length is None:
-            chunker_options = pybind.AutoTunedChunkerOptions(num_keep_alive_refs, 1.0)
-        else:
-            chunker_options = pybind.ConstantChunkerOptions(
-                max_chunk_length=max_chunk_length,
-                num_keep_alive_refs=num_keep_alive_refs,
-            )
-        cpp_writer = self._client.new_trajectory_writer(chunker_options)
-        from reverb import trajectory_writer as trajectory_writer_lib
-        return trajectory_writer_lib.TrajectoryWriter(cpp_writer)
+    def trajectory_writer(self, num_keep_alive_refs, *, max_chunk_length=None):
+        # chunker_options 构造（AutoTuned/Constant）→ new_trajectory_writer →
+        # reverb.trajectory_writer.TrajectoryWriter 包装。
+        ...
 
     def structured_writer(self, configs):
-        if not configs:
-            raise ValueError(...)
-        serialized_configs = [config.SerializeToString() for config in configs]
-        cpp_writer = self._client.new_structured_writer(serialized_configs)
-        from reverb import structured_writer as structured_writer_lib
-        return structured_writer_lib.StructuredWriter(cpp_writer)
+        # 序列化 configs → new_structured_writer → StructuredWriter 包装。
+        ...
 ```
 
-### `reverb/server.py` — `Server` 新增 `shm` 参数
+要点：
+
+- **`output_format`**（"numpy" / "torch"，torch 为可选依赖 `[torch]` extra）：
+  `ShmClient` 与 `Client`/`LocalClient` 同构，采样侧 `output_format='torch'`
+  时返回 torch.Tensor（torch 零拷贝路径，见 `torch-tensor-phase1.md`）。
+- **pickle**（ticket ⑫）：`__reduce__` 存 `socket_path`，反序列化重连——与
+  `LocalClient` 持进程内指针不可序列化不同。
+- **writer/insert**（ticket ⑬）：Python 层覆盖抛 `NotImplementedError`。
+- **signature 校验**（ticket ⑧-2b）：`trajectory_writer` 构造时调 `ServerInfo()`
+  往返拿实时 `TableInfo` 填 `flat_signature_map`，`create_item` 校验 trajectory
+  与表签名，未知表拒为 `ValueError`（对齐 InProcessClient/gRPC validate_items=True）。
+
+### `reverb/server.py` — `Server` 的 shm 参数
 
 ```python
 class Server:
@@ -1099,214 +1083,192 @@ class Server:
                  port: Optional[int] = None,
                  checkpointer: Optional[checkpointers.CheckpointerBase] = None,
                  in_process: bool = False,
-                 shm: bool = False,                          # ← 新增
-                 shm_socket_path: Optional[str] = None):     # ← 新增
+                 shm: bool = False,
+                 shm_socket_path: Optional[str] = None,
+                 shm_pool_slab_sizes: Optional[List[int]] = None,
+                 shm_pool_blocks_per_slab: Optional[int] = None):
         ...
         if shm:
-            from reverb.shm_server import ShmServer as PyShmServer
-            self._shm_server = PyShmServer(
-                [t.table for t in tables],
+            # 决策 C1：ShmServer 生命周期挂在 Server 对象上。
+            # socket 路径默认 /tmp/reverb_shm_<pid>_<n>.sock（per-process 计数器
+            # 防同进程两个 Server(shm=True) 互踩）。
+            self._shm_server = pybind.ShmServer(
+                [t.internal_table for t in tables],
                 socket_path=shm_socket_path,
+                checkpointer=checkpointer.internal_checkpointer(),
+                # None -> empty/0 保持 C++ 默认路径（kDefaultSlabSizes x
+                # kDefaultBlocksPerSlab）。
+                slab_sizes=shm_pool_slab_sizes or [],
+                blocks_per_slab=shm_pool_blocks_per_slab or 0,
             )
-            self._shm_socket_path = self._shm_server.socket_path()
-        ...
+            self._shm_server.Start()
+            self._shm_socket_path = self._shm_server.socket_path
 ```
 
-`reverb/shm_server.py` 是新增的 `pybind.ShmServer` 的 Python 包装。
+- `shm=True` 时 `Server.shm_socket_path` 可用（`shm=False` 为 `None`）。
+- `shm_pool_slab_sizes` / `shm_pool_blocks_per_slab`（ticket 02）：使用者向调优项，
+  控制单连接池高水位（默认 9 档 × 256 块 ≈ 1.4GB）；小档配置可把高水位降到
+  档位容量量级。
+- `shm=True` 不隐含 `in_process=True`，两开关独立（组合矩阵见 guide）。
 
----
+## 7. 线程模型与数据流
 
-## 7. 实现顺序
+### 7.1 Server 进程
 
-### Phase 1：基础设施
+单 dispatch 线程（`ShmServer::DispatchLoop`）全权处理 SHM 面：
 
-| 步骤 | 文件 | 产出 |
-| ------ | ------ | ------ |
-| 1.1 | `shm_protocol.proto` | proto 定义 + `reverb_cc_proto_library` 构建 |
-| 1.2 | `ring.h`, `ring.cc`, `ring_test.cc` | SPSC ring 读写 + 单元测试（无 mmap，纯内存） |
-| 1.3 | `byte_pool.h`, `byte_pool.cc`, `byte_pool_test.cc` | Slab 分配/回收 + 引用计数 + 单元测试 |
+```
+DispatchLoop()
+  ├── poll(listen_fd + 各 client control_fd + wake_fd_, 50ms 兜底)  // ticket 03
+  │     静止（Quiescent）才阻塞；有工作立即处理
+  ├── TryAccept()：新 client → 握手（RecvHello 带小超时）→ 建 4 条 ring 段 →
+  │     SendWelcome → 创建 ClientState
+  ├── 对每个 client：
+  │     HandleInsertRequests：排空 insert c2s
+  │       ALLOCATE → HandleAllocate（选档位，授予偏移）
+  │       INSERT → HandleInsert（ParseFromArray 各 ChunkData → 逐 item
+  │                InsertOrAssignAsync；回调聚合 → 一条 INSERT_ACK 入 outbox）
+  │       RELEASE → Unref 各偏移，归零 Deallocate
+  │     HandleSampleRequests：排空 sample c2s
+  │       SAMPLE → HandleSample（FindTable → EnqueSampleRequest 异步）
+  │       RELEASE → Unref
+  │     DrainPendingSamples：table worker 完成的 SampledItem →
+  │       UnpackChunkColumnAndSlice → pool_.Allocate + Ref + memcpy →
+  │       SAMPLE_RESP（非阻塞写，满则 sample_outbox）
+  │     FlushOutbox：两个 outbox 非阻塞 TryWrite（§8.7）
+  │     IsClientDead：fd EOF/HUP 或 close_requested → HandleDisconnect
+  ├── off-dispatch 生产者（insert ACK 聚合回调、sample 完成回调、
+  │     checkpoint executor）enqueue 后都调 WakeDispatch() 写 eventfd
+  └── 控制面（10/11/08）：MUTATE_PRIORITIES/RESET/CHECKPOINT/SERVER_INFO 也
+        走 insert c2s → HandleXxx → EnqueueInsertS2C；CHECKPOINT 的 Save 在
+        checkpoint_executor_ 上跑（评审 #3）
+```
 
-### Phase 2：控制面
+### 7.2 Client 进程
 
-| 步骤 | 文件 | 产出 |
-|------|------|------|
-| 2.1 | `bootstrap.h`, `bootstrap.cc`, `bootstrap_test.cc` | udsocket 握手 + 段名交换 + 单元测试（双进程测试） |
-| 2.2 | `shm_connection.h` | 三组 mmap 的 RAII 包装 |
-
-### Phase 3：数据面
-
-| 步骤 | 文件 | 产出 |
-|------|------|------|
-| 3.1 | `shm_server.h`, `shm_server.cc`, `shm_server_test.cc` | Dispatch 循环 + insert/sample/release 处理 + 断连恢复 |
-| 3.2 | `shm_client.h`, `shm_client.cc`, `shm_client_test.cc` | Client 连接 + insert/sample writer/sampler 完整路径 |
-
-### Phase 4：Python 集成
-
-| 步骤 | 文件 | 产出 |
-| ------ | ------ | ------ |
-| 4.1 | `reverb/pybind.cc` | `PyShmClient` 的 pybind 绑定 + `PascalCase`/`snake_case` 双名 |
-| 4.2 | `reverb/client.py` | `ShmClient(_BaseClient)` 类 |
-| 4.3 | `reverb/server.py` | `Server` 的 `shm=True` 参数 + `ShmServer` Python 包装 |
-
-### Phase 5：端到端验证
-
-| 步骤 | 内容 |
-| ------ | ------ |
-| 5.1 | 单进程双线程测试（模拟 client/server 双进程，用 udsocket + SHM 连通） |
-| 5.2 | 真双进程测试（fork + `ShmClient` 连子进程 `ShmServer`） |
-| 5.3 | 崩溃恢复测试（kill client → server 清理不泄漏） |
-| 5.4 | 性能对比基准（gRPC loopback vs SHM sample throughput + latency） |
-
----
+- **`ShmSampler` worker 线程**（决策 C5）：`RunWorker` 循环 `FetchOne()`——
+  发 SAMPLE 到 sample c2s → 轮询 sample s2c 收 SAMPLE_RESP（或 ERROR）→ 按
+  `ShmColumn.shm_offset` 从池读字节构建 `TensorBuffer`（批次列：server 已预拼接
+  batched tensor，`squeeze_columns` 解压）→ 发 RELEASE → 组装 `Sample` 推进
+  `samples_` 队列。`GetNextTrajectory` 从队列取。`max_samples` 或取消时退出。
+- **`RunShmWorker`**（TrajectoryWriter 的 SHM worker 线程，ticket ④/01）：从
+  `write_queue_` 取 ready item → **凑批**（连续 already-ready item，≤64 个 /
+  ≤128KB，不引入等待）→ `insert_flow_mu` 锁内：每 unique chunk 一条 ALLOCATE
+  流水线突发（N 发 N 收 FIFO 配对）→ memcpy 序列化 `ChunkData` → 一条 INSERT →
+  等一条聚合 INSERT_ACK → 清 in-flight、`local_can_insert_more_`、RELEASE
+  `offsets_to_release`。一批 ~2 次 ring 往返（旧每 item 2 次）。
+- **调用线程控制面**：`MutatePriorities`/`Reset`/`ServerInfo`/`Checkpoint` 在
+  `insert_flow_mu` 下走 insert 流往返，与 RunShmWorker 串行。
+- **阻塞策略**：Ring 本身非阻塞；调用点用 `ReadBlocking`/`WriteBlocking`
+  （poll + sched_yield + control_fd 存活探测 + `closed` 标志 + 60s 硬上限）——
+  server 死亡/被卡时快速失败（UnavailableError/DeadlineExceededError），不永转。
 
 ## 8. 测试策略
 
-### 单元测试
+`bazel test //reverb/cc/shm/...`（10 个目标；无 plan 时代设想的
+`shm_server_test.cc`/`shm_client_test.cc`）：
 
-| 模块 | 测试项 |
-| ------ | -------- |
-| `Ring` | ✅ 单槽消息写读<br>✅ 多槽跨消息（> slot_size）写读<br>✅ capacity 满时阻塞/背压<br>✅ 多轮循环（写满→读空→写满→...）<br>✅ seq 绕回（seq > capacity 多轮） |
-| `BytePool` | ✅ slab 选择（选最小够用档位）<br>✅ 分配/回收/再分配<br>✅ 引用计数 inc/dec → 0 时回收<br>✅ 池满时阻塞 behavior（靠超时检测）<br>✅ 多块同档位分配复用 |
-| `Bootstrap` | ✅ 握手往返（Hello → Welcome）<br>✅ 段名格式校验<br>✅ 协议版本不匹配拒绝 |
+| 目标 | 覆盖 |
+| --- | --- |
+| `ring_test` | 单槽/跨槽消息、capacity 满背压、多轮循环、seq 绕回、HasData、server_asleep 唤醒 |
+| `byte_pool_test` | slab 选择（最小够用）、分配/回收/再分配、refcount inc/dec→0 回收、几何校验（严格升序、≥8B）、档位耗尽 RESOURCE_EXHAUSTED |
+| `bootstrap_test` | 握手往返（Hello→Welcome）、协议版本不匹配拒绝、段名格式 |
+| `byte_pool_echo_test` | 双进程 pool+ring 回声（跨进程读写校验） |
+| `echo_test` | 最简握手 + 回声端到端 |
+| `shm_sample_test` | ShmSampler 完整 sample 路径（含批次列、timeout→DeadlineExceeded、未知表 NOT_FOUND） |
+| `shm_insert_test` | RunShmWorker insert 路径（批量聚合 ACK 往返计数、ALLOCATE 配对、多表路由、signature 校验） |
+| `shm_crash_test` | 崩溃恢复：client SIGKILL → server 集中释放无泄漏、新 client 可连；server 消失 → client 快速失败；close-while-in-flight（ticket「shm-close-while-in-flight」） |
+| `shm_checkpoint_test` | checkpoint 保存 + 恢复（经 gRPC/InProcess 的 LoadLatest） |
+| `shm_wakeup_test` | eventfd 唤醒：空闲 server poll 计数、唤醒后即时处理（ticket 03） |
 
-### 集成测试
-
-| 测试 | 内容 |
-| ------ | ------ |
-| `ShmServer + ShmClient` | insert → sample 完整路径 (同进程双线程) |
-| `ShmClient + TrajectoryWriter` | writer append → create_item → sample 读出 |
-| `ShmClient::MutatePriorities` | 更新优先级后 sample 概率变化 （已实现，ticket ⑩） |
-| `ShmClient::Reset` | 重置后 table 为空 （已实现，ticket ⑩） |
-| `ShmClient::Checkpoint + Load` | checkpoint → 新建 server load → sample 恢复数据 （已实现，ticket ⑪） |
-
-### 双进程测试
-
-```cpp
-// pseudo-code for process-level test
-TEST(ShmIntegration, TwoProcessSample) {
-  pid_t pid = fork();
-  if (pid == 0) {  // child: server
-    auto server = ShmServer::Create(tables, socket_path);
-    server->Start();
-    sleep(10 秒);  // 等 client 做操作
-    server->Stop();
-    _exit(0);
-  } else {  // parent: client
-    sleep(1);  // 等 server 就绪
-    auto client = ShmClient::Connect(socket_path);
-    // ... 正常 insert / sample ...
-    // kill child
-  }
-}
-```
-
-### 崩溃恢复测试
-
-```cpp
-// client 进程崩溃，server 正确清理
-TEST(ShmIntegration, ClientCrashCleanup) {
-  // 1. 创建 server
-  // 2. client 连接，insert 数据
-  // 3. kill client (SIGKILL)
-  // 4. 验证 server 无泄漏:
-  //    - 该 client 的 outstanding_offsets_ 为空
-  //    - ring 和 pool 段可被 shm_unlink
-  //    - 其他 client 不受影响
-  // 5. 新 client 可正常连接使用
-}
-```
-
----
+双进程场景用 fork + `ShmServer`/`ShmClient` 真跨进程验证（echo/crash 测试）。
 
 ## 9. 边界情况与错误处理
 
 | 场景 | 行为 | 参考 |
-| ------ | ------ | ------ |
-| server 启动时旧 `.sock` 文件残留 | `ShmBootstrapServer::Create` 先 `unlink(socket_path)` 再 `bind` | R7 |
-| server 重启时旧 SHM `/dev/shm/` 残留 | 使用 `O_EXCL` 创建，失败则 `shm_unlink` 旧名重试（仅同名 PID）；或清所有 `/reverb_shm_*` 前缀 | R6 |
-| client 发送消息时 ring 满 | `Ring::Write` 忙等（`sched_yield`），无超时（对齐全语义） | S14 |
-| server 写 S→C ring 满 | 暂存到 `ClientState.outbox`，跳过该 client 继续轮询 | §8.7 |
-| byte pool 满 | 分配阻塞，暂存 sample 请求，等释放后继续 | S14 |
-| server dispatch 线程内 `Table::Sample` 返回 0 个 sample | 写空 `SAMPLE_RESP`（`samples` 字段空列表） | — |
-| client 崩溃（SIGKILL） | udsocket EOF → server 调用 `HandleDisconnect` | §8.8 |
-| server 崩溃 | client 读到 udsocket EOF → 报 `ConnectionError` | §8.8 |
-| client 发送 `CLOSE` 消息 | server 正常释放该 client 全部资源 | §8.8 |
-| 多列 chunk 的 spec 数量与 bytes 长度不匹配 | server 在校验时返回 `INVALID_ARGUMENT` | — |
-| client 协议版本与 server 不匹配 | server 返回 `ERROR(INVALID_ARGUMENT)` + 关闭连接 | §8.2 |
-| `Insert` 请求中 `items` 引用的 `chunk_key` 不在 `chunks` 中 | server 返回 `INSERT_ACK` 只含已插入的 items，缺失的 key 报错 | — |
-| `Sample` 超时 | server 返回 `ERROR(DEADLINE_EXCEEDED)` | §8.3 ShmError |
-| 同一个 SHM 偏移同时被多个 sample 引用 | 引用计数避免提前回收 | §4.1 |
-
----
+| --- | --- | --- |
+| server 启动时旧 `.sock` 文件残留 | `ShmBootstrapServer::Create` 先 `unlink` 再 `bind` | R7 |
+| server 重启时旧 SHM `/dev/shm/` 残留 | 段名含 server epoch（PID+墙上时钟纳秒），同 socket 重启不与活段碰撞；残留仅 tmpfs 少量，重启自清 | ticket #7 / A3 |
+| client 写时 ring 满 | `WriteBlocking` 轮询 TryWrite（sched_yield），每轮探测 control_fd + `closed`，60s 硬上限 | 评审 #2 / ticket「shm-close-while-in-flight」 |
+| server 写 S→C ring 满 | `TryWrite` 失败 → 暂存 per-flow outbox，下轮 FlushOutbox 重试；insert/sample outbox 互不阻塞 | §8.7 |
+| byte pool 档位耗尽 | `Allocate` 快速失败 `RESOURCE_EXHAUSTED`（不阻塞，防 dispatch 死锁）；超档请求永久 `InvalidArgument` | ticket 02 |
+| `Table::Sample` 返回 0 个 sample | 异步完成回调携带 status（含 DeadlineExceeded）→ SAMPLE_RESP 空 / ERROR | ticket ⑩ |
+| client 崩溃（SIGKILL） | udsocket EOF → `HandleDisconnect` 集中释放 `outstanding_offsets_`、unlink 4 条 ring | §8.8 / ticket ⑥ |
+| server 崩溃 | client 读侧探测 control_fd EOF/`closed` → `UnavailableError`（不永转） | §8.8 / ticket ⑥ |
+| client 发送 `CLOSE` | `close_requested` 置位 → 下一轮 HandleDisconnect | ticket ⑥ |
+| 多列 chunk spec 与字节不匹配 | 不存在——传输的是自描述 `ChunkData` proto，`ParseFromArray` 还原 | §8.5 |
+| 协议版本不匹配 | server 回 ERROR + 关闭连接 | §8.2 |
+| `Insert` items 引用未知 chunk_key | 对应 item 报错，已插入的照常 ACK | — |
+| `Sample` 超时 | ERROR(DEADLINE_EXCEEDED) → Python `DeadlineExceededError` | §8.3 |
+| 同一 SHM 偏移被多个 sample 引用 | 引用计数避免提前回收（C3） | §4.1 |
+| 同连接第二个活 sampler | `NewSampler` 拒绝（single-sampler permit，SPSC 不变式） | 扫描 #1 |
+| 会话中途 `Table.replace` 改签名 | 旧 writer 持旧签名；下个 `trajectory_writer` 构造时实时往返拿新签名 | ticket ⑧ step 2 |
 
 ## 附录：关键实现决策说明
 
 ### A0. 已确认决策（2026-07-09 用户确认）
-
-以下三项在审阅时由实现方单方面拟定，现已由用户确认锁定，开发时直接遵循：
 
 | 编号 | 决策 | 内容 |
 | --- | --- | --- |
 | **C1** | ShmServer 生命周期挂在 `Server` Python 对象上 | 不独立成 `ShmServer` Python 对象。`Server(shm=True)` 构造时创建并持有 `ShmServer`（C++ dispatch 线程随之启动），`Server.stop()` / `__del__` 时销毁。用户经 `Server.shm_socket_path` 拿路径去连 `ShmClient`。 |
 | **C2** | insert 的 SHM 偏移在收到 `INSERT_ACK.offsets_to_release` 前，client 不得重用 | client 发完 INSERT 请求后，对应的 SHM 字节区域视为"占用中"，writer 的 backpressure（`num_items_in_flight`）正是靠"等 ACK"来约束。server 压缩完进 ChunkStore 后回 ACK，client 才允许把该偏移归还字节池复用。 |
 | **C3** | sample 的 SHM 偏移引用计数起点 = 1 | server 在 `ShmBytePool::Allocate` 成品字节 memcpy 进池时即设 refcount=1；client 读完该 sample 的所有列后发 RELEASE，server `Unref`，归零则 `Deallocate`。client 崩溃时 server 遍历 `outstanding_offsets_` 集中释放。 |
-
-> 注：设计文档 §6 的 v2 优化（insert 字节复用于 sample 切片源，省压缩往返）
-> 仍延后，v1 按"server 从压缩 ChunkStore 解压到 SHM"实现。
-
-| **C4** | pool 读写权限 + 分配权归属 | client 以 `PROT_READ|PROT_WRITE` mmap pool；**但分配权仍在 server 单线程**。insert 路径：client 先经 C→S ring 向 server 申请偏移（`ALLOCATE` 子请求），server `Allocate` 返回偏移，client `memcpy` chunk 字节进该偏移，再发 `INSERT`。sample 路径：server 分配 + memcpy 成品字节，client 只读。即"谁生产谁写、server 独占分配器"。修正原 A2 的"client 只读"表述——只读仅对 sample 响应字节成立。 |
-| **C5** | SHM Sampler 复用现有 worker 线程架构 | 不按原 A5 的"无 worker、调用者线程内联"实现。现有 `Sampler` 类基于后台 worker 线程 + `samples_` 队列，SHM sampler 保留这套，只把 worker 内的 gRPC `SampleStream` 换成 SHM ring 往返。diff 更小、复用已测机制。原 A5 的"无 worker"属理想化，作废。 |
+| **C4** | pool 读写权限 + 分配权归属 | client 以 `PROT_READ|PROT_WRITE` mmap pool；**但分配权仍在 server 单线程**。insert 路径：client 先经 insert ring C→S 向 server 申请偏移（`ALLOCATE` 子请求），server `Allocate` 返回偏移，client `memcpy` chunk 字节进该偏移，再发 `INSERT`。sample 路径：server 分配 + memcpy 成品字节，client 只读。即"谁生产谁写、server 独占分配器"。 |
+| **C5** | SHM Sampler 复用现有 worker 线程架构 | 现有 `Sampler` 类基于后台 worker 线程 + `samples_` 队列，SHM sampler 保留这套（`ShmSampler::RunWorker`），只把 worker 内的 gRPC `SampleStream` 换成 SHM ring 往返。 |
 
 ### A1. 为什么 sample 路径下 server 用 dispatch 线程同步做 `UnpackChunkColumnAndSlice`
 
-设计文档 §4.1 说分配单线程化。若把解压委派到 worker 池，而分配仍在 dispatch 线程，
-需跨线程传 buffer 和同步，增加复杂度。v1 选择在 dispatch 线程同步执行解压+切片的
-简化方案（`ponytail:` 瓶颈后升级为 per-client dispatch + 带锁分配器）。
+设计文档 §4.1 说分配单线程化。若把解压委派到 worker 池，而分配仍在 dispatch
+线程，需跨线程传 buffer 和同步，增加复杂度。v1 选择在 dispatch 线程同步执行
+解压+切片的简化方案：table worker 只做采样，成品 `SampledItem` 攒进
+`pending_samples`，dispatch 线程 `DrainPendingSamples` 做 unpack + pool 分配 +
+memcpy + 写 SAMPLE_RESP（`ponytail:` 瓶颈后升级为 per-client dispatch + 带锁
+分配器）。
 
 ### A2. pool 读写权限与分配权归属（见决策 C4）
 
 client 以 `PROT_READ|PROT_WRITE` mmap pool，但**不自行分配**——分配器是 server
-单线程独占的 slab free list，无跨进程锁（spec §4.1）。两条路径的读写角色：
+单线程独占的 slab free list，无跨进程锁。两条路径的读写角色：
 
-- **insert**（client 生产字节）：client 先经 C→S ring 向 server 申请偏移，server
-  `Allocate` 返回偏移，client `memcpy` chunk 字节进该偏移，再发 `INSERT`。
-  server 读这些字节压缩进 ChunkStore，回 `INSERT_ACK.offsets_to_release`，client
-  方可释放该偏移（C2）。
+- **insert**（client 生产字节）：client 先经 insert ring C→S 向 server 申请偏移，
+  server `Allocate` 返回偏移，client `memcpy` chunk 字节进该偏移，再发 `INSERT`。
+  server 读这些字节 `ParseFromArray` 进 ChunkStore，回 `INSERT_ACK.offsets_to_release`，
+  client 方可释放该偏移（C2）。
 - **sample**（server 生产字节）：server `Allocate` + `memcpy` 成品字节，client 只读。
-
-原"client 只读"的表述仅对 sample 响应字节成立，已由 C4 修正。
 
 ### A3. SHM 段名如何生成
 
 权威定义在 `reverb/cc/shm/bootstrap.h`（`MakeShmNames`）。server 为每个连接生成
 `/reverb_shm_pool_<token>` 与四条 ring（决策 D 每流一对）：
 `/reverb_shm_{insert,sample}_{c2s,s2c}_<token>_<client_pid>`，全部经 Welcome 下发，
-client 不自算。`<token>` = 消毒后的 server socket 路径 + server epoch（PID + 墙上时钟
-纳秒）：socket 路径使同机/同进程多 server 实例不互删段（scan #12），epoch 使同 socket
-路径崩溃重启的 server 不与旧客户端的活段碰撞（ticket #7——旧段不再被
+client 不自算。`<token>` = 消毒后的 server socket 路径 + server epoch（PID + 墙上
+时钟纳秒）：socket 路径使同机/同进程多 server 实例不互删段（scan #12），epoch 使
+同 socket 路径崩溃重启的 server 不与旧客户端的活段碰撞（ticket #7——旧段不再被
 unlink-and-retry 误删，仅 tmpfs 少量残留，重启自清）。
 
 ### A4. `ShmClient.NewTrajectoryWriter` 为什么走 SHM 路径而不是直接持 Table
 
 与 `InProcessClient` 不同，`ShmClient` 与 server 在不同进程，不能直接持有
 `shared_ptr<Table>`。writer 的逻辑（chunker、column refs、backpressure）在 client
-侧运行，但最终的 `InsertOrAssignAsync` 必须经 SHM 路径发往 server。
-具体做法：
+侧运行，但最终的 `InsertOrAssignAsync` 必须经 SHM 路径发往 server。具体做法
+（`RunShmWorker`，ticket ④/01）：
 
-1. Writer 的 `RunLocalWorker` 或等效 dispatch loop 在 client 线程运行
-2. chunk 数据组装完毕后 memcpy 到 client 侧共享的 SHM 字节池的一块区域
-3. 发 INSERT 请求（含 SHM 偏移）到 C→S ring
-4. server 读 ring，压缩该 SHM 字节到 ChunkStore
-5. server 回复 INSERT_ACK（含 `offsets_to_release`）
-6. client 收到后允许 writer 重用该偏移的 SHM 空间
+1. Writer 的 `RunShmWorker` 线程在 client 进程跑，从 `write_queue_` 取 ready item
+2. 凑批（≤64 items / ≤128KB）后，为每个 unique chunk 先发 `ALLOCATE` 申请池偏移
+   （流水线突发，N 发 N 收 FIFO 配对）
+3. chunker 产出的 `ChunkData`（已压缩）`SerializeToString` memcpy 进该偏移
+4. 发一条 `INSERT` 请求（含全部 chunk 偏移 + items）到 insert ring C→S
+5. server 读 ring，`ParseFromArray` 还原 `ChunkData` 入 ChunkStore
+6. server 回一条聚合 `INSERT_ACK`（含 `offsets_to_release`）
+7. client 收到后清 in-flight、允许 writer 重用该批偏移的 SHM 空间
 
 ### A5. `Sampler` 的 SHM 路径实现（见决策 C5）
 
-SHM `Sampler` **复用现有 worker 线程 + `samples_` 队列架构**，不按"调用者线程内联"
-实现。worker 线程内把原 gRPC `SampleStream` 往返换成 SHM ring 往返：发 `SAMPLE`
-请求到 C→S ring → 轮询 S→C ring 取 `SAMPLE_RESP` → 按 `ShmColumn.shm_offset` 从
-pool 读字节构建 `TensorBuffer` → 发 `RELEASE` → 把 `Sample` 推进 `samples_` 队列。
-`GetNextTrajectory` 仍从队列取，与 gRPC/local 路径一致。
+SHM `Sampler` **复用现有 worker 线程 + `samples_` 队列架构**（`ShmSampler`）。
+worker 线程内把原 gRPC `SampleStream` 往返换成 SHM ring 往返：发 `SAMPLE` 请求到
+sample ring C→S → 轮询 sample ring S→C 取 `SAMPLE_RESP` → 按 `ShmColumn.shm_offset`
+从 pool 读字节构建 `TensorBuffer` → 发 `RELEASE` → 把 `Sample` 推进 `samples_`
+队列。`GetNextTrajectory` 仍从队列取，与 gRPC/local 路径一致。
 
 > 注意：`TensorBuffer` 指向的 SHM 区域在 RELEASE 前必须保持有效。worker 读完
 > 一次 sample 的所有列、组装完 `Sample` 入队后再发 RELEASE，避免 sample 未组装

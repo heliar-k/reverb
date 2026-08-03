@@ -89,7 +89,7 @@ signature 用 TF 的 `nested_structure_coder` 编解码，checkpoint 用 TFRecor
 | B2 | 自研 `TensorSpec` + `TensorBuffer` | 不依赖 TF，对齐 numpy dtype |
 | C1 | pybind 暴露 `timeout` 参数，超时抛 `DeadlineExceededError` | 原版 `TimeoutError` 与 Python 内置同名，易混淆 |
 | C2 | 保留 `table_worker_` + `extension_worker_` 异步线程 | 零 GIL 是性能基础，不能丢 |
-| D1 | 本地 `TrajectoryWriter`/`Writer` 持 `tables_` map，按 `item.table()` 分发 | 修正“绑定单一 table”的历史偏懒选择，签名对齐 gRPC `Client`(不收 table 参数)，消除三层 API 债。详见 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) |
+| D1 | 本地 `TrajectoryWriter`/`Writer` 持 `tables_` map，按 `item.table()` 分发 | 修正“绑定单一 table”的历史偏懒选择，签名对齐 gRPC `Client`(不收 table 参数)，消除三层 API 债。详见 [ADR-0001](../adr/0001-embedded-writer-local-path.md) 与 [§6](#6-附录本地-writer-解绑与本地化d1d2d3-a-摘录) |
 | D2 | writer 级 backpressure(任意表满则 writer 停) | 对齐 gRPC writer 级单一 stream 的语义；单表场景行为不变 |
 | D3 | checkpoint 用 length-delimited protobuf | TFRecord 去掉 CRC32 就是标准 length-delimited protobuf，~20 行实现。**注**：与 §6 的 D3-a(Writer 本地化) 不同编号语境，此处 D3 为 checkpoint 决策 |
 
@@ -170,7 +170,7 @@ class InProcessClient {
 };
 ```
 
-Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`writer`/
+Python 层有三个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`writer`/
 `mutate_priorities`/`reset`/`server_info`/`checkpoint` 逻辑：
 
 - **`Client`**（gRPC）：构造为 `Client('localhost:port')`，走 gRPC。保留原版的
@@ -179,9 +179,14 @@ Python 层有两个客户端类，共享 `_BaseClient` 的 `sample`/`insert`/`wr
   包装 C++ `InProcessClient`。与 `Client` API 严格镜像——`insert`/`writer` 上提到
   `_BaseClient` 共享单一实现，`trajectory_writer`/`structured_writer` 不收 table
   参数。唯一缺失是 pickle（见 [3.5](#35-localclient-无-pickle)）。
+- **`ShmClient`**（同机跨进程）：`reverb.ShmClient(server.shm_socket_path)`，包装
+  C++ `ShmClient`（udsocket 握手 + mmap 共享字节池与 per-flow ring）。除 legacy
+  `writer`/`insert`（无 SHM seam，Python 层抛 `NotImplementedError`，见
+  [numpy-shm-design.md](numpy-shm-design.md)）外 API 与另两者一致，且可 pickle
+  （存 `socket_path` 重连）。
 
-两者通过两个 hook 区分 C++ 调用差异：`_fetch_server_info_proto`（gRPC 传 timeout，
-内嵌忽略）和 `_new_sampler`（gRPC 无 rate-limiter timeout，内嵌有）。
+三者通过两个 hook 区分 C++ 调用差异：`_fetch_server_info_proto`（gRPC 传 timeout，
+内嵌/ SHM 忽略）和 `_new_sampler`（gRPC 无 rate-limiter timeout，内嵌/SHM 有）。
 
 ### 2.3 Signature 编解码：TF `nested_structure_coder` → 纯 Python `signature_codec`
 
@@ -279,7 +284,7 @@ C++ 侧 `Sampler::Options.rate_limiter_timeout` 和 `TrajectoryWriter::Flush`/
 NewTrajectoryWriter` 不收 table 参数，完全对齐 gRPC `Client` 签名。完整决策背景
 （含早期“绑定单一 table”的折中如何逼出三层 API 债、为何改为持 map）见
 [§6](#6-附录本地-writer-解绑与本地化d1d2d3-a-摘录) 与
-[unbind-local-writer-plan.md](unbind-local-writer-plan.md)。
+[ADR-0001](../adr/0001-embedded-writer-local-path.md)。
 
 ### 3.3 pybind PascalCase 双名别名
 
@@ -528,8 +533,8 @@ Python 闭包零 TF（无 `tf_nightly`/`keras`）。首次 `bazel build` 不再�
 
 ## 6. 附录：本地 Writer 解绑与本地化（D1/D2/D3-a 摘录）
 
-> 本节摘录自 [unbind-local-writer-plan.md](unbind-local-writer-plan.md) 与
-> [adr/0001-embedded-writer-local-path.md](../adr/0001-embedded-writer-local-path.md)，
+> 本节摘录自已归档删除的 unbind-local-writer-plan.md（改造完成后清理，见
+> git 历史 98ea063）与 [adr/0001-embedded-writer-local-path.md](../adr/0001-embedded-writer-local-path.md)，
 > 是上文 §3.2/§3.4/§3.5 当前实现背后的完整背景与决策记录（含早期“绑定单一 table”
 > 折中如何被推翻）。
 

@@ -856,8 +856,9 @@ class ShmClient(_BaseClient):
     v1 scope (spec §6 + ticket ⑤): the C++ `ShmServer` dispatch handles
     SAMPLE/RELEASE/INSERT/ALLOCATE plus the control-plane ops
     `mutate_priorities`/`reset` (ticket ⑩) and `checkpoint` (ticket ⑪), all
-    riding the insert flow under a client mutex. `server_info` returns a
-    bootstrap-time snapshot (ticket ⑧); the plain `Writer` is unimplemented
+    riding the insert flow under a client mutex. `server_info` does a live
+    `SERVER_INFO` ring round-trip per call (ticket ⑧ step 2, replaces the
+    step-1 bootstrap snapshot); the plain `Writer` is unimplemented
     over SHM (use `trajectory_writer`/`structured_writer`). `ShmClient` is
     picklable: `__reduce__` stores `socket_path` and reconnects on load
     (ticket ⑫).

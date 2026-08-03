@@ -14,7 +14,9 @@
 
 Reverb 是一个**数据存储与传输系统**，为强化学习的经验回放（experience replay）而设计，同时也适用于任何需要在训练循环中高效存取数据的场景——例如存储模型权重、构建数据管道、或实现优先级队列。
 
-它由 C++ 实现核心逻辑，通过 Python 暴露 API，数据载体为纯 numpy 数组（本 fork 不依赖 TensorFlow）。
+它由 C++ 实现核心逻辑，通过 Python 暴露 API，数据载体默认是纯 numpy 数组
+（本 fork 不依赖 TensorFlow；可选 `output_format='torch'` 让 `sample()` 直接产出
+`torch.Tensor`，torch 是可选依赖，需 `pip install dm-reverb-numpy[torch]`）。
 
 用三行代码感受一下：
 
@@ -48,7 +50,10 @@ flowchart TB
   end
 ```
 
-**核心思路：** Server 持有若干 Table，每个 Table 是一个独立的「容器 + 采样/移除策略」组合。Client 通过三种传输层之一连接 Server，写入数据或读取样本。传输层对上层核心 API 完全透明——用 `trajectory_writer`、`structured_writer`、`sample`、`mutate_priorities` 时调用方式都一样。**例外：** `ShmClient` 不支持 `Writer`/`insert`（较早的写入 API，功能已被 `TrajectoryWriter` 取代），请使用 `trajectory_writer` 代替。详见 [client-transports.md](client-transports.md)。
+**核心思路：** Server 持有若干 Table，每个 Table 是一个独立的「容器 + 采样/移除策略」组合。Client 通过三种传输层之一连接 Server，写入数据或读取样本。传输层对上层核心 API 完全透明——用 `trajectory_writer`、`structured_writer`、`sample`、`mutate_priorities` 时调用方式都一样。**例外：** `ShmClient` 不支持 `Writer`/`insert`——SHM 传输层未提供 legacy `Writer`
+的接缝（`Writer` 本身未废弃，gRPC `Client`/`LocalClient` 仍支持，见
+[ADR-0001](../adr/0001-embedded-writer-local-path.md)），请使用 `trajectory_writer`
+代替。详见 [client-transports.md](client-transports.md)。
 
 > 图中 `sampler`、`remover`、`rate_limiter` 等概念详见下文第 3 节。
 
@@ -96,6 +101,10 @@ print(info['my_table'].current_size)  # 当前 item 数量
 
 **关键理解：** `in_process=True` 和 `shm=True` 是独立的开关。前者让同进程代码可以零开销访问 Table，后者让同机器的其他进程可以通过共享内存访问。两者可以同时开启。
 
+> **SHM 调优**：`Server(shm=True, shm_pool_slab_sizes=[...], shm_pool_blocks_per_slab=N)`
+> 可调 SHM 字节池的档位几何（默认 9 档 × 每档 256 块 ≈ 1.4GB 单连接高水位；
+> 小档配置可把高水位降到档位容量量级），详见 [client-transports.md](client-transports.md)。
+
 ### 3.2 Table
 
 Table 是 Reverb 的核心抽象——一个带有存、取、删策略的数据容器。每个 Table 由以下要素定义：
@@ -125,7 +134,7 @@ Reverb 提供三种 Client，对应三种不同的通信路径。**API 完全一
 |---|---|---|---|
 | `Client` (gRPC) | `reverb.Client('host:port')` | 跨机器 / 分布式 | 基线（gRPC 序列化开销） |
 | `LocalClient` | `server.in_process_client` | 同进程内嵌 | 最快（零拷贝，直接持有 Table 指针） |
-| `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` | 同机器跨进程 | 约 gRPC 的 9-11 倍（mmap 零拷贝） |
+| `ShmClient` | `reverb.ShmClient(server.shm_socket_path)` | 同机器跨进程 | 约 gRPC 的 ~3×（mmap 零拷贝，见 [client-benchmark.md](../benchmark/client-benchmark.md)） |
 
 ```python
 # 三种构造方式，API 完全一致
@@ -204,7 +213,12 @@ writer.flush()  # 或由 StructuredWriter 在退出时自动 flush
 | 固定窗口、条件触发、一数据流多表 | `StructuredWriter` |
 | 手动切轨迹、复杂依赖、自定义优先级 | `TrajectoryWriter` |
 
-> 历史遗留：`client.writer()` 返回一个更早的 `Writer` 对象，功能与 `TrajectoryWriter` 重叠但不支持轨迹构造。新代码请统一使用 `TrajectoryWriter`。`Writer` 已从 `ShmClient` 中移除。
+> 历史遗留：`client.writer()` 返回一个更早的 `Writer` 对象，功能与 `TrajectoryWriter`
+> 重叠但不支持轨迹构造。新代码请统一使用 `TrajectoryWriter`。`Writer` 本身**未废弃**
+> （gRPC `Client` / `LocalClient` 仍完整支持，见
+> [ADR-0001](../adr/0001-embedded-writer-local-path.md)），但 `ShmClient` 不提供该
+> 接缝——SHM 传输层没有 legacy `Writer` 的 seam，`writer()`/`insert()` 抛
+> `NotImplementedError`。
 
 **写入耐久性：in-flight insert 与 server 关闭**。`flush()` 成功代表数据已送达 server 并入队，不代表已落表。若 server 在插入完成前关闭，在飞 insert 会被丢弃，且**没有**对客户端的状态通道（并发评审 #5，已拍板接受该语义、不改协议）。各传输的实际表现：
 
@@ -338,8 +352,8 @@ flowchart TB
 
 按你的学习目标选择：
 
-- **「给我看代码」** → [examples/demo.py](../examples/demo.py)（核心教程，覆盖轨迹写入、队列、优先级、checkpoint）
-- **「我要选传输层」** → [docs/client-transports.md](client-transports.md)（三种 Client 的完整对比与避坑）
-- **「我要生产级用法」** → [examples/production_patterns.py](../examples/production_patterns.py)（Queue、Stack、SampleToInsertRatio、flush 背压等 10 个模式）
-- **「我要了解设计决策」** → [docs/numpy-embed-design.md](../design/numpy-embed-design.md)（为什么去掉 TensorFlow、架构变更记录）
+- **「给我看代码」** → [examples/demo.py](../../examples/demo.py)（核心教程，覆盖轨迹写入、队列、优先级、checkpoint）
+- **「我要选传输层」** → [client-transports.md](client-transports.md)（三种 Client 的完整对比与避坑）
+- **「我要生产级用法」** → [examples/production_patterns.py](../../examples/production_patterns.py)（Queue、Stack、SampleToInsertRatio、flush 背压等 10 个模式）
+- **「我要了解设计决策」** → [numpy-embed-design.md](../design/numpy-embed-design.md)（为什么去掉 TensorFlow、架构变更记录）
 - **「我要完整 API」** → 参考 `reverb/__init__.py` 中的导出列表，以及各模块的 docstring

@@ -108,7 +108,8 @@ class ShmSampler {
 };
 
 // ShmClient connects to a ShmServer over a udsocket, handshakes, and mmaps the
-// three shared segments (pool + two rings). NewSampler returns a ShmSampler.
+// five shared segments (pool + two ring pairs: insert C→S/S→C + sample
+// C→S/S→C, decision D). NewSampler returns a ShmSampler.
 class ShmClient {
  public:
   static absl::StatusOr<std::unique_ptr<ShmClient>> Connect(

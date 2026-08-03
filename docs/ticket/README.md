@@ -24,3 +24,40 @@
 | 2026-08-03 | SHM dispatch 事件驱动唤醒（client-benchmark §4 优化项） | [shm-dispatch-eventfd-wakeup.md](shm-dispatch-eventfd-wakeup.md) | dispatch 静止时阻塞 poll（listen_fd + 各 client control_fd + server-local eventfd，50ms 兜底）；客户端 `WriteBlocking` 仅在 ring 共享 `server_asleep` 标志置位时发 1 字节唤醒（热路径零新增 syscall）；三处 off-dispatch 生产者（insert ACK 聚合/sample 完成/checkpoint executor）enqueue 后写 eventfd；seq_cst 双定序防 missed-wakeup；顺带删掉有工作轮次的 50us 地板——sample 吞吐 +54~88%、单 client p50 近减半、w8r8 服务端 CPU 降 ~100-130pp |
 
 新增 ticket 时直接在本目录开新文件，结案后把一行总结追加到上表。
+
+## 编号图例（代码 / design / spec / benchmark 中的 ticket 引用）
+
+代码注释与长期文档里的 ticket 编号有两套来源，均**不指向**本索引表（索引表用描述性
+文件名），需要时按下表对照：
+
+**①-⑬ —— 开发期 tracer-bullet / 后续 tickets**：①-⑦ 定义在已删除的
+`tickets.md`（git 历史 `544c8c9^:tickets.md`）；⑧-⑬ 定义散见于代码注释
+（`shm_server.h`/`shm_client.h`/`ring.h`/`trajectory_writer.cc`）与
+[numpy-shm-design.md](../design/numpy-shm-design.md) §8.3 的消息类型表。
+本表是两者合一的速查：
+
+| 编号 | 主题 | 落地位置 |
+| --- | --- | --- |
+| ① | Ring + Bootstrap echo | `ring` / `bootstrap` + echo 测试 |
+| ② | Byte pool round-trip（slab + refcount，决策 C4 确立） | `byte_pool` + `ALLOCATE`/`ALLOCATE_RESP` |
+| ③ | Sample path（server→client） | `ShmServer` / `ShmSampler` 骨架 |
+| ④ | Insert path（client→server，`RunShmWorker`） | `TrajectoryWriter::RunShmWorker` + insert 回调保活 |
+| ⑤ | Python API：`ShmClient` + `Server(shm=True)` | `reverb/client.py`、`reverb/server.py` |
+| ⑥ | Crash recovery + cleanup（断连检测、集中释放） | `HandleDisconnect` / `CleanupClient` / `IsPeerClosed` |
+| ⑦ | Performance baseline + v2 spike | → [client-benchmark.md](../benchmark/client-benchmark.md) |
+| ⑧ | `server_info`：step 1 bootstrap 快照 → step 2 按需 `SERVER_INFO` ring 往返；⑧-2b = `NewTrajectoryWriter` 实时签名校验 | `ShmClient::ServerInfo` / `HandleServerInfo` |
+| ⑨ | 多表路由（按表名） | `ShmServer::FindTable` |
+| ⑩ | 控制面 `mutate_priorities`/`reset`（走 insert 流 + `insert_flow_mu`）+ 死锁修复（方向 A 异步 sample / 方向 C 60s 硬上限） | `HandleMutatePriorities` / `HandleReset` / `EnqueSampleRequest` |
+| ⑪ | `checkpoint`（走 insert 流 + 注入 checkpointer，Save 在专用 executor） | `HandleCheckpoint` / `checkpoint_executor_` |
+| ⑫ | `ShmClient` pickle（存 `socket_path` 重连） | `ShmClient.__reduce__` |
+| ⑬ | legacy `Writer`/`insert` won't fix（无 SHM seam） | Python 层 `NotImplementedError` |
+
+**01/02/03 —— 近期性能/调优 tickets**（benchmark 与代码注释引用）：
+
+| 编号 | 归档文件 | 主题 |
+| --- | --- | --- |
+| 01 | [shm-batch-insert.md](shm-batch-insert.md) | 批量 INSERT + 聚合 ACK |
+| 02 | [shm-pool-slab-config.md](shm-pool-slab-config.md) | pool slab 几何可配 |
+| 03 | [shm-dispatch-eventfd-wakeup.md](shm-dispatch-eventfd-wakeup.md) | dispatch 事件驱动唤醒 |
+
+其余归档文件互相引用用评审编号（#1-#7、扫描 #1 等），见上表"做了什么"列。

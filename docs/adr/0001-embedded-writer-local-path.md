@@ -49,3 +49,12 @@ accepted(随 `docs/unbind-local-writer-plan.md` 实施落地)
 
 supersedes: 设计文档 §1.3 决策 A1 中"旧 `Writer` 本地路径砍掉"的部分(A1 关于
 `StreamingTrajectoryWriter` 的部分不变)。
+
+## 注记（2026-08-03）
+
+正文反引号内的 `docs/unbind-local-writer-plan.md`（代价描述与"状态"字段两处）
+已于 commit `98ea063`（docs: remove completed plan files）**归档删除**——本 ADR
+因此含悬空引用（纯文本引用，非 markdown 死链）。按 ADR 不可变原则不改正文；
+该 plan 的 D1/D2/D3 摘录保留在
+[numpy-embed-design.md](../design/numpy-embed-design.md) §6（"本地 Writer 解绑
+与本地化"），跨线程 callback 确认机制见 §6.2 的 D3（"给 `Writer` 类加本地路径"）。

@@ -77,11 +77,11 @@ client ndarray
 | S7 | SHM 池与现有 ChunkStore 并存，但 SHM 字节是**瞬态传输缓冲**（insert 字节在 INSERT_ACK 后 RELEASE 回收，sample 字节在 client 读后 RELEASE 回收），仅在传输瞬间与 ChunkStore 双份 | 现有 Table / ChunkStore / sampler 零改动；避免 SHM 池永久占双份内存 |
 | S8 | insert：client 把 chunker 已压缩的 `ChunkData` proto 序列化后 memcpy 进 SHM，server 反序列化存档（不再二次压缩） | 复用 chunker 现有压缩；server 零压缩。注：与早期“client 送原始字节、server 压缩”设想不同，实现采用 proto 序列化简化多列处理（见 §8.5） |
 | S9 | sample：server 预切片成成品字节进 SHM，client 直接读 | client 侧零计算；每次独立分配不复用 |
-| S10 | rate limiter / backpressure 语义对齐现有；v1 **未实现** checkpoint / mutate_priorities / reset / server_info（`ShmClient.server_info()` 返回空） | 热路径（sample/insert）优先；冷路径控制面 v2 补 （`server_info` 已实现 ticket ⑧：step 1 bootstrap 快照 → step 2 按需 `SERVER_INFO` ring 往返；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；`checkpoint` 已实现 ticket ⑪，走 insert 流 + 注入 checkpointer；`ShmClient` 已可 pickle ticket ⑫） |
+| S10 | rate limiter / backpressure 语义对齐现有；v1 **已实现** checkpoint / mutate_priorities / reset / server_info（`server_info` 每次调用按需往返） | 热路径（sample/insert）优先；冷路径控制面随 ticket 补齐（`server_info` 已实现 ticket ⑧：step 1 bootstrap 快照 → step 2 按需 `SERVER_INFO` ring 往返；`mutate_priorities`/`reset` 已实现 ticket ⑩，走 insert 流 + 客户端互斥锁；`checkpoint` 已实现 ticket ⑪，走 insert 流 + 注入 checkpointer；`ShmClient` 已可 pickle ticket ⑫） |
 | S11 | Python 新增 `ShmClient`，镜像 `_BaseClient` | API 一致；三路并列 |
 | S12 | 支持 trajectory_writer / structured_writer（insert 经 trajectory_writer 的 SHM 路径实现）；plain `Writer` won't fix（无 SHM seam，Python 层 `NotImplementedError`，ticket ⑬） | writer backpressure 经反向 ring confirm |
 | S13 | 崩溃恢复：udsocket 断连检测 + 集中释放该 client SHM 偏移 | 简单可靠 |
-| S14 | 字节池满：阻塞等待，对齐全语义 | 不报错、不丢数据 |
+| S14 | 字节池满：**快速失败**（`RESOURCE_EXHAUSTED`，ticket 02）——阻塞会死锁单 dispatch 线程（Allocate/Deallocate 唯一调用方）；超档请求永久 `InvalidArgument` | 早期"阻塞等待对齐全语义"设想未采用：报错不丢数据，client 可重试 |
 | S15 | SHM 用 POSIX `shm_open` | 跨平台、与 udsocket 配合自然 |
 | D | 每 client **两对** ring（insert 流 C→S/S→C + sample 流 C→S/S→C），共 4 条 ring + 1 个 pool = 5 个 SHM 段 | insert worker 与 sample worker 是两条后台线程，单对 ring 会违反 SPSC 不变式（两个生产者写同一 `head`，无 CAS → 数据损坏）。两对 ring 让每流保持单生产者，无需跨线程同步 |
 
@@ -171,15 +171,19 @@ sequenceDiagram
   默认每档 256 块（`kDefaultBlocksPerSlab`）。
 - **分配（C4）**：client 不自选偏移，而是发 `ALLOCATE{num_bytes}` 请求经
   insert ring C→S，server 单线程选最小够用档位从 free list 取一块返回偏移
-  （`ALLOCATE_RESP{shm_offset}`）。无空闲则池满阻塞（S14）。集中分配保证
+  （`ALLOCATE_RESP{shm_offset}`）。无空闲则快速失败（ticket 02，见 S14/§8.7）。
+  集中分配保证
   server 单线程无锁，client 拿到偏移后再 memcpy。
 - **回收**：偏移归还所属档位 free list。
 - **引用计数**：server 维护 `map<偏移, refcount>`。sample 发 N 列则各偏移 +1；
   client release 则 -1；归零回收。
-- **池满**：阻塞等待（S14）。server 端 `ShmServer` 线程在池满时阻塞，对应的
-  client 请求排队（控制 ring 自然背压）。
-- **容量**：默认每档 256 块（`kDefaultBlocksPerSlab`）× 9 档，总约 1.3 GB
-  （档位与块数均可配）。`slab_sizes` 空时用 `kDefaultSlabSizes`。
+- **池满**：快速失败（ticket 02）——档位 free list 空即返回
+  `RESOURCE_EXHAUSTED`，不阻塞（阻塞会死锁单 dispatch 线程：Allocate 与
+  Deallocate 的唯一调用方都是它）；超档请求为永久 `InvalidArgument`。
+  早期"阻塞等待（S14）"设想未采用，见 §8.7。
+- **容量**：默认每档 256 块（`kDefaultBlocksPerSlab`）× 9 档，总约 1.4 GB
+  （档位与块数均可配，ticket 02：`Server(shm_pool_slab_sizes=...)` /
+  `shm_pool_blocks_per_slab` 可调）。`slab_sizes` 空时用 `kDefaultSlabSizes`。
 
 > `ponytail:` slab 档位是经验值，profile 后可调。跨进程分配单线程化是简化——
 > 若 server dispatch 成瓶颈，升级为 per-档位 spinlock。
@@ -198,11 +202,18 @@ sequenceDiagram
   1024 槽，每槽默认 256B（含 16B `SlotHeader`）。大数据用 SHM 偏移引用。
 - **消息类型**：定长 `SlotHeader`（seq + msg_type + flags + body_len）+ 变长 body
   （length-delimited proto）。body 超单槽时跨槽拼接（HAS_CONT/IS_CONT flags）。
-- **server 轮询**：`ShmServer` 单 dispatch 线程轮询所有 client 的两条 C→S ring
-  （insert + sample），dispatch 到 Table。响应写回对应流的 S→C ring。
+- **server 轮询（事件驱动）**：`ShmServer` 单 dispatch 线程排空所有 client 的
+  两条 C→S ring（insert + sample），dispatch 到 Table。静止时阻塞 poll（ticket
+  03）：`listen_fd + 各 client control_fd + server-local eventfd`，50ms 兜底；
+  off-dispatch 生产者 enqueue 后写 eventfd 唤醒。响应写回对应流的 S→C ring。
 
-> `ponytail:` SPSC ring 不用信号量（避免崩溃泄漏），靠 server 主动轮询。延迟
-> 由轮询间隔决定（默认忙等或 `sched_yield`）。若延迟敏感，升级为 eventfd 通知。
+> `ponytail:` SPSC ring 不用信号量（避免崩溃泄漏），靠 server 主动轮询。
+> **事件驱动已实现**（ticket 03 / commit `ea0155f`）：dispatch 静止（无 c2s
+> 消息、outbox 空、无待 drain sample）时阻塞 `poll(listen_fd + 各 client
+> control_fd + server-local eventfd, 50ms 兜底)`，不再忙轮询；所有 off-dispatch
+> 生产者（insert ACK 聚合 / sample 完成 / checkpoint executor）enqueue 后写
+> eventfd 唤醒；client 仅在 ring 共享的 `server_asleep` 标志置位时才发 1 字节
+> 唤醒——server 醒着时热路径零新增 syscall。
 
 ### 4.3 Bootstrap 与连接 `ShmBootstrap`
 
@@ -228,8 +239,8 @@ sequenceDiagram
   INSERT 时从 SHM 偏移读字节 `ParseFromArray` 反序列化 `ChunkData`（client 已压缩，
   server 不再二次压缩）→ 构造 `ChunkStore::Chunk` → `Table::InsertOrAssignAsync`
   （带 `InsertCallback`，回调存 `ClientState.pending_insert_callbacks` 保活）
-  → callback 全部触发后往 insert ring S→C 写 `INSERT_ACK`（item keys +
-  `offsets_to_release`）。
+  → callback 全部触发后经 `AckAggregate` 聚合往 insert ring S→C 写**一条**
+  `INSERT_ACK`（item keys + `offsets_to_release`，ticket 01 批量聚合）。
 - **sample 处理**：读 sample ring C→S 请求 → `Table::Sample`（现有 rate
   limiter/selector）→ 对每个 `SampledItem` 调 `UnpackChunkColumnAndSlice`（现有
   逻辑）解压切片 → 成品字节 memcpy 进 SHM 池（refcount +1）→ sample ring S→C 写
@@ -246,11 +257,14 @@ sequenceDiagram
   insert_c2s/s2c + sample_c2s/s2c ring 读写器）。方法镜像 `InProcessClient`：
   `Sample` / `NewTrajectoryWriter` / `NewStructuredWriter` / `NewSampler`。
   `MutatePriorities` / `Reset` 已实现（ticket ⑩，走 insert 流）；`ServerInfo`
-  返回 bootstrap 快照（ticket ⑧）；`Checkpoint` 未实现。`Insert`（plain `Writer`）
+  按需 `SERVER_INFO` ring 往返返回实时 `TableInfo`（ticket ⑧ step 2，取代
+  bootstrap 快照）；`Checkpoint` 已实现（ticket ⑪，走 insert 流 + 注入
+  checkpointer，`Save` 在专用 `TaskExecutor` 上跑，评审 #3）。`Insert`（plain `Writer`）
   **won't fix**——legacy `Writer` 无 SHM seam，Python 层覆盖为 `NotImplementedError`
   （ticket ⑬），用 `trajectory_writer` / `structured_writer`。`ShmClient` 可 pickle
-  （ticket ⑫，存 `socket_path` 重连）。`NewTrajectoryWriter` 从缓存快照填
-  `flat_signature_map`，signature 校验生效（ticket ⑧-2b，镜像 `InProcessClient`）。
+  （ticket ⑫，存 `socket_path` 重连）。`NewTrajectoryWriter` 每次构造经实时
+  `SERVER_INFO` 往返填 `flat_signature_map`（ticket ⑧ step 2，取代早期缓存
+  快照），signature 校验生效（镜像 `InProcessClient`）。
 - **trajectory_writer**：chunker/column 逻辑在 client 进程（复用现有
   `TrajectoryWriter`，只把 `RunLocalWorker` 的 `InsertOrAssignAsync` 换成
   `RunShmWorker`：ALLOCATE 申请偏移 → memcpy 序列化 `ChunkData` proto → INSERT →
@@ -286,7 +300,7 @@ sequenceDiagram
 - gRPC、in_process、shm 三者可按需组合（同进程内嵌 + 同机跨进程并存）。
 - client 侧按需用 `Client(addr)` / `server.in_process_client` / `ShmClient(path)`。
 
-## 6. 未决 / 后续
+## 6. 实现现状与后续
 
 - **insert 字节复用于 sample 切片源（未采用）**：早期设想 client insert 时送的
   SHM 字节，sample 时 server 可直接基于它切片，省去“压缩进 ChunkStore 再解压”
@@ -330,14 +344,18 @@ sequenceDiagram
 // 段头(128 字节 = 2 cache lines)。
 // head(生产者)在 line 0，tail(消费者)在 line 1，两者不共享 cache line
 // 防 false sharing。均从 1 开始(seq 0 表示槽从未写过)。
-// 显式字段布局 + pad，不靠 alignas(64) 成员（那会肨大结构体）。
+// 显式字段布局 + pad，不靠 alignas(64) 成员（那会撑大结构体）。
 struct RingHeader {
   // Line 0 (offset 0..63).
   uint64_t magic;          // 0x524556524253484D ("REVRBSHM")
   uint32_t version;        // 协议版本, 当前 1
   uint32_t capacity;       // 槽位数(2 的幂), 默认 1024
   uint32_t slot_size;      // 每槽字节数(含 SlotHeader), 默认 256
-  uint32_t reserved;       // 对齐填充
+  // ticket 03（原 `reserved`）：server-asleep 标志，每个 C→S ring 一份。
+  // server dispatch 线程在进入 poll() 阻塞前对每条 c2s ring 置 1（seq_cst）；
+  // client 的 WriteBlocking 成功写入后 load（seq_cst），仅置位时向 control_fd
+  // 发 1 字节唤醒。双端 seq_cst 防 store→load 重排导致的 missed-wakeup。
+  std::atomic<uint32_t> server_asleep{0};
   uint64_t capacity_mask;  // capacity - 1, 用于 seq & capacity_mask
   // ponytail: 这两个必须是 atomic, SPSC 无锁靠 release/acquire 配对
   std::atomic<uint64_t> head;   // 生产者: 下一个要写的槽的 seq(从 1 开始)
@@ -407,8 +425,8 @@ insert 流，复用 `ServerInfoRequest`/`ServerInfoResponse`，按需往返返�
 | 5 | `ALLOCATE` | `ShmAllocateRequest{num_bytes}` | SHM 专有（C4：client 向 server 申请字节池偏移） | ✓ |
 | 6 | `MUTATE_PRIORITIES` | `MutatePrioritiesRequest`（复用现有 proto） | MutatePriorities | ✓（⑩） |
 | 7 | `RESET` | `ResetRequest{repeated string table_names}`（复用） | Reset | ✓（⑩） |
-| 9 | `CLOSE` | 空 | client 主动关闭 | ✓ |
 | 8 | `CHECKPOINT` | `CheckpointRequest`（复用） | Checkpoint | ✓（⑪，走 insert 流） |
+| 9 | `CLOSE` | 空 | client 主动关闭 | ✓ |
 | 10 | `SERVER_INFO` | `ServerInfoRequest`（复用） | ServerInfo | ✓（⑧ step 2，走 insert 流） |
 
 > 注：早期设计表把 type 5 预留给 `MUTATE_PRIORITIES`，实现中 5 被用于 `ALLOCATE`
@@ -460,8 +478,8 @@ message ShmAllocateRequest {
 #### S→C 响应（server 写，client 读）
 
 v1 已实现：`WELCOME` / `INSERT_ACK` / `SAMPLE_RESP` / `ALLOCATE_RESP` / `ERROR`。
-`MUTATE_ACK`（⑩）/ `RESET_ACK`（⑩）已实现；`CHECKPOINT_RESP` / `SERVER_INFO_RESP`
-未实现。
+`MUTATE_ACK`（⑩）/ `RESET_ACK`（⑩）、`CHECKPOINT_RESP`（⑪）、`SERVER_INFO_RESP`
+（⑧ step 2）均已实现，全部走 insert s2c 流。
 
 | type 值 | msg_type 名 | body proto | 对应 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -517,7 +535,7 @@ message ShmError {
     DEADLINE_EXCEEDED = 1;   // 映射 Python DeadlineExceededError
     INVALID_ARGUMENT = 2;
     NOT_FOUND = 3;           // 表/chunk 不存在
-    RESOURCE_EXHAUSTED = 4;  // 字节池满(理论上阻塞不报错, 保留)
+    RESOURCE_EXHAUSTED = 4;  // 字节池档位耗尽（快速失败，ticket 02）
     INTERNAL = 5;
   }
   Code code = 1;
@@ -705,10 +723,12 @@ ring 满时的阻塞行为，对齐 §S10（语义对齐 gRPC）：
   继续轮询下一个，待该 client ring 有空间再回写（响应暂存 per-client per-flow
   outbox 队列：`insert_outbox` + `sample_outbox`）。这样 dispatch 不被慢 client
   阻塞。
-- **字节池满**（§S14）：`ShmBytePool::Allocate` 在 server dispatch 线程上用
-  `Mutex`+`CondVar` 阻塞等待 free list 有块（`ponytail:` 简化——v1 dispatch 单
-  线程，池满时阻塞该请求直到有空间；这会暂停所有 client 的 insert 分配，但
-  sample 路径不分配故不受影响）。§8.7 设想的“非阻塞尝试 + 暂存请求”未采用。
+- **字节池满**（§S14）：`ShmBytePool::Allocate` **快速失败**（ticket 02）——档位
+  free list 空即返回 `RESOURCE_EXHAUSTED`，不阻塞（阻塞会死锁单 dispatch
+  线程：Allocate 与 Deallocate 的唯一调用方都是它）。超档请求（无档位够大）
+  为永久 `InvalidArgument`，档位耗尽为瞬时 `ResourceExhausted`，client 可据此
+  区分。sample 与 insert 路径**都**分配（sample 解包在 `shm_server.cc` 的
+  `pool_.Allocate`），池满时两端都收错误。
 
 ### 8.8 断连检测与崩溃恢复
 

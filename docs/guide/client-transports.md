@@ -30,7 +30,8 @@
 | 维度 | `Client`（gRPC） | `LocalClient`（in_process） | `ShmClient`（shm） |
 | --- | --- | --- | --- |
 | 传输 / 拓扑 | 跨进程 / 跨机器，gRPC stream，序列化 numpy bytes | **同进程**，直接持 `shared_ptr<Table>`，无序列化 | **同一台机器跨进程**，POSIX shm + Unix Domain Socket，mmap 零拷贝 |
-| 性能 | 基线 | 最快（无网络 / 无序列化） | ~9–11× gRPC 回环（见 [client-benchmark.md](../benchmark/client-benchmark.md)） |
+| 性能 | 基线 | 最快（无网络 / 无序列化） | ~3× gRPC 回环（见 [client-benchmark.md](../benchmark/client-benchmark.md)） |
+| `sample` 输出类型 | numpy；`output_format='torch'` 时 torch.Tensor（可选依赖 `[torch]`） | 同左 | 同左（torch 零拷贝路径） |
 | 构造 | `Client('localhost:port')` | `server.in_process_client` | `reverb.ShmClient(server.shm_socket_path)` |
 | 内部持有资源 | gRPC channel | 进程内 Table 指针 | SHM mmap + ring 状态 |
 | `pickle` | ✅ 支持（存 `server_address`） | ❌ 不可（持进程内指针） | ✅ 支持（存 `socket_path`，反序列化重连） |
@@ -147,6 +148,9 @@ finally:
 - `in_process=False` 时 `server.in_process_client` 抛错，用 `localhost_client()`
   或自行 `reverb.Client(f'localhost:{server.port}')`。
 - `shm=True` 时 `server.shm_socket_path` 可用；`shm=False` 时为 `None`。
+- SHM 字节池几何可配：`Server(shm_pool_slab_sizes=[...], shm_pool_blocks_per_slab=N)`
+  （默认 9 档 × 256 块 ≈ 1.4GB 单连接高水位；小档配置把高水位降到档位容量量级，
+  超档 insert/sample 会收 `InvalidArgument`/`ResourceExhausted`）。
 - ⚠️ `shm=True` 不隐含 `in_process=True`。如果写
   `Server(in_process=False, shm=True)`，则得到 gRPC + SHM（无 LocalClient）。
   要同时用 `LocalClient` 和 `ShmClient`，必须写 `Server(in_process=True, shm=True)`。
