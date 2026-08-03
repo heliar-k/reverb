@@ -29,7 +29,22 @@ absl::Status WriteBlocking(Ring* ring, MsgType msg_type,
   absl::Time deadline = absl::Now() + timeout;
   while (true) {
     absl::Status s = ring->TryWrite(msg_type, payload);
-    if (s.ok()) return absl::OkStatus();
+    if (s.ok()) {
+      // ticket 03: wake the server if it flagged itself asleep on THIS ring.
+      // seq_cst load pairs with the server's seq_cst store before its
+      // re-check (see RingHeader::server_asleep): reading 0 guarantees the
+      // server sees this write in its re-check and never blocks on it.
+      // Reading 1 costs one DONTWAIT send; errors are ignored — a lost byte
+      // only falls back to the server's 50ms poll timeout, and a dead peer
+      // is reported by the liveness probe on the next failed pass. Hot path
+      // (flag 0, server awake) adds ZERO syscalls.
+      if (control_fd >= 0 &&
+          ring->server_asleep()->load(std::memory_order_seq_cst) != 0) {
+        char b = 0;
+        (void)send(control_fd, &b, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+      }
+      return absl::OkStatus();
+    }
     if (!absl::IsResourceExhausted(s)) return s;  // permanent error, no retry
     if (control_fd >= 0 && IsPeerClosed(control_fd)) {
       return absl::UnavailableError("SHM peer closed connection");

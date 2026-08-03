@@ -1,5 +1,13 @@
 # 03 — SHM dispatch 线程事件驱动唤醒（eventfd 替代 50us 轮询睡眠）
 
+> 状态：**已完成**（2026-08-03；全量 66/66 绿，新增 `shm_wakeup_test` 5 例
+> + `ring_test` 2 例，8 连跑零抖动。三处设计偏离均为加强：asleep 标志用
+> seq_cst（release/acquire 关不上 flag-then-recheck 的 store→load 乱序洞）、
+> 静止判定排除 pending 回调（其完成回调已接 wake_fd_，睡眠安全且避免
+> 无节流空转打满核）、wake 字节 recv 循环 drain 防残留假唤醒。附带收益：
+> 删掉有工作轮次的 50us 地板后 sample 吞吐 +54~88%、单 client p50 近减半、
+> w8r8 服务端 CPU 降 ~100-130 个百分点）
+
 **What to build:** `ShmServer::DispatchLoop` 每轮扫完全部 client 后**无条件**
 `sched_yield() + usleep(50)`（`shm_server.cc:277-278`）。这带来两个问题：
 
@@ -23,7 +31,7 @@ would be cheaper still but needs eventfd plumbing per ring」。本 ticket
 
 **Blocked by:** 02 — SHM pool slab 可配置（用户要求串行执行，无技术依赖）
 
-**Status:** ready-for-agent
+**Status:** done（2026-08-03）
 
 - [ ] 空闲 server 的 dispatch CPU 降到 ~0（阻塞在 poll，不再 50us 空转）
 - [ ] 客户端热路径（server 未睡时）零新增 syscall；仅 asleep 标志置位时

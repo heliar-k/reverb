@@ -16,6 +16,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <functional>
+#include <poll.h>
 #include <sched.h>
 #include <string>
 #include <sys/mman.h>
@@ -132,6 +133,51 @@ TEST(RingTest, WriteBlockingRespectsDeadline) {
   EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded);
   EXPECT_LT(absl::Now() - start, absl::Seconds(5))
       << "WriteBlocking overshot its 200ms deadline";
+}
+
+// ticket 03: HasData is the consumer-side "a message is ready" view used by
+// ShmServer's quiescence check before blocking in poll().
+TEST(RingTest, HasDataTracksWriteAndRead) {
+  auto s = Ring::Create(UniqueName("hasdata"), 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+
+  EXPECT_FALSE(ring.HasData());
+  std::string payload = "hello";
+  REVERB_ASSERT_OK(ring.Write(HELLO, absl::MakeSpan(payload)));
+  EXPECT_TRUE(ring.HasData());
+  MsgType type;
+  std::string out;
+  REVERB_ASSERT_OK(ring.Read(&type, &out));
+  EXPECT_FALSE(ring.HasData());
+}
+
+// ticket 03: WriteBlocking sends a wake byte on control_fd ONLY when the
+// ring's server_asleep flag is set — the flag-clear hot path must add zero
+// syscalls (asserted here as: no byte arrives).
+TEST(RingTest, WriteBlockingSendsWakeByteOnlyWhenServerAsleep) {
+  auto s = Ring::Create(UniqueName("wakebyte"), 16, 256);
+  REVERB_ASSERT_OK(s.status());
+  Ring ring = std::move(s).value();
+  int fds[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  std::string payload = "y";
+
+  // Flag clear (server awake): write succeeds, NO byte on the socket.
+  REVERB_ASSERT_OK(
+      WriteBlocking(&ring, SAMPLE, absl::MakeSpan(payload), fds[0]));
+  struct pollfd pfd = {fds[1], POLLIN, 0};
+  EXPECT_EQ(poll(&pfd, 1, 100), 0) << "wake byte sent while server awake";
+
+  // Flag set (server asleep): exactly one wake byte.
+  ring.server_asleep()->store(1, std::memory_order_seq_cst);
+  REVERB_ASSERT_OK(
+      WriteBlocking(&ring, SAMPLE, absl::MakeSpan(payload), fds[0]));
+  char buf[8];
+  EXPECT_EQ(recv(fds[1], buf, sizeof(buf), 0), 1);
+
+  close(fds[0]);
+  close(fds[1]);
 }
 
 TEST(RingTest, SingleSlotWriteRead) {

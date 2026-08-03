@@ -85,12 +85,17 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 | transport | small/1k | small/10k | med/1k | med/10k |
 | --- | --- | --- | --- | --- |
 | in-process | 11967 (82us) | 7942 (105us) | 11706 (84us) | 1821 (98us) |
-| SHM | 3779 (247us) | 4482 (221us) | 4043 (237us) | 4005 (241us) |
+| SHM（ticket 03 后） | 7989 (115us) | 8271 (117us) | 6418 (151us) | 6587 (151us) |
 | gRPC | 1465 (657us) | 1506 (655us) | 1282 (770us) | 1191 (802us) |
 
+（SHM 行为 2026-08-03 ticket
+[shm-dispatch-eventfd-wakeup](../ticket/shm-dispatch-eventfd-wakeup.md)
+落地后同 session A/B 复测；另一次高负载抽查确认 p50 减半属实。）
+
 - **gRPC** 全程 ~1.2–1.5k sps，被 per-call RPC 开销钉死，payload/表大小不敏感。
-- **SHM** ~4k sps，对 payload 与表大小都稳——传输零拷贝，成本在 per-call
-  ring 往返。
+- **SHM** ticket 03 后 ~6.4–8.3k sps（旧批次 ~4k）：dispatch 有工作轮次的
+  50us 地板删除，单 client p50 从 ~240us 降到 ~120us；成本仍是 per-call
+  ring 往返，但不再叠加固定轮询延迟。
 - **in-process** 小表最快（~12k），但 **med/10k 塌到 1821**——1.1GB 表上
   直接访问散布在 chunkstore 里的压缩 chunk，cache/TLB 压力主导；同配置
   SHM（4005）反而快 2.2 倍，因为结果字节是拷贝进紧凑 pool 区域的。
@@ -131,23 +136,27 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 | transport | ins/s w1→w8 | sam/s w1→w8 | 饱和点 |
 | --- | --- | --- | --- |
 | in-process (small) | 4007 → 3411 | 7457 → 6913 | **w1 已饱和**：加线程只增争抢 |
-| SHM (small) | 1546 → 2494 | 3821 → 6616 | w4 附近平台（dispatch 单线程 + 表 worker） |
+| SHM (small)（ticket 01+03 后） | 2871 → 2631 | 6259 → 8190 | w4 附近平台（dispatch 单线程 + 表 worker） |
 | gRPC (small) | 1441 → 1900 | 1112 → 2260 | w4 后微增，p99 劣化到 ~15ms |
 | in-process (med) | 2867 → 2826 | 5654 → 5829 | w1 饱和 |
-| SHM (med) | 1435 → 2090 | 2950 → 5155 | 同 small |
+| SHM (med)（ticket 01+03 后） | 2049 → 2137 | 4070 → 6433 | 同 small |
 | gRPC (med) | 1091 → 1719 | 960 → 1932 | 同 small |
+
+（SHM 两行为 2026-08-03 ticket 01+03 落地后同 session A/B 复测；
+其余行为原批次。）
 
 - **单表并发天花板 = 单 table worker 线程**：in-process 下 w1r1 即满，
   w8r8 反而略降（锁争抢）。要更高单表吞吐只能靠**加表分片**（多 worker
   线程），不是加 client 线程。
-- **SHM 采样随连接数扩展良好**（w1→w8 采样 ~1.7×）：每连接独立 ring，
-  服务端单 dispatch 线程轮询不是瓶颈直到 w4 后。写入受 per-item 往返
-  限制，多连接并行写 ~1.7×。
+- **SHM 采样随连接数扩展良好**：ticket 03（dispatch 去 50us 地板）后
+  w1r1 即 ~6.3k sam/s（旧 ~3.8k），w8r8 ~8.2k；写入侧叠加 ticket 01
+  批量 INSERT，w1r1 ~2.9k ins/s（旧 ~1.5k），w4 后平台不变。
 - **w8r8 全配置存活**——修复 ticket「shm-close-while-in-flight」前，
   此场景会让客户端进程无声死亡（连接被服务端回收后客户端读循环无限
   自旋，见 `docs/ticket/shm-close-while-in-flight.md`）。
-- 资源列（`# RAW` 有 rss/cpu）：SHM w8r8 服务端 ~5.5 核（dispatch 自旋
-  + 表 worker + checkpoint executor），gRPC ~2.2 核。
+- 资源列（`# RAW` 有 rss/cpu）：ticket 03 后 SHM w8r8 服务端 ~4.9 核
+  （旧 ~5.5 核含 dispatch 自旋 + 50us 轮询），w1r1 升至 ~3 核但吞吐
+  +75%（干活的核）；gRPC ~2.2 核。空闲时 dispatch CPU ≈ 0（阻塞 poll）。
 
 ## 5. 大 payload（float32[256,256,3] ≈ 770KB）
 
@@ -155,6 +164,9 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 `--table-size 500 --num-ops 100 --writers 1,2`。）
 
 ### 5.1 结果
+
+（⚠️ 本节全部为 ticket 01+03 落地前批次，large payload 未复测；SHM 的
+small/med 新口径见 §2/§3/§4。）
 
 sample / insert 吞吐（表 500，单 client）：
 
@@ -176,7 +188,7 @@ pipeline（5s，聚合）：
   压缩主导，传输差异被摊平。SHM b1→b8 有 ~1.7×（本行为 ticket 01 前批
   次；ticket 01 后批量效应见 §3）。
 - **sample 差距拉开**：in-process 7427（无序列化直切）≫ SHM 2201 ≈ 3.3×
-  gRPC 667。SHM sample 的 p50 从 small 247us 涨到 449us，**payload 相关
+  gRPC 667。SHM sample 的 p50 从 small ~250us 涨到 449us，**payload 相关
   成本 ≈ 200us/770KB-sample**（服务端解压 + memcpy 进 pool + 客户端读出）。
 - 内存：in-process w2r2 峰值 RSS ~10.3GB、SHM w2r2 ~6.8GB（`# RAW`）。
 

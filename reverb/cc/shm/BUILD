@@ -360,3 +360,26 @@ reverb_cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+# ---- Dispatch wakeup test (ticket 03: eventfd poll replaces 50us spin) ----
+
+reverb_cc_test(
+    name = "shm_wakeup_test",
+    srcs = ["shm_wakeup_test.cc"],
+    deps = [
+        ":shm_client",
+        ":shm_server",
+        "//reverb/cc:chunker",
+        "//reverb/cc:schema_cc_proto",
+        "//reverb/cc:table",
+        "//reverb/cc:trajectory_writer",
+        "//reverb/cc/platform/default:logging",
+        "//reverb/cc/platform/default:status_matchers",
+        "//reverb/cc/selectors:fifo",
+        "//reverb/cc/support:tensor_proxy",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

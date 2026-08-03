@@ -138,7 +138,7 @@ absl::StatusOr<Ring> Ring::Create(std::string shm_name, uint32_t capacity,
   ring.header_->version = kRingVersion;
   ring.header_->capacity = capacity;
   ring.header_->slot_size = slot_size;
-  ring.header_->reserved = 0;
+  ring.header_->server_asleep.store(0, std::memory_order_relaxed);
   ring.header_->capacity_mask = capacity - 1;
   ring.header_->head.store(1, std::memory_order_relaxed);
   ring.header_->tail.store(1, std::memory_order_relaxed);
@@ -281,6 +281,14 @@ void Ring::WriteSlots(MsgType msg_type, absl::Span<const char> payload,
       reinterpret_cast<std::atomic<uint64_t>*>(&first->seq), first_seq,
       std::memory_order_release);
   header_->head.store(first_seq + num_slots, std::memory_order_release);
+}
+
+bool Ring::HasData() const {
+  uint64_t seq = header_->tail.load(std::memory_order_relaxed);
+  const SlotHeader* s = Slot(seq);
+  return std::atomic_load_explicit(
+             reinterpret_cast<const std::atomic<uint64_t>*>(&s->seq),
+             std::memory_order_acquire) == seq;
 }
 
 absl::Status Ring::Read(MsgType* msg_type, std::string* payload) {

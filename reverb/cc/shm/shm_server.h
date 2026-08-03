@@ -192,6 +192,14 @@ class ShmServer {
     return insert_requests_received_.load(std::memory_order_relaxed);
   }
 
+  // ticket 03 test-only: number of times the dispatch thread entered its
+  // blocking poll(). An idle server advances this ~20/s (the 50ms fallback
+  // timeout) instead of spinning ~20k passes/s; the wakeup test uses the
+  // delta as an idle-CPU proxy and as the "server is asleep" observation.
+  uint64_t poll_entries_for_test() const {
+    return poll_entries_for_test_.load(std::memory_order_relaxed);
+  }
+
  private:
   ShmServer(std::vector<std::shared_ptr<Table>> tables, std::string socket_path,
             ShmBytePool pool, ShmBootstrapServer bootstrap,
@@ -200,6 +208,27 @@ class ShmServer {
 
   // dispatch thread main loop
   void DispatchLoop();
+
+  // ticket 03: true when the dispatch thread has no actionable work: every
+  // client's insert/sample c2s ring is empty, both outboxes are empty, and
+  // no completed samples await draining. In-flight async callbacks
+  // (pending_insert_callbacks / pending_sample_callbacks) deliberately do
+  // NOT count: those producers signal wake_fd_ after enqueueing, so the
+  // dispatch thread may block until they fire instead of spinning (the
+  // design's 静止 definition tightened to actionable work only — a pending
+  // rate-limited sample would otherwise peg a core for its whole wait).
+  bool Quiescent();
+
+  // ticket 03: one 8-byte eventfd write to pull the dispatch thread out of
+  // poll(). Called by Stop() and by every off-dispatch-thread producer
+  // AFTER it has enqueued into a mutex-protected outbox/queue (insert ACK
+  // aggregate callback, sample completion callback, checkpoint executor).
+  // The enqueue-then-signal order pairs with the dispatch thread's
+  // check-then-poll order: a producer landing between the check and the
+  // poll still finds its wake byte counted, so poll() returns immediately.
+  // No-op when wake_fd_ < 0 (eventfd creation failed — the 50ms poll
+  // timeout remains as the fallback).
+  void WakeDispatch();
 
   // Accept a waiting client (non-blocking via poll on listen fd). Returns true
   // if a client was accepted.
@@ -342,6 +371,14 @@ class ShmServer {
 
   // ticket 01: counts INSERT messages (see insert_requests_received_for_test).
   std::atomic<int> insert_requests_received_{0};
+
+  // ticket 03: server-local eventfd the dispatch thread polls alongside
+  // listen_fd + client control fds. Created in Start, signalled by
+  // WakeDispatch, closed at the end of Stop (after tables stop, so no
+  // callback can still write it). NOT passed to the client — the client's
+  // wake path is its existing control_fd (see RingHeader::server_asleep).
+  int wake_fd_ = -1;
+  std::atomic<uint64_t> poll_entries_for_test_{0};
 
   // review #3: single-thread executor for checkpoint Saves — keeps unbounded
   // disk I/O off the dispatch thread. Declared after tables_/clients_ so it

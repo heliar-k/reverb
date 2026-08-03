@@ -49,7 +49,21 @@ struct RingHeader {
   uint32_t version = kRingVersion;
   uint32_t capacity = kDefaultCapacity;   // slot count (power of two)
   uint32_t slot_size = kDefaultSlotSize;  // bytes per slot (incl. SlotHeader)
-  uint32_t reserved = 0;
+  // ticket 03 (was `reserved`): server-asleep flag, one per C→S ring. The
+  // server dispatch thread stores 1 (seq_cst) on every c2s ring just before
+  // blocking in poll(); the client's WriteBlocking loads it (seq_cst) after a
+  // successful write and sends a 1-byte wakeup on control_fd only when set —
+  // zero added syscalls while the server is awake. Lives in shared memory;
+  // each client writer thread consults its OWN ring's flag (insert vs
+  // sample), sidestepping cross-ring visibility. seq_cst on BOTH sides (not
+  // release/acquire): this is the classic flag-then-recheck pattern, where a
+  // store→load reorder between publishing the flag and re-reading the ring is
+  // the missed-wakeup hole; seq_cst's total order closes it (the hot-path
+  // load compiles to a plain MOV on x86; only the rare sleep-entry store pays
+  // a fence). Mixed-version peers degrade safely: an old client never reads
+  // the flag (the server's 50ms poll timeout caps wake latency), an old
+  // server never sets it (the client never sends a byte).
+  std::atomic<uint32_t> server_asleep{0};
   uint64_t capacity_mask = kDefaultCapacity - 1;
   std::atomic<uint64_t> head{1};  // producer: next slot seq to write
   uint64_t pad0[3];               // pad line 0 to 64 bytes
@@ -118,6 +132,17 @@ class Ring {
   // InternalError. Callers needing blocking reads must poll at the call site
   // (per spec R5, that policy belongs to ShmConnection, not Ring).
   absl::Status Read(MsgType* msg_type, std::string* payload);
+
+  // ticket 03: true when a message is ready for Read (consumer-side view:
+  // the next slot's seq is published). Same acquire pairing as Read(); used
+  // by ShmServer's quiescence check before it blocks in poll().
+  bool HasData() const;
+
+  // ticket 03: the shared-memory asleep flag (see RingHeader). Server stores,
+  // client loads; both seq_cst (see RingHeader::server_asleep comment).
+  std::atomic<uint32_t>* server_asleep() const {
+    return &header_->server_asleep;
+  }
 
   uint32_t capacity() const { return header_->capacity; }
   uint32_t slot_size() const { return header_->slot_size; }

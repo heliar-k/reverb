@@ -21,7 +21,9 @@
 #include <poll.h>
 #include <sched.h>
 #include <string>
+#include <sys/eventfd.h>
 #include <sys/mman.h>  // shm_unlink
+#include <sys/socket.h>  // recv (wake-byte drain)
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -152,12 +154,26 @@ absl::Status ShmServer::Start() {
     return absl::FailedPreconditionError("ShmServer already started");
   }
   InstallSignalHandlers();  // R12: SIGTERM/SIGINT -> graceful shutdown
+  // ticket 03: create the wake eventfd BEFORE the dispatch thread starts so
+  // WakeDispatch from any thread is always safe. EFD_NONBLOCK: a signalling
+  // producer never blocks (a full counter just means a wake is already
+  // pending). On failure, wake_fd_ stays -1 and the loop degrades to its
+  // 50ms poll timeout (the pre-ticket-03 behaviour, minus the 50us spin).
+  wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (wake_fd_ < 0) {
+    REVERB_LOG(REVERB_WARNING)
+        << "ShmServer: eventfd failed (errno " << errno
+        << "); dispatch wakeup degraded to the 50ms poll timeout";
+  }
   dispatch_thread_ = std::thread([this] { DispatchLoop(); });
   return absl::OkStatus();
 }
 
 void ShmServer::Stop() {
   if (!running_.exchange(false)) return;
+  // ticket 03: pull the dispatch thread out of a blocking poll() so the join
+  // below returns immediately instead of waiting out the 50ms fallback.
+  WakeDispatch();
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
 
   // review #3: drain + join the checkpoint executor before stopping tables —
@@ -185,6 +201,14 @@ void ShmServer::Stop() {
     CleanupClient(*c, /*unlink_rings=*/false);
   }
   clients_.clear();
+
+  // ticket 03: close the wake fd LAST. Off-dispatch producers (table /
+  // checkpoint callbacks) can no longer fire once the tables and the
+  // checkpoint executor are stopped above, so nobody writes it after this.
+  if (wake_fd_ >= 0) {
+    close(wake_fd_);
+    wake_fd_ = -1;
+  }
 }
 
 void ShmServer::CloseClientFdForTest() {
@@ -248,7 +272,38 @@ bool ShmServer::IsClientDead(const ClientState& state) {
   return IsPeerClosed(state.fd);
 }
 
+bool ShmServer::Quiescent() {
+  for (const auto& client : clients_) {
+    if (client->conn.insert_c2s.HasData() || client->conn.sample_c2s.HasData()) {
+      return false;
+    }
+    {
+      absl::MutexLock lock(&client->insert_outbox_mu);
+      if (!client->insert_outbox.empty()) return false;
+    }
+    {
+      absl::MutexLock lock(&client->sample_outbox_mu);
+      if (!client->sample_outbox.empty()) return false;
+    }
+    {
+      absl::MutexLock lock(&client->pending_samples_mu);
+      if (!client->pending_samples.empty()) return false;
+    }
+  }
+  return true;
+}
+
+void ShmServer::WakeDispatch() {
+  if (wake_fd_ < 0) return;
+  // EFD_NONBLOCK: EAGAIN means the counter is full, i.e. a wake is already
+  // pending and poll() will return — the write can be dropped.
+  const uint64_t one = 1;
+  (void)write(wake_fd_, &one, sizeof(one));
+}
+
 void ShmServer::DispatchLoop() {
+  // ticket 03: poll indices for the blocking sleep below.
+  constexpr int kIdlePollMs = 50;  // fallback: g_signal_stop check cadence
   while (running_.load() && !g_signal_stop.load(std::memory_order_relaxed)) {
     TryAccept();
     // ticket ⑥: detect dead clients (udsocket EOF/HUP) each pass. Collect
@@ -272,15 +327,77 @@ void ShmServer::DispatchLoop() {
     for (auto it = dead.rbegin(); it != dead.rend(); ++it) {
       HandleDisconnect(*it);
     }
-    // ponytail: yield + short sleep instead of bare sched_yield. A bare
-    // sched_yield does NOT release the core when no other thread is runnable
-    // (the common idle case), so the dispatch loop pegged a core at ~100% CPU
-    // spinning on poll(timeout=0) — this was the 98% CPU seen in the hang.
-    // The 50us sleep releases the core; vs ring ops costing hundreds of us the
-    // latency cost is negligible. A blocking poll on all ring fds would be
-    // cheaper still but needs eventfd plumbing per ring (upgrade).
-    sched_yield();
-    usleep(50);
+
+    // ticket 03: a pass with actionable work loops IMMEDIATELY — the old
+    // unconditional sched_yield()+usleep(50) floor is gone. Only a fully
+    // quiescent pass blocks in poll().
+    if (!Quiescent()) continue;
+
+    // Missed-wakeup ordering (hard requirement):
+    //   (1) publish asleep=1 on every c2s ring (seq_cst — see
+    //       RingHeader::server_asleep for why release is NOT enough),
+    //   (2) RE-CHECK quiescence: a client write that landed between the scan
+    //       above and (1) is either seen here, or its writer saw the flag and
+    //       sent a wake byte which poll() below observes,
+    //   (3) only then block. Off-dispatch producers (table/checkpoint
+    //       callbacks) pair with this by enqueue-then-WakeDispatch.
+    for (const auto& client : clients_) {
+      client->conn.insert_c2s.server_asleep()->store(1,
+                                                     std::memory_order_seq_cst);
+      client->conn.sample_c2s.server_asleep()->store(1,
+                                                     std::memory_order_seq_cst);
+    }
+    if (!Quiescent()) {
+      for (const auto& client : clients_) {
+        client->conn.insert_c2s.server_asleep()->store(
+            0, std::memory_order_seq_cst);
+        client->conn.sample_c2s.server_asleep()->store(
+            0, std::memory_order_seq_cst);
+      }
+      continue;
+    }
+
+    // Poll set: listen fd (accept wakes the loop, TryAccept semantics kept),
+    // wake_fd_ (off-dispatch producers + Stop), each client's control_fd
+    // (client wake bytes; POLLHUP/ERR surfaces here too and is routed through
+    // the unchanged IsClientDead/HandleDisconnect path next pass).
+    std::vector<struct pollfd> pfds;
+    pfds.reserve(clients_.size() + 2);
+    pfds.push_back({bootstrap_.listen_fd(), POLLIN, 0});
+    int wake_idx = -1;
+    if (wake_fd_ >= 0) {
+      wake_idx = static_cast<int>(pfds.size());
+      pfds.push_back({wake_fd_, POLLIN, 0});
+    }
+    const size_t client_base = pfds.size();
+    for (const auto& client : clients_) {
+      pfds.push_back({client->fd, POLLIN, 0});
+    }
+
+    poll_entries_for_test_.fetch_add(1, std::memory_order_relaxed);
+    (void)poll(pfds.data(), pfds.size(), kIdlePollMs);
+
+    // Wake path: clear the flags BEFORE the next scan so client writers
+    // return to the zero-syscall hot path immediately.
+    for (const auto& client : clients_) {
+      client->conn.insert_c2s.server_asleep()->store(0,
+                                                     std::memory_order_seq_cst);
+      client->conn.sample_c2s.server_asleep()->store(0,
+                                                     std::memory_order_seq_cst);
+    }
+    // Drain wake sources so the next sleep doesn't return instantly on a
+    // stale readable fd.
+    if (wake_idx >= 0 && (pfds[wake_idx].revents & POLLIN)) {
+      uint64_t n;
+      (void)read(wake_fd_, &n, sizeof(n));
+    }
+    for (size_t i = 0; i < clients_.size(); i++) {
+      if (pfds[client_base + i].revents & POLLIN) {
+        char buf[256];
+        while (recv(clients_[i]->fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+        }
+      }
+    }
   }
 }
 
@@ -770,25 +887,32 @@ absl::Status ShmServer::HandleSample(std::shared_ptr<ClientState> state_sp,
   // Ceil: 高并发可改 hash_set 按指针查。Upgrade: 同。
   auto cb_raw_box = std::make_shared<Table::SamplingCallback*>();
   auto cb = std::make_shared<Table::SamplingCallback>(
-      [state_sp, cb_raw_box, req_copy = std::move(req_copy)](
+      [this, state_sp, cb_raw_box, req_copy = std::move(req_copy)](
           Table::SampleRequest* sample) mutable {
-        ClientState::PendingSample ps;
-        ps.req = std::move(req_copy);
-        ps.status = sample->status;
-        if (sample->status.ok() && !sample->samples.empty()) {
-          ps.item = std::move(sample->samples.front());
-        }
-        absl::MutexLock lock(&state_sp->pending_samples_mu);
-        state_sp->pending_samples.push_back(std::move(ps));
-        // 自清 keepalive：erase 指向自己的 shared_ptr 拷贝。
-        Table::SamplingCallback* raw = *cb_raw_box;
-        auto& cbs = state_sp->pending_sample_callbacks;
-        for (auto it = cbs.begin(); it != cbs.end(); ++it) {
-          if (it->get() == raw) {
-            cbs.erase(it);
-            break;
+        {
+          absl::MutexLock lock(&state_sp->pending_samples_mu);
+          ClientState::PendingSample ps;
+          ps.req = std::move(req_copy);
+          ps.status = sample->status;
+          if (sample->status.ok() && !sample->samples.empty()) {
+            ps.item = std::move(sample->samples.front());
+          }
+          state_sp->pending_samples.push_back(std::move(ps));
+          // 自清 keepalive：erase 指向自己的 shared_ptr 拷贝。
+          Table::SamplingCallback* raw = *cb_raw_box;
+          auto& cbs = state_sp->pending_sample_callbacks;
+          for (auto it = cbs.begin(); it != cbs.end(); ++it) {
+            if (it->get() == raw) {
+              cbs.erase(it);
+              break;
+            }
           }
         }
+        // ticket 03: enqueue-then-signal — pull the dispatch thread out of
+        // poll() so the drained SAMPLE_RESP is not delayed by the 50ms
+        // fallback. Safe during Stop: tables stop (draining this callback)
+        // before wake_fd_ closes.
+        WakeDispatch();
       });
   *cb_raw_box = cb.get();  // make_shared 后赋值，lambda 按值捕获 cb_raw_box 读到此值
   {
@@ -1104,8 +1228,13 @@ absl::Status ShmServer::HandleCheckpoint(std::shared_ptr<ClientState> state) {
       err.set_message(std::string(s.message()));
       err.SerializeToString(&body);
     }
-    absl::MutexLock lock(&state->insert_outbox_mu);
-    state->insert_outbox.emplace_back(type, std::move(body));
+    {
+      absl::MutexLock lock(&state->insert_outbox_mu);
+      state->insert_outbox.emplace_back(type, std::move(body));
+    }
+    // ticket 03: enqueue-then-signal — a slow Save finishing into an idle
+    // server must not wait out the 50ms poll fallback for its response.
+    WakeDispatch();
   });
   return absl::OkStatus();
 }
@@ -1319,7 +1448,7 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
     // touch the S→C ring directly; it pushes the completed key, and when the
     // last item completes it enqueues the aggregate ACK into the outbox.
     auto cb = std::make_shared<Table::InsertCallback>(
-        [agg, offsets, state_sp, request_id](uint64_t completed_key) {
+        [this, agg, offsets, state_sp, request_id](uint64_t completed_key) {
           std::string body;
           {
             absl::MutexLock lock(&agg->mu);
@@ -1336,20 +1465,25 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
           // dispatch thread, the direct write would race the dispatch
           // thread's S→C producer. Route through the outbox unconditionally
           // instead.
-          absl::MutexLock lock(&state_sp->insert_outbox_mu);
-          state_sp->insert_outbox.emplace_back(
-              static_cast<uint16_t>(INSERT_ACK), std::move(body));
-          // All inserts confirmed: drop THIS REQUEST's keepalives so the
-          // callbacks (and what they capture) are reclaimed. This breaks
-          // the would-be cycle (cb -> lambda -> ... ; the lambda does NOT
-          // capture cb). Selective by request_id — a full clear could drop
-          // another in-flight request's keepalives (see fail_insert).
-          auto& pending = state_sp->pending_insert_callbacks;
-          pending.erase(std::remove_if(pending.begin(), pending.end(),
-                                       [request_id](const auto& e) {
-                                         return e.request_id == request_id;
-                                       }),
-                        pending.end());
+          {
+            absl::MutexLock lock(&state_sp->insert_outbox_mu);
+            state_sp->insert_outbox.emplace_back(
+                static_cast<uint16_t>(INSERT_ACK), std::move(body));
+            // All inserts confirmed: drop THIS REQUEST's keepalives so the
+            // callbacks (and what they capture) are reclaimed. This breaks
+            // the would-be cycle (cb -> lambda -> ... ; the lambda does NOT
+            // capture cb). Selective by request_id — a full clear could drop
+            // another in-flight request's keepalives (see fail_insert).
+            auto& pending = state_sp->pending_insert_callbacks;
+            pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                         [request_id](const auto& e) {
+                                           return e.request_id == request_id;
+                                         }),
+                          pending.end());
+          }
+          // ticket 03: enqueue-then-signal — the ACK must reach the client
+          // in ms even when the dispatch thread is blocked in poll().
+          WakeDispatch();
         });
     // Keepalive: InsertOrAssignAsync stores a weak_ptr; the table worker fires
     // the callback AFTER HandleInsert returns, so the shared_ptr must outlive
