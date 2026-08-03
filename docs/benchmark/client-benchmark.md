@@ -106,21 +106,23 @@ machine-readable `# RAW` block; `--json` for JSON. 单配置失败会记入
 | transport | small b1 | small b8 | small b64 | med b1 | med b8 | med b64 |
 | --- | --- | --- | --- | --- | --- | --- |
 | in-process | 6036 | 21284 | 25083 | 3294 | 7263 | 14275 |
-| SHM | 1500 | 2754 | 2887 | 1685 | 2152 | 2391 |
+| SHM（ticket 01 后） | 1685 | 8141 | 20545 | 1543 | 3774 | 8593 |
 | gRPC | 1722 | 5740 | 17471 | 1397 | 4110 | 6542 |
 
-（表 1k；10k 趋势相同，见 `# RAW`。）
+（表 1k；10k 趋势相同，见 `# RAW`。SHM 行为 2026-08-03 ticket
+[shm-batch-insert](../ticket/shm-batch-insert.md) 落地后复测，
+其余两行是原批次数字。）
 
 - **in-process** 批量摊薄明显（b1→b64 ≈ 4×）。
-- **gRPC** 批量收益最大（b1→b64 ≈ 10×）：streaming 天然流水，批量把
+- **gRPC** 批量收益大（b1→b64 ≈ 10×）：streaming 天然流水，批量把
   per-RPC 固定成本摊掉。
-- **⚠️ SHM 批量几乎无效**（b64 仅 ~2.4–2.9k ips，flush p50 涨到 22–29ms）：
-  写入 worker 对**每个 item 做一次 INSERT→ACK 往返**（
-  `trajectory_writer.cc` RunShmWorker：「each INSERT blocks on
-  read_blocking(ACK) before the next item is popped」）。SHM 写入吞吐的
-  上限是 per-item 往返延迟（~0.4–0.6ms/item），批量不改变往返次数。
-  **要大吞吐写入：多条连接并行写**（见 §4），或未来把协议改成批量
-  INSERT（一条消息 N items）。
+- **SHM 批量已生效**（ticket 01 前 b64 仅 ~2.4–2.9k ips）：`RunShmWorker`
+  现在把至多 64 个 ready item 合并成**一条** `ShmInsertRequest`——
+  流水化 ALLOCATE burst（N 发 N 收按序配对）+ 单条 INSERT + 聚合 ACK，
+  一批 ~2 次 ring 往返（旧实现每 item 2 次）。b64 提速 **small 7.1× /
+  med 3.6×**，超过 gRPC b64（17471/6542）；b1 不变（单 item 仍是 2 次
+  往返）。b64 的残余成本是服务端 per-item 工作（parse/压缩/表插入）——
+  约 45us/item，不再是传输往返。
 
 ## 4. 并发读写混合（pipeline，5s 稳态）
 
@@ -171,8 +173,8 @@ pipeline（5s，聚合）：
 | gRPC | 498 / 563 | 717 / 708 |
 
 - 大 payload 下三者的 **insert 趋同**（b1 ~570–830 ips）：770KB 的序列化/
-  压缩主导，传输差异被摊平。SHM b1→b8 有 ~1.7×（per-item 往返仍是短板但
-  占比下降）。
+  压缩主导，传输差异被摊平。SHM b1→b8 有 ~1.7×（本行为 ticket 01 前批
+  次；ticket 01 后批量效应见 §3）。
 - **sample 差距拉开**：in-process 7427（无序列化直切）≫ SHM 2201 ≈ 3.3×
   gRPC 667。SHM sample 的 p50 从 small 247us 涨到 449us，**payload 相关
   成本 ≈ 200us/770KB-sample**（服务端解压 + memcpy 进 pool + 客户端读出）。

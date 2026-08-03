@@ -393,10 +393,12 @@ class TrajectoryWriter : public ColumnWriter,
 
   // SHM-mode worker loop (ticket ④). Mirrors `RunLocalWorker` (drain
   // write_queue_, wait AllReady, OnItemFinalized, assemble chunks) EXCEPT the
-  // insert step: serialize each unique ChunkData, ALLOCATE a pool offset from
-  // the server, memcpy the bytes, build a ShmInsertRequest with ShmChunkRefs,
-  // send INSERT, then wait for InsertAck on S→C. The ACK fires the completion
-  // callback (erase in_flight, set local_can_insert_more_, signal data_cv_) and
+  // insert step: gather up to K already-ready items into one batch
+  // (ticket 01), pipeline-ALLOCATE a pool offset per unique chunk of the
+  // batch, memcpy the bytes in, build ONE ShmInsertRequest carrying all
+  // items + deduped ShmChunkRefs, send INSERT, then wait for the aggregate
+  // InsertAck on S→C. The ACK fires the completion step (erase the whole
+  // batch from in_flight, set local_can_insert_more_, signal data_cv_) and
   // the client RELEASEs the ack'd offsets (C2). Reuses all chunker/column
   // backpressure machinery — only the transport changes.
   absl::Status RunShmWorker();

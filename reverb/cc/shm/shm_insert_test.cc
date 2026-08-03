@@ -40,6 +40,7 @@
 #include "gtest/gtest.h"
 
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "reverb/cc/chunker.h"
 #include "reverb/cc/platform/default/logging.h"
@@ -252,21 +253,22 @@ TEST(ShmInsertTest, MultiChunkItemRoundTrips) {
   sampler->Close();
 }
 
-// v1 synchronous insert round-trip (decision C2): with a tight rate
+// Synchronous batch insert round-trip (decision C2): with a tight rate
 // limiter (max_size=1, no samples drained), writing many items must not
-// deadlock. v1 RunShmWorker is STRICTLY SYNCHRONOUS (in_flight <= 1): each
-// item does ALLOCATE -> INSERT -> read_blocking(ACK) -> erase from
-// in_flight -> RELEASE, then loops to the next item. in_flight_items_ never
-// exceeds 1, so there is no in_flight>1 pipelined backpressure gate in v1.
+// deadlock. RunShmWorker is STRICTLY SYNCHRONOUS at batch granularity
+// (ticket 01): each loop pipelines the ALLOCATE burst -> sends ONE INSERT
+// for up to 64 ready items -> read_blocking(aggregate ACK) -> erases the
+// whole batch from in_flight -> RELEASEs, then loops. in_flight_items_ peaks
+// at the batch size; there is no pipelined-batches backpressure gate.
 // local_can_insert_more_ is set to true on ACK but is NEVER read/awaited by
-// RunShmWorker (unlike RunLocalWorker, which waits on it at line ~815) — it is
-// vestigial from RunLocalWorker and NOT a backpressure gate in v1. The only
+// RunShmWorker (unlike RunLocalWorker, which waits on it at line ~815) — it
+// is vestigial from RunLocalWorker and NOT a backpressure gate. The only
 // backpressure here is the natural C->S ring-full block on Write plus the
 // serial ACK wait. After draining samples, the remaining items flush through.
 //
 // ponytail: true in_flight>1 async/pipelined backpressure is deferred —
-// upgrade RunShmWorker to async batch + reuse local_can_insert_more_ as the
-// gate.
+// upgrade RunShmWorker to async batches + reuse local_can_insert_more_ as
+// the gate.
 TEST(ShmInsertTest, SequentialInsertAckDoesNotDeadlock) {
   // Permissive rate limiter + small max_size: all 10 inserts complete (the
   // Fifo remover evicts the oldest beyond max_size), exercising the writer's
@@ -292,6 +294,50 @@ TEST(ShmInsertTest, SequentialInsertAckDoesNotDeadlock) {
   absl::Status st = writer->Flush(/*ignore_last_num_items=*/0,
                                   /*timeout=*/absl::Milliseconds(500));
   REVERB_EXPECT_OK(st) << "Flush timed out — ACK/backpressure path broken";
+
+  writer->Close();
+}
+
+// --- ticket 01: batched INSERT — one ring round-trip per batch -------------
+//
+// RunShmWorker merges up to 64 already-ready items into ONE ShmInsertRequest
+// (a pipelined ALLOCATE burst, one INSERT, one aggregate INSERT_ACK). This
+// test queues 8 ready items behind the worker's back — holding the client's
+// insert_flow_mu so the worker wakes on the first item but blocks BEFORE
+// gathering its batch — then releases it and asserts the whole flush costs
+// exactly ONE INSERT ring message (server-side counter) and lands all items.
+TEST(ShmInsertTest, BatchedFlushCostsOneInsertRoundTrip) {
+  auto table = MakePermissiveTable("t");
+  auto fx = ShmFixture::Make(table, "batch");
+  ASSERT_NE(fx, nullptr);
+
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(
+      fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+
+  // max_chunk_length=1 finalizes each chunk at Append time, so every item is
+  // AllReady the moment it is created (the batch gather takes ready items
+  // only).
+  const int kNumItems = 8;
+  int before;
+  {
+    absl::MutexLock hold(&fx->client->connection()->insert_flow_mu);
+    for (int i = 0; i < kNumItems; i++) {
+      StepRef refs;
+      REVERB_ASSERT_OK(writer->Append(
+          Step({MakeConstantBuffer<int32_t>(DataType::Int32, {1}, i)}),
+          &refs));
+      REVERB_ASSERT_OK(
+          writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+    }
+    before = fx->server->insert_requests_received_for_test();
+  }  // unlock: the worker gathers all 8 items into ONE batch.
+
+  REVERB_ASSERT_OK(writer->Flush(/*ignore_last_num_items=*/0,
+                                 /*timeout=*/absl::Milliseconds(5000)));
+  EXPECT_EQ(fx->server->insert_requests_received_for_test() - before, 1)
+      << "8 ready items must ride ONE ShmInsertRequest";
+  EXPECT_EQ(table->size(), kNumItems);
 
   writer->Close();
 }

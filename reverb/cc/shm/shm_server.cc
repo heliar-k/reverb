@@ -398,6 +398,7 @@ void ShmServer::HandleInsertRequests(size_t client_id) {
     }
     switch (type) {
       case INSERT: {
+        insert_requests_received_.fetch_add(1, std::memory_order_relaxed);
         ShmInsertRequest req;
         if (!req.ParseFromString(payload)) {
           REVERB_LOG(REVERB_WARNING)
@@ -632,6 +633,22 @@ absl::Status ShmServer::EnqueueInsertS2C(ClientState& state, MsgType type,
   // Non-blocking write on the INSERT flow's s2c ring (spec §8.7). TryWrite
   // returns ResourceExhausted("RING_FULL") immediately when full — we stash
   // in insert_outbox and FlushOutbox retries each dispatch pass.
+  //
+  // FIFO guard (ticket 01): if the outbox is non-empty, a prior response is
+  // still queued for this ring — append instead of TryWrite, otherwise this
+  // message would JUMP AHEAD of the stashed one. Exact response ordering is
+  // load-bearing now that the client pipelines ALLOCATEs (N requests, then N
+  // RESPs matched by position). In practice a burst (≤64 RESPs) never fills
+  // the 1024-slot ring, and the client's insert_flow_mu keeps logically
+  // ordered requests from overlapping, so this is belt-and-braces.
+  {
+    absl::MutexLock lock(&state.insert_outbox_mu);
+    if (!state.insert_outbox.empty()) {
+      state.insert_outbox.emplace_back(static_cast<uint16_t>(type),
+                                       std::string(body));
+      return absl::OkStatus();
+    }
+  }
   absl::Status s = state.conn.insert_s2c.TryWrite(type, absl::MakeSpan(body));
   if (s.ok()) return absl::OkStatus();
   if (absl::IsInvalidArgument(s)) {
@@ -1175,11 +1192,11 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
   //
   //    ponytail: one ACK per insert request, aggregating all item keys and all
   //    chunk offsets. The client correlates by waiting for the next INSERT_ACK
-  //    after sending INSERT (SPSC ordering guarantees it matches). A per-item
-  //    ACK would let the client release offsets earlier, but v1's
-  //    one-INSERT-per-item writer means there is exactly one item per ACK
-  //    anyway. Ceiling: a batched-INSERT client would hold all offsets until the
-  //    whole batch acks. Upgrade: per-item ACKs keyed by item key.
+  //    after sending INSERT (SPSC ordering guarantees it matches). ticket 01:
+  //    the client batches up to 64 items per INSERT, so the aggregate ACK —
+  //    and holding all offsets until the whole batch acks — is load-bearing.
+  //    Upgrade: per-item ACKs keyed by item key would let the client release
+  //    offsets earlier.
   std::vector<uint64_t> chunk_offsets;
   chunk_offsets.reserve(req.chunks_size());
   for (const ShmChunkRef& ref : req.chunks()) {
@@ -1203,8 +1220,18 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
     return EnqueueInsertS2C(state, INSERT_ACK, body);
   }
 
-  auto remaining = std::make_shared<std::atomic<int>>(num_items);
-  auto ack_keys = std::make_shared<std::vector<uint64_t>>();
+  // ticket 01: the aggregation state is shared by up to num_items callbacks,
+  // which may fire CONCURRENTLY when the request's items span tables (each
+  // table has its own callback executor). Guard keys/remaining with a mutex —
+  // the old atomic counter + bare vector push_back raced in that case (latent
+  // while the client sent one item per INSERT, real once it batches).
+  struct AckAggregate {
+    absl::Mutex mu;
+    std::vector<uint64_t> keys ABSL_GUARDED_BY(mu);
+    int remaining ABSL_GUARDED_BY(mu);
+  };
+  auto agg = std::make_shared<AckAggregate>();
+  agg->remaining = num_items;
   // review #1: capture state_sp (shared_ptr<ClientState>), not a raw
   // pointer — see HandleSample.
   auto offsets = std::make_shared<std::vector<uint64_t>>(std::move(chunk_offsets));
@@ -1287,35 +1314,37 @@ absl::Status ShmServer::HandleInsert(std::shared_ptr<ClientState> state_sp,
     // touch the S→C ring directly; it pushes the completed key, and when the
     // last item completes it enqueues the aggregate ACK into the outbox.
     auto cb = std::make_shared<Table::InsertCallback>(
-        [remaining, ack_keys, offsets, state_sp,
-         request_id](uint64_t completed_key) {
-          ack_keys->push_back(completed_key);
-          if (remaining->fetch_sub(1) == 1) {
+        [agg, offsets, state_sp, request_id](uint64_t completed_key) {
+          std::string body;
+          {
+            absl::MutexLock lock(&agg->mu);
+            agg->keys.push_back(completed_key);
+            if (--agg->remaining > 0) return;
+            // Last completion of the request: build the aggregate ACK.
             InsertAck ack;
-            for (uint64_t k : *ack_keys) ack.add_keys(k);
+            for (uint64_t k : agg->keys) ack.add_keys(k);
             for (uint64_t off : *offsets) ack.add_offsets_to_release(off);
-            std::string body;
             ack.SerializeToString(&body);
-            // EnqueueInsertS2C writes to the ring directly (dispatch thread)
-            // or stashes in insert_outbox on ResourceExhausted. Called off the
-            // dispatch thread, the direct write would race the dispatch
-            // thread's S→C producer. Route through the outbox unconditionally
-            // instead.
-            absl::MutexLock lock(&state_sp->insert_outbox_mu);
-            state_sp->insert_outbox.emplace_back(
-                static_cast<uint16_t>(INSERT_ACK), std::move(body));
-            // All inserts confirmed: drop THIS REQUEST's keepalives so the
-            // callbacks (and what they capture) are reclaimed. This breaks
-            // the would-be cycle (cb -> lambda -> ... ; the lambda does NOT
-            // capture cb). Selective by request_id — a full clear could drop
-            // another in-flight request's keepalives (see fail_insert).
-            auto& pending = state_sp->pending_insert_callbacks;
-            pending.erase(std::remove_if(pending.begin(), pending.end(),
-                                         [request_id](const auto& e) {
-                                           return e.request_id == request_id;
-                                         }),
-                          pending.end());
           }
+          // EnqueueInsertS2C writes to the ring directly (dispatch thread)
+          // or stashes in insert_outbox on ResourceExhausted. Called off the
+          // dispatch thread, the direct write would race the dispatch
+          // thread's S→C producer. Route through the outbox unconditionally
+          // instead.
+          absl::MutexLock lock(&state_sp->insert_outbox_mu);
+          state_sp->insert_outbox.emplace_back(
+              static_cast<uint16_t>(INSERT_ACK), std::move(body));
+          // All inserts confirmed: drop THIS REQUEST's keepalives so the
+          // callbacks (and what they capture) are reclaimed. This breaks
+          // the would-be cycle (cb -> lambda -> ... ; the lambda does NOT
+          // capture cb). Selective by request_id — a full clear could drop
+          // another in-flight request's keepalives (see fail_insert).
+          auto& pending = state_sp->pending_insert_callbacks;
+          pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                       [request_id](const auto& e) {
+                                         return e.request_id == request_id;
+                                       }),
+                        pending.end());
         });
     // Keepalive: InsertOrAssignAsync stores a weak_ptr; the table worker fires
     // the callback AFTER HandleInsert returns, so the shared_ptr must outlive

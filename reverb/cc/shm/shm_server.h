@@ -177,6 +177,14 @@ class ShmServer {
   // threads. No-op if no client.
   void CloseClientFdForTest();
 
+  // ticket 01 test-only: total number of INSERT ring messages received
+  // across all clients since Start(). The batching regression test asserts a
+  // multi-item flush costs exactly ONE INSERT round-trip. Atomic: written on
+  // the dispatch thread, read from the test thread.
+  int insert_requests_received_for_test() const {
+    return insert_requests_received_.load(std::memory_order_relaxed);
+  }
+
  private:
   ShmServer(std::vector<std::shared_ptr<Table>> tables, std::string socket_path,
             ShmBytePool pool, ShmBootstrapServer bootstrap,
@@ -324,6 +332,9 @@ class ShmServer {
 
   std::thread dispatch_thread_;
   std::atomic<bool> running_{false};
+
+  // ticket 01: counts INSERT messages (see insert_requests_received_for_test).
+  std::atomic<int> insert_requests_received_{0};
 
   // review #3: single-thread executor for checkpoint Saves — keeps unbounded
   // disk I/O off the dispatch thread. Declared after tables_/clients_ so it
