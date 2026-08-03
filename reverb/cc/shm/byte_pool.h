@@ -105,6 +105,10 @@ class ShmBytePool {
 
   // Server side: create + truncate a new SHM segment, init slab metadata +
   // free lists. `slab_sizes` defaults to kDefaultSlabSizes when empty.
+  // Custom sizes must be strictly ascending (PickSlab's smallest-fit scan
+  // assumes it) and each >= 8 bytes (a free block stores its next-offset in
+  // its first 8 bytes); `blocks_per_slab` must be > 0. Violations return
+  // InvalidArgumentError before any segment is created.
   static absl::StatusOr<ShmBytePool> Create(
       const std::string& shm_name,
       absl::Span<const size_t> slab_sizes = {},

@@ -102,7 +102,8 @@ ShmServer::ShmServer(std::vector<std::shared_ptr<Table>> tables,
 // static
 absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
     std::vector<std::shared_ptr<Table>> tables, const std::string& socket_path,
-    std::shared_ptr<Checkpointer> checkpointer) {
+    std::shared_ptr<Checkpointer> checkpointer,
+    absl::Span<const size_t> slab_sizes, size_t pool_blocks_per_slab) {
   if (tables.empty()) {
     return absl::InvalidArgumentError("tables must not be empty");
   }
@@ -132,8 +133,12 @@ absl::StatusOr<std::unique_ptr<ShmServer>> ShmServer::Create(
   std::string name_token = absl::StrCat(socket_path, "_", getpid(), "_",
                                         absl::ToUnixNanos(absl::Now()));
   std::string pool_name = MakePoolShmName(name_token);
+  // ticket 02: 0 = "caller didn't configure" -> the historical default.
+  size_t blocks_per_slab = pool_blocks_per_slab == 0 ? kDefaultBlocksPerSlab
+                                                     : pool_blocks_per_slab;
   REVERB_ASSIGN_OR_RETURN(
-      ShmBytePool pool, ShmBytePool::Create(pool_name));
+      ShmBytePool pool,
+      ShmBytePool::Create(pool_name, slab_sizes, blocks_per_slab));
   return absl::WrapUnique(
       new ShmServer(std::move(tables), socket_path, std::move(pool),
                     std::move(bootstrap), std::move(checkpointer),

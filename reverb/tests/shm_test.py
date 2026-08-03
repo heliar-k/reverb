@@ -149,6 +149,74 @@ class ShmWriteSampleTest(absltest.TestCase):
         )
 
 
+class ShmPoolSlabConfigTest(absltest.TestCase):
+    """ticket 02: SHM pool slab geometry is configurable from Server(...).
+
+    shm_pool_slab_sizes / shm_pool_blocks_per_slab pass through
+    Server -> pybind ShmServer -> ShmServer::Create -> ShmBytePool::Create.
+    """
+
+    def test_custom_geometry_roundtrip(self):
+        # Small custom pool: 3 tiers, 8 blocks each (~533KB capacity vs the
+        # ~1.4GB default). Small payloads insert/sample unchanged.
+        server, client = _make_shm_server(
+            shm_pool_slab_sizes=[64, 1024, 65536],
+            shm_pool_blocks_per_slab=8,
+        )
+        with client.trajectory_writer(num_keep_alive_refs=1) as w:
+            w.append({"obs": np.array([1.0, 2.0], dtype=np.float32)})
+            w.create_item(
+                table="t", priority=1.0, trajectory={"obs": w.history["obs"][:]}
+            )
+            w.flush()
+
+        samples = list(client.sample("t", num_samples=1, emit_timesteps=False))
+        self.assertLen(samples, 1)
+        np.testing.assert_allclose(np.asarray(samples[0].data[0]), [[1.0, 2.0]])
+        server.stop()
+
+    def test_invalid_geometry_raises_at_construction(self):
+        # Non-ascending tiers: ShmBytePool::Create rejects with InvalidArgument
+        # -> ValueError, before any SHM segment is created.
+        with self.assertRaisesRegex(ValueError, "ascending"):
+            _make_shm_server(shm_pool_slab_sizes=[1024, 64])
+
+    def test_oversize_insert_surfaces_client_error(self):
+        # A chunk bigger than the largest slab can never fit the pool: the
+        # client must get a clear error (not hang/crash). Chain:
+        # Allocate InvalidArgument -> ShmError::INVALID_ARGUMENT ->
+        # RunShmWorker fail_stream -> flush raises ValueError.
+        server, client = _make_shm_server(
+            shm_pool_slab_sizes=[1024],
+            shm_pool_blocks_per_slab=8,
+        )
+        # The chunker compresses, so zeros would shrink under the slab size —
+        # use deterministic noise to keep the wire size above it.
+        rng = np.random.RandomState(42)
+        with self.assertRaisesRegex(ValueError, "too large"):
+            _insert_one(client, "t", rng.randint(0, 256, size=4096, dtype=np.uint8))
+        server.stop()
+
+    def test_oversize_sample_surfaces_client_error(self):
+        # Sample-path oversize: insert a big item via the in-process client
+        # (bypasses the pool), then sample it over SHM — the result bytes
+        # exceed the largest slab, so the server replies ERROR and the client
+        # raises (RuntimeError from ShmError::INTERNAL) instead of hanging.
+        server, client = _make_shm_server(
+            shm_pool_slab_sizes=[1024],
+            shm_pool_blocks_per_slab=8,
+        )
+        rng = np.random.RandomState(42)
+        _insert_one(
+            server.in_process_client,
+            "t",
+            rng.randint(0, 256, size=4096, dtype=np.uint8),
+        )
+        with self.assertRaises(RuntimeError):
+            next(client.sample("t", num_samples=1, emit_timesteps=False))
+        server.stop()
+
+
 class ShmStructuredWriterTest(absltest.TestCase):
     """StructuredWriter over SHM -> sample reads back."""
 

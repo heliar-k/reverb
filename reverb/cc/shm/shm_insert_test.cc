@@ -60,6 +60,7 @@ namespace reverb {
 namespace shm {
 namespace {
 
+using ::testing::HasSubstr;
 using ::testing::SizeIs;
 
 using Step = std::vector<std::optional<TensorBuffer>>;
@@ -155,12 +156,16 @@ struct ShmFixture {
   std::unique_ptr<ShmClient> client;
   std::string sock;
 
-  static std::unique_ptr<ShmFixture> Make(std::shared_ptr<Table> table,
-                                          const std::string& tag) {
+  // ticket 02: optional pool geometry (empty/0 = server defaults).
+  static std::unique_ptr<ShmFixture> Make(
+      std::shared_ptr<Table> table, const std::string& tag,
+      absl::Span<const size_t> slab_sizes = {}, size_t blocks_per_slab = 0) {
     auto f = std::make_unique<ShmFixture>();
     f->table = table;
     f->sock = "/tmp/reverb_shm_insert_" + UniqueTag(tag) + ".sock";
-    auto s = ShmServer::Create({table}, f->sock);
+    auto s =
+        ShmServer::Create({table}, f->sock, nullptr, slab_sizes,
+                          blocks_per_slab);
     if (!s.ok()) return nullptr;
     f->server = std::move(*s);
     if (!f->server->Start().ok()) return nullptr;
@@ -208,6 +213,72 @@ TEST(ShmInsertTest, WriteAndSampleRoundTrip) {
   EXPECT_EQ(data[0].shape(), std::vector<int64_t>({1, 1}));
 
   sampler->Close();
+}
+
+// ticket 02: a server created with a small custom pool geometry round-trips
+// small items end to end (insert over SHM + sample over SHM).
+TEST(ShmInsertTest, SmallPoolGeometryRoundTrips) {
+  const size_t slabs[] = {1024};
+  auto fx = ShmFixture::Make(MakeTable("t"), "smallpool", slabs,
+                             /*blocks_per_slab=*/8);
+  ASSERT_NE(fx, nullptr);
+
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(
+      fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+
+  StepRef refs;
+  REVERB_ASSERT_OK(
+      writer->Append(Step({MakeZeroBuffer<int32_t>(kIntSpec)}), &refs));
+  REVERB_ASSERT_OK(writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+  REVERB_ASSERT_OK(writer->Flush());
+  EXPECT_EQ(fx->table->size(), 1);
+
+  std::unique_ptr<ShmSampler> sampler;
+  REVERB_ASSERT_OK(fx->client->NewSampler("t", {1}, &sampler));
+  std::vector<TensorBuffer> data;
+  REVERB_EXPECT_OK(sampler->GetNextTrajectory(&data));
+  ASSERT_THAT(data, SizeIs(1));
+  EXPECT_EQ(data[0].shape(), std::vector<int64_t>({1, 1}));
+  sampler->Close();
+}
+
+// ticket 02: inserting a chunk larger than the biggest slab fails fast on the
+// CLIENT with a clear error (no hang, no crash). The server's Allocate
+// returns InvalidArgument (oversize can never fit this geometry),
+// HandleAllocate ships it as ShmError::INVALID_ARGUMENT, and RunShmWorker
+// surfaces it via fail_stream -> Flush.
+TEST(ShmInsertTest, OversizeInsertSurfacesClientError) {
+  const size_t slabs[] = {1024};
+  auto fx = ShmFixture::Make(MakePermissiveTable("t"), "toobig", slabs,
+                             /*blocks_per_slab=*/8);
+  ASSERT_NE(fx, nullptr);
+
+  std::unique_ptr<TrajectoryWriter> writer;
+  REVERB_ASSERT_OK(
+      fx->client->NewTrajectoryWriter(MakeOptions(1, 1), &writer));
+
+  // 4KB payload + ChunkData framing > the 1KB max slab. The chunker
+  // compresses, so zeros would shrink under the slab size — fill with
+  // xorshift noise (incompressible) to keep the wire size above it.
+  std::string noise(4096, '\0');
+  uint64_t x = 0x9E3779B97F4A7C15ULL;
+  for (char& c : noise) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    c = static_cast<char>(x);
+  }
+  TensorBuffer big(TensorSpec{DataType::Int8, {4096}}, noise);
+  StepRef refs;
+  REVERB_ASSERT_OK(writer->Append(Step({std::move(big)}), &refs));
+  REVERB_ASSERT_OK(writer->CreateItem("t", 1.0, MakeTrajectory({{refs[0]}})));
+  absl::Status st = writer->Flush();
+  EXPECT_TRUE(absl::IsInvalidArgument(st)) << st;
+  EXPECT_THAT(std::string(st.message()), HasSubstr("too large"));
+
+  // The server survived the rejected batch; nothing was partially inserted.
+  EXPECT_EQ(fx->table->size(), 0);
 }
 
 // A multi-chunk item: max_chunk_length=2, append 5 steps (chunks of 2,2,1),

@@ -209,6 +209,10 @@ pipeline（5s，聚合）：
   mmap 高水位叠加），大 payload 必须按传输拆进程跑。
 - **容量规划公式**：SHM 服务端内存 ≈ 表内容 + Σ（活跃连接数 × pool
   高水位）；多客户端大 payload 场景按 ~1.4GB/连接预留。
+- **pool 几何已可配**（ticket 02）：`Server(shm_pool_slab_sizes=...,
+  shm_pool_blocks_per_slab=...)`，pool 容量 = Σ(档位 × 块数)；上述
+  1.4GB/连接 为默认档位（9 档 × 256 blocks）口径。small-payload 场景
+  砍掉大档即可把单连接高水位降到档位容量量级。
 
 旧文档 §4 的 v2 复杂度分析仍然成立，摘录在下节。
 

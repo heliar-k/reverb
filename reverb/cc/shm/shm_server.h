@@ -141,10 +141,17 @@ class ShmServer {
   // (ticket ⑪): when provided, HandleCheckpoint saves all tables and returns
   // the path; when null, HandleCheckpoint returns FailedPreconditionError
   // (mirrors InProcessClient::Checkpoint).
+  // ticket 02: `slab_sizes` / `pool_blocks_per_slab` tune the pool geometry
+  // (per-connection high water mark is sum(slab x blocks)); empty / 0 keeps
+  // the defaults (kDefaultSlabSizes x kDefaultBlocksPerSlab, byte-identical
+  // to pre-ticket-02). Invalid geometry surfaces as BytePool::Create's
+  // InvalidArgumentError.
   static absl::StatusOr<std::unique_ptr<ShmServer>> Create(
       std::vector<std::shared_ptr<Table>> tables,
       const std::string& socket_path,
-      std::shared_ptr<Checkpointer> checkpointer = nullptr);
+      std::shared_ptr<Checkpointer> checkpointer = nullptr,
+      absl::Span<const size_t> slab_sizes = {},
+      size_t pool_blocks_per_slab = 0);
 
   ~ShmServer();
 

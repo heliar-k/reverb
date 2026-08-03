@@ -252,12 +252,16 @@ class ShmServer:
         tables: Sequence[Table],
         socket_path: str = ...,
         checkpointer: Optional[Checkpointer] = ...,
+        slab_sizes: Sequence[int] = ...,
+        blocks_per_slab: int = ...,
     ): ...
     @staticmethod
     def Create(
         tables: Sequence[Table],
         socket_path: str = ...,
         checkpointer: Optional[Checkpointer] = ...,
+        slab_sizes: Sequence[int] = ...,
+        blocks_per_slab: int = ...,
     ) -> ShmServer: ...
     def Start(self) -> None: ...
     def Stop(self) -> None: ...

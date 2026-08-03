@@ -26,7 +26,7 @@ import logging
 import os
 import tempfile
 import threading
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import portpicker
 import tree
@@ -333,6 +333,8 @@ class Server:
         in_process: bool = False,
         shm: bool = False,
         shm_socket_path: Optional[str] = None,
+        shm_pool_slab_sizes: Optional[List[int]] = None,
+        shm_pool_blocks_per_slab: Optional[int] = None,
         output_format: str = "numpy",
     ):
         """Constructor of Server serving the ReverbService.
@@ -358,6 +360,15 @@ class Server:
           shm_socket_path: udsocket path for the SHM bootstrap server. If `None`
             (default), a path `/tmp/reverb_shm_<pid>.sock` is generated and cleaned
             up on `stop()`.
+          shm_pool_slab_sizes: Optional slab tier sizes (bytes) for the SHM byte
+            pool, e.g. `[64, 1024, 65536]`. Must be strictly ascending, each >= 8.
+            The pool's per-connection memory high water mark is roughly
+            `sum(slab * blocks_per_slab)`; trimming large tiers cuts it far below
+            the ~1.4GB default for small-payload workloads. If `None` (default),
+            the built-in tiers (64B..4MB) are used and the geometry is
+            byte-identical to previous releases.
+          shm_pool_blocks_per_slab: Optional number of blocks per slab tier. If
+            `None` (default), the built-in default (256) is used.
           output_format: "numpy" (default) or "torch"; forwarded to the in-process
             client's `sample` output. Only meaningful with `in_process=True`.
 
@@ -446,6 +457,10 @@ class Server:
                 tables=[t.internal_table for t in tables],
                 socket_path=shm_socket_path,
                 checkpointer=checkpointer.internal_checkpointer(),
+                # None -> empty/0 keeps the C++ default path (kDefaultSlabSizes
+                # x kDefaultBlocksPerSlab).
+                slab_sizes=shm_pool_slab_sizes or [],
+                blocks_per_slab=shm_pool_blocks_per_slab or 0,
             )
             self._shm_server.Start()
             self._shm_socket_path = self._shm_server.socket_path

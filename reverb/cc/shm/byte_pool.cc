@@ -94,8 +94,24 @@ absl::StatusOr<ShmBytePool> ShmBytePool::Create(
   if (sizes.empty()) {
     sizes.assign(std::begin(kDefaultSlabSizes), std::end(kDefaultSlabSizes));
   }
-  if (sizes.empty() || blocks_per_slab == 0) {
-    return absl::InvalidArgumentError("slab_sizes and blocks_per_slab required");
+  if (blocks_per_slab == 0) {
+    return absl::InvalidArgumentError("blocks_per_slab must be > 0");
+  }
+  // Validate the tier geometry: PickSlab's "smallest tier >= bytes" scan is
+  // only correct on ascending sizes, and each free block stores its 8-byte
+  // next-offset in its first bytes, so a tier smaller than that would corrupt
+  // its neighbour. Reject up front instead of mis-allocating silently.
+  for (size_t i = 0; i < sizes.size(); i++) {
+    if (sizes[i] < sizeof(uint64_t)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "slab_sizes[", i, "] = ", sizes[i], " must be >= ",
+          sizeof(uint64_t), " (free-list next pointer)"));
+    }
+    if (i > 0 && sizes[i] <= sizes[i - 1]) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "slab_sizes must be strictly ascending, but slab_sizes[", i - 1,
+          "] = ", sizes[i - 1], " >= slab_sizes[", i, "] = ", sizes[i]));
+    }
   }
 
   int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);

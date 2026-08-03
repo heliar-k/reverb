@@ -82,10 +82,61 @@ TEST(ShmBytePoolTest, AllocateTooLargeFails) {
                                kSmallBlocksPerSlab);
   REVERB_ASSERT_OK(s.status());
   ShmBytePool pool = std::move(s).value();
-  // Larger than the biggest slab (1024).
+  // Larger than the biggest slab (1024): fails fast, InvalidArgument (the
+  // request can NEVER fit this geometry — retrying won't help, unlike tier
+  // exhaustion which is transient ResourceExhausted).
   auto a = pool.Allocate(2048);
   EXPECT_FALSE(a.ok());
+  EXPECT_TRUE(absl::IsInvalidArgument(a.status())) << a.status();
   EXPECT_THAT(std::string(a.status().message()), HasSubstr("too large"));
+}
+
+// ── Custom geometry (ticket 02: slab config pass-through) ──
+
+TEST(ShmBytePoolTest, CustomGeometryCapacityMatchesSumOfTiers) {
+  const size_t slabs[] = {64, 1024, 65536};
+  const size_t kBlocks = 3;
+  auto s = ShmBytePool::Create(UniqueName("capacity"), slabs, kBlocks);
+  REVERB_ASSERT_OK(s.status());
+  ShmBytePool pool = std::move(s).value();
+
+  // ftruncate'd capacity = header + per-tier metadata + sum(slab x blocks).
+  size_t expected = sizeof(PoolHeader) + 3 * sizeof(SlabMeta) +
+                    kBlocks * (64 + 1024 + 65536);
+  EXPECT_EQ(pool.size(), expected);
+
+  // The largest tier is allocatable; one byte past it is not.
+  auto a = pool.Allocate(65536);
+  REVERB_ASSERT_OK(a.status());
+  EXPECT_EQ(pool.block_size_at(*a), 65536u);
+  auto too_big = pool.Allocate(65537);
+  EXPECT_TRUE(absl::IsInvalidArgument(too_big.status())) << too_big.status();
+}
+
+TEST(ShmBytePoolTest, CreateRejectsInvalidGeometry) {
+  // Non-ascending tiers would break PickSlab's smallest-fit scan.
+  const size_t unsorted[] = {1024, 64};
+  auto s1 = ShmBytePool::Create(UniqueName("unsorted"), unsorted, 4);
+  EXPECT_TRUE(absl::IsInvalidArgument(s1.status())) << s1.status();
+  EXPECT_THAT(std::string(s1.status().message()), HasSubstr("ascending"));
+
+  // Duplicates are not strictly ascending.
+  const size_t dup[] = {64, 64};
+  auto s2 = ShmBytePool::Create(UniqueName("dup"), dup, 4);
+  EXPECT_TRUE(absl::IsInvalidArgument(s2.status())) << s2.status();
+
+  // A zero tier would alias every free block to the same offset; a tier
+  // smaller than 8 bytes can't hold the free-list next pointer.
+  const size_t zero[] = {0, 64};
+  auto s3 = ShmBytePool::Create(UniqueName("zero"), zero, 4);
+  EXPECT_TRUE(absl::IsInvalidArgument(s3.status())) << s3.status();
+  const size_t tiny[] = {4};
+  auto s4 = ShmBytePool::Create(UniqueName("tiny"), tiny, 4);
+  EXPECT_TRUE(absl::IsInvalidArgument(s4.status())) << s4.status();
+
+  // Zero blocks per slab.
+  auto s5 = ShmBytePool::Create(UniqueName("zeroblocks"), kSmallSlabs, 0);
+  EXPECT_TRUE(absl::IsInvalidArgument(s5.status())) << s5.status();
 }
 
 // ── Allocate → write → read → Deallocate → recycle (LIFO) ──

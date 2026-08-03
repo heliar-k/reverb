@@ -1280,36 +1280,50 @@ PYBIND11_MODULE(libpybind, m) {
   // ⑨: routed by table name) and a udsocket path; an empty path auto-generates
   // one.
   py::class_<ShmServer, std::shared_ptr<ShmServer>>(m, "ShmServer")
+      // ticket 02: `slab_sizes` (empty = default tiers) and
+      // `blocks_per_slab` (0 = default 256) tune the per-connection pool
+      // high water mark; see ShmServer::Create. Both lambdas must stay in
+      // sync (ctor + static Create).
       .def(py::init([](std::vector<std::shared_ptr<Table>> tables,
                       const std::string& socket_path,
-                      std::shared_ptr<Checkpointer> checkpointer) {
+                      std::shared_ptr<Checkpointer> checkpointer,
+                      std::vector<size_t> slab_sizes,
+                      size_t blocks_per_slab) {
              absl::StatusOr<std::unique_ptr<ShmServer>> result;
              {
                py::gil_scoped_release g;
                result = ShmServer::Create(std::move(tables), socket_path,
-                                         std::move(checkpointer));
+                                         std::move(checkpointer), slab_sizes,
+                                         blocks_per_slab);
              }
              MaybeRaiseFromStatus(result.status());
              return std::shared_ptr<ShmServer>(std::move(*result));
            }),
            py::arg("tables"), py::arg("socket_path") = "",
-           py::arg("checkpointer") = nullptr)
+           py::arg("checkpointer") = nullptr,
+           py::arg("slab_sizes") = std::vector<size_t>{},
+           py::arg("blocks_per_slab") = 0)
       .def_static(
           "Create",
           [](std::vector<std::shared_ptr<Table>> tables,
              const std::string& socket_path,
-             std::shared_ptr<Checkpointer> checkpointer) {
+             std::shared_ptr<Checkpointer> checkpointer,
+             std::vector<size_t> slab_sizes,
+             size_t blocks_per_slab) {
             absl::StatusOr<std::unique_ptr<ShmServer>> result;
             {
               py::gil_scoped_release g;
               result = ShmServer::Create(std::move(tables), socket_path,
-                                        std::move(checkpointer));
+                                        std::move(checkpointer), slab_sizes,
+                                        blocks_per_slab);
             }
             MaybeRaiseFromStatus(result.status());
             return std::shared_ptr<ShmServer>(std::move(*result));
           },
           py::arg("tables"), py::arg("socket_path") = "",
-          py::arg("checkpointer") = nullptr)
+          py::arg("checkpointer") = nullptr,
+          py::arg("slab_sizes") = std::vector<size_t>{},
+          py::arg("blocks_per_slab") = 0)
       .def("Start",
            [](ShmServer* server) {
              absl::Status status;
